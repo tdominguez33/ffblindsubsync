@@ -89,7 +89,7 @@ class GenericSubtitlesFile:
         if encoding is None:
             raise ValueError("encoding must be specified")
         self.subs_: List[GenericSubtitle] = subs
-        self._sub_format: str = sub_format
+        self._sub_format: str = sub_format.lower()
         self._encoding: str = encoding
         self._styles: Optional[Dict[str, pysubs2.SSAStyle]] = kwargs.pop("styles", None)
         self._fonts_opaque: Optional[Dict[str, Any]] = kwargs.pop("fonts_opaque", None)
@@ -136,9 +136,14 @@ class GenericSubtitlesFile:
         if fname is None:
             out_format = self._sub_format
         else:
-            out_format = os.path.splitext(fname)[-1][1:]
+            out_format = os.path.splitext(fname)[-1][1:].lower()
         subs = list(self.gen_raw_resolved_subs())
-        if self._sub_format in ("ssa", "ass", "vtt"):
+        if self._sub_format in ("ssa", "ass", "vtt", "sub") and out_format in (
+            "ssa",
+            "ass",
+            "vtt",
+            "srt",
+        ):
             ssaf = pysubs2.SSAFile()
             ssaf.events = subs
             if self._styles is not None:

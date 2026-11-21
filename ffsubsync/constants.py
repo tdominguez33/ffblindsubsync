@@ -25,6 +25,13 @@ DEFAULT_APPLY_OFFSET_SECONDS: int = 0
 # structural breaks (ad breaks / scene cuts) that misalign everything after them.
 DEFAULT_SPLIT_PENALTY: float = 5.0
 
+# Defaults for --auto-split (safe two-stage piecewise sync). Higher penalty and
+# wider search range allow catching large structural breaks (up to +/- 5 minutes)
+# while the Stage 1 health check + Stage 3 split gate prevent false splits on
+# unbroken files.
+DEFAULT_AUTO_SPLIT_PENALTY: float = 12.0
+DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS: float = 300.0
+
 # Weight of the piecewise aligner's edge/length term ("standard scoring"): each cue
 # is additionally charged this fraction of the reference speech in a guard band just
 # outside its edges, so a cue prefers a same-sized speech block over sitting anywhere
@@ -75,7 +82,7 @@ DEFAULT_MIN_SCORE: float = 0.0
 DEFAULT_QUALITY_MAX_OFFSET_SECONDS: float = 30.0
 DEFAULT_MAX_FRAMERATE_DEVIATION: float = 0.1
 
-SUBTITLE_EXTENSIONS: Tuple[str, ...] = ("srt", "ass", "ssa", "sub")
+SUBTITLE_EXTENSIONS: Tuple[str, ...] = ("srt", "ass", "ssa", "sub", "vtt")
 
 # Remote URL protocols that ffmpeg can read directly as an input (`-i <url>`),
 # so a reference of this form needs no local download or read-permission check.

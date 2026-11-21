@@ -1,10 +1,21 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 from ffsubsync.constants import SUBSYNC_RESOURCES_ENV_MAGIC
-from ffsubsync._version import get_versions
 
-__version__ = get_versions()["version"]
-del get_versions
+if getattr(sys, "frozen", False):
+    try:
+        from ffsubsync._frozen_version import FFSUBSYNC_VERSION as __version__
+    except ImportError:
+        from ffsubsync._version import get_versions
+
+        __version__ = get_versions()["version"]
+        del get_versions
+else:
+    from ffsubsync._version import get_versions
+
+    __version__ = get_versions()["version"]
+    del get_versions
 
 
 def get_version():

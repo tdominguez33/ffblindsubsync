@@ -76,7 +76,7 @@ class GenericSubtitleParser(SubsMixin, TransformerMixin):
         strict: bool = False,
     ) -> None:
         super(self.__class__, self).__init__()
-        self.sub_format: str = fmt
+        self.sub_format: str = fmt.lower()
         self.encoding: str = encoding
         self.caching: bool = caching
         self.fit_fname: Optional[str] = None

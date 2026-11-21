@@ -14,6 +14,8 @@ import numpy as np
 from ffsubsync.aligners import FFTAligner, MaxScoreAligner
 from ffsubsync.constants import (
     DEFAULT_APPLY_OFFSET_SECONDS,
+    DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
+    DEFAULT_AUTO_SPLIT_PENALTY,
     DEFAULT_FRAME_RATE,
     DEFAULT_MAX_OFFSET_SECONDS,
     DEFAULT_MAX_SUBTITLE_SECONDS,
@@ -44,7 +46,14 @@ from ffsubsync.speech_transformers import (
     ProgressInfo,
     make_subtitle_speech_pipeline,
 )
-from ffsubsync.split_aligner import compute_split_offsets, log_split_segments
+from ffsubsync.split_aligner import (
+    alignment_has_positive_signal,
+    compute_auto_split_offsets,
+    compute_split_offsets,
+    count_dropped_cues,
+    log_split_segments,
+    summarize_split_segments,
+)
 from ffsubsync.subtitle_parser import make_subtitle_parser
 from ffsubsync.subtitle_transformers import (
     SubtitleMerger,
@@ -66,7 +75,8 @@ def override(args: argparse.Namespace, **kwargs: Any) -> Dict[str, Any]:
 def _ref_format(ref_fname: Optional[str]) -> Optional[str]:
     if ref_fname is None:
         return None
-    return ref_fname[-3:]
+    ext = os.path.splitext(ref_fname)[1].lstrip(".").lower()
+    return ext or ref_fname[-3:].lower()
 
 
 def make_test_case(
@@ -131,7 +141,7 @@ def get_srt_pipe_maker(
     if srtin is None:
         srtin_format = "srt"
     else:
-        srtin_format = os.path.splitext(srtin)[-1][1:]
+        srtin_format = os.path.splitext(srtin)[-1][1:].lower()
     parser = make_subtitle_parser(fmt=srtin_format, caching=True, **args.__dict__)
     return lambda scale_factor: make_subtitle_speech_pipeline(
         **override(args, scale_factor=scale_factor, parser=parser)
@@ -233,15 +243,32 @@ def try_sync(
                 logger.info("...done")
             logger.info("computing alignments...")
             reference_speech = None
+            split_penalty = getattr(args, "split_penalty", None)
+            use_split_early = split_penalty is not None and not skip_sync
+            use_auto_split_early = (
+                bool(getattr(args, "auto_split", False))
+                and not use_split_early
+                and not skip_sync
+            )
+            align_max_offset_seconds = (
+                max(
+                    float(args.max_offset_seconds),
+                    DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
+                )
+                if use_auto_split_early
+                else args.max_offset_seconds
+            )
+            aligner: Optional[MaxScoreAligner] = None
             if skip_sync:
                 best_score = 0.0
                 best_srt_pipe = cast(Pipeline, srt_pipes[0])
                 offset_samples = 0
             else:
                 reference_speech = reference_pipe.transform(args.reference)
-                (best_score, offset_samples), best_srt_pipe = MaxScoreAligner(
-                    FFTAligner, srtin, SAMPLE_RATE, args.max_offset_seconds
-                ).fit_transform(
+                aligner = MaxScoreAligner(
+                    FFTAligner, srtin, SAMPLE_RATE, align_max_offset_seconds
+                )
+                (best_score, offset_samples), best_srt_pipe = aligner.fit_transform(
                     reference_speech,
                     srt_pipes,
                 )
@@ -281,59 +308,156 @@ def try_sync(
                 )
                 out_subs.write_file(srtout)
                 continue
-            split_penalty = getattr(args, "split_penalty", None)
-            use_split = (
-                split_penalty is not None
-                and not skip_sync
-                and reference_speech is not None
-            )
-            if use_split:
+            use_split = use_split_early and reference_speech is not None
+            use_auto_split = use_auto_split_early and reference_speech is not None
+            split_segments: Optional[List[Dict[str, Any]]] = None
+            dropped_cues = 0
+            if use_split or use_auto_split:
                 length_penalty = getattr(
                     args, "split_length_penalty", DEFAULT_SPLIT_LENGTH_PENALTY
                 )
                 subsample = max(1, int(getattr(args, "split_subsample", 1) or 1))
                 max_off = abs(int(args.max_offset_seconds * SAMPLE_RATE))
-                # Joint framerate + split search: score the piecewise alignment at
-                # every candidate framerate scale (reusing the pipelines the global
-                # search already fit) and keep the best-scoring one, rather than
-                # committing to the scale the single-offset FFT search preferred.
-                candidate_pipes = [p for p in srt_pipes if not callable(p)]
-                if best_srt_pipe not in candidate_pipes:
-                    candidate_pipes.append(cast(Pipeline, best_srt_pipe))
-                best_split: Optional[Tuple[float, List[float], Pipeline]] = None
-                for cand_pipe in candidate_pipes:
-                    cand_offsets, cand_score = compute_split_offsets(
-                        reference_speech,
-                        list(cand_pipe.named_steps["scale"].subs_),
-                        sample_rate=SAMPLE_RATE,
-                        start_seconds=args.start_seconds,
-                        split_penalty=split_penalty * SAMPLE_RATE,
-                        length_penalty=length_penalty,
-                        offset_step_samples=1.0 / subsample,
-                        max_offset_samples=max_off,
-                        return_score=True,
-                        log_segments=False,
+                offsets_samples: List[Optional[float]]
+                if use_split:
+                    # Joint framerate + split search: score the piecewise alignment at
+                    # every candidate framerate scale (reusing the pipelines the global
+                    # search already fit) and keep the best-scoring one, rather than
+                    # committing to the scale the single-offset FFT search preferred.
+                    candidate_pipes = [p for p in srt_pipes if not callable(p)]
+                    if best_srt_pipe not in candidate_pipes:
+                        candidate_pipes.append(cast(Pipeline, best_srt_pipe))
+                    best_split: Optional[Tuple[float, List[float], Pipeline]] = None
+                    for cand_pipe in candidate_pipes:
+                        cand_offsets, cand_score = compute_split_offsets(
+                            reference_speech,
+                            list(cand_pipe.named_steps["scale"].subs_),
+                            sample_rate=SAMPLE_RATE,
+                            start_seconds=args.start_seconds,
+                            split_penalty=split_penalty * SAMPLE_RATE,
+                            length_penalty=length_penalty,
+                            offset_step_samples=1.0 / subsample,
+                            max_offset_samples=max_off,
+                            return_score=True,
+                            log_segments=False,
+                        )
+                        if best_split is None or cand_score > best_split[0]:
+                            best_split = (cand_score, cand_offsets, cand_pipe)
+                    assert best_split is not None
+                    _, split_offs, best_split_pipe = best_split
+                    offsets_samples = list(split_offs)
+                    if best_split_pipe is not best_srt_pipe:
+                        logger.info(
+                            "split search preferred framerate scale %.3f (single-offset "
+                            "search had chosen %.3f)",
+                            best_split_pipe.named_steps["scale"].scale_factor,
+                            scale_step.scale_factor,
+                        )
+                    scale_step = best_split_pipe.named_steps["scale"]
+                else:
+                    auto_max_search = max(
+                        float(args.max_offset_seconds),
+                        DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
                     )
-                    if best_split is None or cand_score > best_split[0]:
-                        best_split = (cand_score, cand_offsets, cand_pipe)
-                assert best_split is not None
-                _, offsets_samples, best_split_pipe = best_split
-                if best_split_pipe is not best_srt_pipe:
-                    logger.info(
-                        "split search preferred framerate scale %.3f (single-offset "
-                        "search had chosen %.3f)",
-                        best_split_pipe.named_steps["scale"].scale_factor,
-                        scale_step.scale_factor,
+                    auto_search_samples = int(round(auto_max_search * SAMPLE_RATE))
+                    precomputed_offsets: Dict[int, float] = {}
+                    if aligner is not None:
+                        for cand_score_tuple, cand_pipe in getattr(
+                            aligner, "_scores", []
+                        ):
+                            precomputed_offsets[id(cand_pipe)] = float(
+                                cand_score_tuple[1]
+                            )
+
+                    def _run_auto_for_pipe(
+                        cand_pipe: Pipeline, cand_global: float
+                    ) -> Tuple[float, List[Optional[float]], Pipeline]:
+                        cand_offsets, cand_score = compute_auto_split_offsets(
+                            reference_speech,
+                            list(cand_pipe.named_steps["scale"].subs_),
+                            global_offset_samples=cand_global,
+                            sample_rate=SAMPLE_RATE,
+                            start_seconds=args.start_seconds,
+                            split_penalty=DEFAULT_AUTO_SPLIT_PENALTY * SAMPLE_RATE,
+                            length_penalty=length_penalty,
+                            offset_step_samples=1.0 / subsample,
+                            max_search_samples=auto_search_samples,
+                            log_segments=False,
+                        )
+                        cand_scale = float(cand_pipe.named_steps["scale"].scale_factor)
+                        norm_score = cand_score * min(1.0 / cand_scale, 1.0)
+                        return norm_score, cand_offsets, cand_pipe
+
+                    best_auto = _run_auto_for_pipe(
+                        cast(Pipeline, best_srt_pipe), float(offset_samples)
                     )
-                scale_step = best_split_pipe.named_steps["scale"]
+                    first_segs = summarize_split_segments(best_auto[1], SAMPLE_RATE)
+                    first_dropped = count_dropped_cues(best_auto[1])
+                    needs_alt_scale_check = (
+                        len(first_segs) > 1
+                        or first_dropped > 0
+                        or best_score < 0
+                        or abs(scale_step.scale_factor - 1.0) > 1e-6
+                    )
+                    if needs_alt_scale_check:
+                        for cand_pipe in srt_pipes:
+                            if callable(cand_pipe) or cand_pipe is best_srt_pipe:
+                                continue
+                            cand_global = precomputed_offsets.get(id(cand_pipe))
+                            if cand_global is None:
+                                cand_global = float(
+                                    FFTAligner(
+                                        max_offset_samples=auto_search_samples
+                                    ).fit_transform(
+                                        reference_speech, cand_pipe.transform(None)
+                                    )
+                                )
+                            cand_res = _run_auto_for_pipe(cand_pipe, cand_global)
+                            if cand_res[0] > best_auto[0]:
+                                best_auto = cand_res
+                    _, offsets_samples, best_auto_pipe = best_auto
+                    if best_auto_pipe is not best_srt_pipe:
+                        logger.info(
+                            "auto-split preferred framerate scale %.3f (single-offset "
+                            "search had chosen %.3f)",
+                            best_auto_pipe.named_steps["scale"].scale_factor,
+                            scale_step.scale_factor,
+                        )
+                    scale_step = best_auto_pipe.named_steps["scale"]
                 log_split_segments(offsets_samples, SAMPLE_RATE)
-                offsets_seconds = [
-                    off / float(SAMPLE_RATE) + args.apply_offset_seconds
+                dropped_cues = count_dropped_cues(offsets_samples)
+                if not sync_was_successful and alignment_has_positive_signal(
+                    reference_speech,
+                    list(scale_step.subs_),
+                    offsets_samples,
+                    sample_rate=SAMPLE_RATE,
+                    start_seconds=args.start_seconds,
+                    length_penalty=length_penalty,
+                ):
+                    sync_was_successful = True
+                offsets_seconds: List[Optional[float]] = [
+                    None
+                    if off is None
+                    else off / float(SAMPLE_RATE) + args.apply_offset_seconds
                     for off in offsets_samples
                 ]
-                shift_step: TransformerMixin = VariableSubtitleShifter(offsets_seconds)
-                if offsets_seconds:
-                    offset_seconds = float(np.median(offsets_seconds))
+                valid_offsets = [off for off in offsets_seconds if off is not None]
+                split_segments = [
+                    {
+                        "count": count,
+                        "offset_seconds": off_s + args.apply_offset_seconds,
+                    }
+                    for count, off_s in summarize_split_segments(
+                        offsets_samples, SAMPLE_RATE
+                    )
+                ]
+                if len(split_segments) <= 1 and dropped_cues == 0 and valid_offsets:
+                    offset_seconds = valid_offsets[0]
+                    shift_step: TransformerMixin = SubtitleShifter(offset_seconds)
+                else:
+                    shift_step = VariableSubtitleShifter(offsets_seconds)
+                    if valid_offsets:
+                        offset_seconds = float(np.median(valid_offsets))
             else:
                 shift_step = SubtitleShifter(offset_seconds)
             output_steps: List[Tuple[str, TransformerMixin]] = [("shift", shift_step)]
@@ -361,6 +485,8 @@ def try_sync(
         else:
             result["offset_seconds"] = offset_seconds
             result["framerate_scale_factor"] = scale_step.scale_factor
+            result["split_segments"] = split_segments
+            result["dropped_cues"] = dropped_cues
     result["sync_was_successful"] = sync_was_successful
     return sync_was_successful
 
@@ -799,6 +925,8 @@ def run(
         "retval": 0,
         "offset_seconds": None,
         "framerate_scale_factor": None,
+        "split_segments": None,
+        "dropped_cues": 0,
     }
     args = validate_and_transform_args(parser_or_args)
     if args is None:
@@ -951,6 +1079,13 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         "typical. Pass the flag with no value to use a reasonable default "
         "(%.0f). If the flag is omitted entirely (the default), a single global "
         "offset is used as before." % DEFAULT_SPLIT_PENALTY,
+    )
+    parser.add_argument(
+        "--auto-split",
+        action="store_true",
+        help="Safe two-stage piecewise sync: check timeline health at the global "
+        "offset and only introduce monotonic, validated mid-file breaks when a "
+        "genuine misaligned region is detected.",
     )
     parser.add_argument(
         "--split-length-penalty",

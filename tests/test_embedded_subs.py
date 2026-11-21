@@ -276,3 +276,134 @@ def test_build_ffmpeg_args_keeps_aresample_filter():
     args = t._build_ffmpeg_args("movie.mkv")
     assert "-af" in args
     assert args[args.index("-af") + 1] == "aresample=async=1"
+
+
+def _srt_at(timestamps):
+    lines = []
+    for idx, ts in enumerate(timestamps, 1):
+        h = int(ts // 3600)
+        m = int((ts % 3600) // 60)
+        s = ts % 60
+        lines.append(str(idx))
+        lines.append("{:02d}:{:02d}:{:06.3f}".format(h, m, s).replace(".", ",") + " --> " +
+                     "{:02d}:{:02d}:{:06.3f}".format(h, m, s + 0.8).replace(".", ","))
+        lines.append("line {}".format(idx))
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def test_forced_and_commentary_streams_are_deprioritized(monkeypatch):
+    # Tagged forced and commentary tracks should not even be extracted when a normal
+    # track exists; and untagged sparse forced tracks with late timestamps must lose
+    # to full dialogue tracks.
+    calls = _install_fake_popen(
+        monkeypatch,
+        probe_lines=[
+            "2,subrip,1,0,Forced",
+            "3,subrip,0,1,Director Commentary",
+            "4,subrip,0,0,English",
+        ],
+        srt_by_stream={"0:4": _srt(15)},
+    )
+    t = _transformer()
+    t.try_fit_using_embedded_subs("movie.mkv")
+    ffmpeg_call = next(c for c in calls if "ffmpeg" in os.path.basename(c[0]).lower())
+    mapped = [ffmpeg_call[i + 1] for i, a in enumerate(ffmpeg_call) if a == "-map"]
+    assert mapped == ["0:4"]
+
+    # Untagged tracks: 0:2 has only 2 cues ending at 3600s, 0:3 has 40 cues ending at 120s
+    sparse_forced = _srt_at([10.0, 3600.0])
+    full_dialogue = _srt_at([2.0 + i * 3.0 for i in range(40)])
+    _install_fake_popen(
+        monkeypatch,
+        probe_lines=["2,subrip", "3,subrip"],
+        srt_by_stream={"0:2": sparse_forced, "0:3": full_dialogue},
+    )
+    t2 = _transformer()
+    t2.try_fit_using_embedded_subs("movie.mkv")
+    assert np.array_equal(t2.video_speech_results_, _parse_speech_results(full_dialogue))
+
+
+def test_find_pgs_stream_skips_forced_when_full_exists(monkeypatch):
+    monkeypatch.setattr(st, "ffmpeg_bin_path", lambda *a, **k: "ffprobe")
+    monkeypatch.setattr(
+        st.ffmpeg,
+        "probe",
+        lambda *a, **k: {
+            "streams": [
+                {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "hdmv_pgs_subtitle",
+                    "disposition": {"forced": 1, "comment": 0},
+                    "tags": {"title": "Forced"},
+                },
+                {
+                    "index": 3,
+                    "codec_type": "subtitle",
+                    "codec_name": "hdmv_pgs_subtitle",
+                    "disposition": {"forced": 0, "comment": 0},
+                    "tags": {"title": "English"},
+                },
+            ]
+        },
+    )
+    assert st.find_pgs_stream("movie.mkv") == "0:s:1"
+
+
+def test_find_vobsub_stream_skips_commentary_and_forced(monkeypatch):
+    monkeypatch.setattr(st, "ffmpeg_bin_path", lambda *a, **k: "ffprobe")
+    monkeypatch.setattr(
+        st.ffmpeg,
+        "probe",
+        lambda *a, **k: {
+            "streams": [
+                {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "dvd_subtitle",
+                    "disposition": {"forced": 0, "comment": 1},
+                    "tags": {"title": "Commentary"},
+                },
+                {
+                    "index": 3,
+                    "codec_type": "subtitle",
+                    "codec_name": "dvd_subtitle",
+                    "disposition": {"forced": 1, "comment": 0},
+                    "tags": {"title": "Forced"},
+                },
+                {
+                    "index": 4,
+                    "codec_type": "subtitle",
+                    "codec_name": "dvd_subtitle",
+                    "disposition": {"forced": 0, "comment": 0},
+                    "tags": {"title": "English"},
+                },
+            ]
+        },
+    )
+    assert st.find_pgs_stream("movie.mkv") == "0:s:2"
+    assert st._find_bitmap_timing_streams("movie.mkv", include_deprioritized=False) == [
+        ("0:s:2", 4, "dvd_subtitle")
+    ]
+
+
+def test_find_bitmap_timing_streams_excludes_only_commentary_when_requested(monkeypatch):
+    monkeypatch.setattr(st, "ffmpeg_bin_path", lambda *a, **k: "ffprobe")
+    monkeypatch.setattr(
+        st.ffmpeg,
+        "probe",
+        lambda *a, **k: {
+            "streams": [
+                {
+                    "index": 2,
+                    "codec_type": "subtitle",
+                    "codec_name": "dvd_subtitle",
+                    "disposition": {"forced": 0, "comment": 1},
+                    "tags": {"title": "Director Commentary"},
+                },
+            ]
+        },
+    )
+    assert st._find_bitmap_timing_streams("movie.mkv", include_deprioritized=False) == []
+    assert st.find_pgs_stream("movie.mkv") == "0:s:0"

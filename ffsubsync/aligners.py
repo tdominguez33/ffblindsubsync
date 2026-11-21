@@ -133,7 +133,9 @@ class MaxScoreAligner(TransformerMixin):
     ) -> "MaxScoreAligner":
         if not isinstance(subpipes, list):
             subpipes = [subpipes]
-        for subpipe in subpipes:
+        total = len(subpipes)
+        for idx, subpipe in enumerate(subpipes, 1):
+            logger.info("computing alignment %d/%d...", idx, total)
             if callable(subpipe):
                 self.fit_gss(refstring, subpipe)
                 continue

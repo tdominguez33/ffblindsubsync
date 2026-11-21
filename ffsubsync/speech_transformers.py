@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import timedelta
-from typing import cast, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import cast, Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import ffmpeg
 import numpy as np
@@ -253,6 +253,20 @@ _BITMAP_SUBTITLE_CODECS: frozenset = frozenset(
 )
 
 
+def _is_deprioritized_sub_track(
+    title: str = "", forced: Any = 0, comment: Any = 0
+) -> bool:
+    """Return True if a subtitle track appears to be forced/commentary/signs."""
+    if str(forced).strip() in ("1", "true", "True") or str(comment).strip() in (
+        "1",
+        "true",
+        "True",
+    ):
+        return True
+    low = (title or "").lower()
+    return any(tok in low for tok in ("forced", "commentary", "signs", "songs"))
+
+
 def _probe_embedded_subtitle_streams(
     fname: str,
     ffmpeg_path: Optional[str] = None,
@@ -264,6 +278,7 @@ def _probe_embedded_subtitle_streams(
     so that every subtitle stream can be extracted in a single ffmpeg pass.
     Bitmap subtitle codecs (PGS, VobSub, DVB, ...) are skipped because they
     cannot be muxed to SRT and would otherwise abort the whole extraction.
+    Forced / commentary tracks are deprioritized when full tracks exist.
 
     Returns ``None`` when ffprobe is unavailable or fails, signaling the
     caller to fall back to extracting streams one at a time.
@@ -275,7 +290,7 @@ def _probe_embedded_subtitle_streams(
         "-select_streams",
         "s",
         "-show_entries",
-        "stream=index,codec_name",
+        "stream=index,codec_name:stream_disposition=forced,comment:stream_tags=title",
         "-of",
         "csv=p=0",
         fname,
@@ -288,17 +303,25 @@ def _probe_embedded_subtitle_streams(
         return None
     if process.returncode != 0:
         return None
-    streams: List[str] = []
+    preferred: List[str] = []
+    deprioritized: List[str] = []
     for line in output.decode("utf-8", errors="replace").splitlines():
-        parts = line.strip().split(",")
+        parts = [p.strip() for p in line.strip().split(",", 4)]
         if not parts or not parts[0].isdigit():
             continue
         index = parts[0]
-        codec_name = parts[1].strip().lower() if len(parts) > 1 else ""
+        codec_name = parts[1].lower() if len(parts) > 1 else ""
         if codec_name in _BITMAP_SUBTITLE_CODECS:
             continue
-        streams.append("0:{}".format(index))
-    return streams or None
+        disp_flags = [p for p in parts[2:4] if p in ("0", "1")]
+        is_flagged = any(p == "1" for p in disp_flags)
+        title = ",".join(parts[2 + len(disp_flags) :])
+        spec = "0:{}".format(index)
+        if _is_deprioritized_sub_track(title=title, forced="1" if is_flagged else "0"):
+            deprioritized.append(spec)
+        else:
+            preferred.append(spec)
+    return (preferred or deprioritized) or None
 
 
 _FUSION_STRATEGIES: Tuple[str, ...] = ("weighted", "intersection", "union")
@@ -512,7 +535,7 @@ class VideoSpeechTransformer(TransformerMixin):
                     fname, list(map("0:s:{}".format, range(5)))
                 )
         embedded_subs = []
-        embedded_subs_times = []
+        embedded_scores = []
         for buffer in subtitle_buffers:
             pipe = cast(
                 Pipeline,
@@ -520,15 +543,18 @@ class VideoSpeechTransformer(TransformerMixin):
             ).fit(buffer)
             speech_step = pipe.steps[-1][1]
             embedded_subs.append(speech_step)
-            embedded_subs_times.append(speech_step.max_time_)
+            speech_samples = float(np.sum(speech_step.subtitle_speech_results_ > 0))
+            embedded_scores.append((speech_samples, float(speech_step.max_time_ or 0.0)))
         if len(embedded_subs) == 0:
             if self.ref_stream is None:
                 error_msg = "Video file appears to lack subtitle stream"
             else:
                 error_msg = "Stream {} not found".format(self.ref_stream)
             raise ValueError(error_msg)
-        # use longest set of embedded subs
-        subs_to_use = embedded_subs[int(np.argmax(embedded_subs_times))]
+        # Prefer the track with the most actual dialogue (tie-breaking on max_time_)
+        # so sparse Forced / Commentary tracks don't beat full dialogue tracks.
+        best_idx = max(range(len(embedded_subs)), key=lambda i: embedded_scores[i])
+        subs_to_use = embedded_subs[best_idx]
         self.video_speech_results_ = subs_to_use.subtitle_speech_results_
 
     def _build_ffmpeg_args(self, fname: str) -> List[str]:
@@ -555,6 +581,11 @@ class VideoSpeechTransformer(TransformerMixin):
             ffmpeg_args.extend(["-map", self.ref_stream])
         ffmpeg_args.extend(
             [
+                "-vn",
+                "-sn",
+                "-dn",
+                "-threads",
+                "0",
                 "-f",
                 "s16le",
                 "-ac",
@@ -626,6 +657,58 @@ class VideoSpeechTransformer(TransformerMixin):
                 return self
             except Exception as e:
                 logger.info(e)
+            if self.ref_stream is None and not is_remote_url(fname):
+                try:
+                    bitmap_streams = _find_bitmap_timing_streams(
+                        fname,
+                        ffmpeg_path=self.ffmpeg_path,
+                        gui_mode=self.gui_mode,
+                        include_deprioritized=False,
+                    )
+                    for pgs_stream, _, codec_name in bitmap_streams[:3]:
+                        try:
+                            pgs = PGSSpeechTransformer(
+                                sample_rate=self.sample_rate,
+                                start_seconds=self.start_seconds,
+                                ffmpeg_path=self.ffmpeg_path,
+                                ref_stream=pgs_stream,
+                                gui_mode=self.gui_mode,
+                            ).fit(fname)
+                            pgs_res = pgs.transform(fname)
+                            active_sec = float(np.sum(pgs_res > 0)) / float(
+                                self.sample_rate
+                            )
+                            num_timings = getattr(pgs, "num_timings_", 0)
+                            if active_sec >= 50.0 and num_timings >= 20:
+                                kind_label = (
+                                    "PGS"
+                                    if codec_name == "hdmv_pgs_subtitle"
+                                    else "VobSub"
+                                )
+                                logger.info(
+                                    "using %s subtitle stream %s as reference "
+                                    "(%d cues, %.1fs active captions)",
+                                    kind_label,
+                                    pgs_stream,
+                                    num_timings,
+                                    active_sec,
+                                )
+                                self.video_speech_results_ = pgs_res
+                                return self
+                            logger.info(
+                                "skipping bitmap stream %s (%d cues, %.1fs active captions)",
+                                pgs_stream,
+                                num_timings,
+                                active_sec,
+                            )
+                        except Exception as e:
+                            logger.info(
+                                "bitmap stream %s failed (%s)", pgs_stream, e
+                            )
+                except Exception as e:
+                    logger.info(
+                        "PGS/VobSub fallback failed (%s); falling back to audio VAD", e
+                    )
         temp_audio = None
         if self.extract_audio_first and is_remote_url(fname):
             temp_audio = self._extract_audio_to_temp(fname)
@@ -691,7 +774,7 @@ class VideoSpeechTransformer(TransformerMixin):
         process = subprocess.Popen(ffmpeg_args, **subprocess_args(include_stdout=True))
         bytes_per_frame = 2
         frames_per_window = bytes_per_frame * self.frame_rate // self.sample_rate
-        windows_per_buffer = 10000
+        windows_per_buffer = 2500
         simple_progress = 0.0
 
         redirect_stderr = None
@@ -1018,38 +1101,75 @@ class DeserializeSpeechTransformer(TransformerMixin):
         return self.deserialized_speech_results_
 
 
-def find_pgs_stream(
+_TIMING_BITMAP_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle"})
+
+
+def _find_bitmap_timing_streams(
     fname: str,
     ffmpeg_path: Optional[str] = None,
     gui_mode: bool = False,
-) -> Optional[str]:
-    """Return the ffmpeg stream specifier for the first PGS subtitle track in *fname*.
-
-    Uses ``ffprobe`` to inspect the file.  Returns a string like ``"0:s:0"`` on
-    success, or ``None`` if the file has no ``hdmv_pgs_subtitle`` streams.
-    """
+    include_deprioritized: bool = True,
+) -> List[Tuple[str, Any, str]]:
+    """Return ``(specifier, stream_index, codec_name)`` tuples for PGS/VobSub tracks."""
     try:
         probe = ffmpeg.probe(
             fname,
             cmd=ffmpeg_bin_path("ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path),
         )
     except Exception as e:
-        logger.warning("ffprobe failed while searching for PGS streams: %s", e)
-        return None
+        logger.warning("ffprobe failed while searching for PGS/VobSub streams: %s", e)
+        return []
 
     sub_index = 0
+    preferred: List[Tuple[str, Any, str]] = []
+    fallback: List[Tuple[str, Any, str]] = []
     for stream in probe.get("streams", []):
         if stream.get("codec_type") == "subtitle":
-            if stream.get("codec_name") == "hdmv_pgs_subtitle":
+            codec_name = (stream.get("codec_name") or "").lower()
+            if codec_name in _TIMING_BITMAP_SUBTITLE_CODECS:
                 specifier = "0:s:{}".format(sub_index)
-                logger.info(
-                    "auto-detected PGS stream: %s (ffmpeg stream index %s)",
-                    specifier,
-                    stream.get("index"),
-                )
-                return specifier
+                disp = stream.get("disposition") or {}
+                tags = stream.get("tags") or {}
+                entry = (specifier, stream.get("index"), codec_name)
+                if not _is_deprioritized_sub_track(
+                    title=tags.get("title", ""),
+                    forced=disp.get("forced", 0),
+                    comment=disp.get("comment", 0),
+                ):
+                    preferred.append(entry)
+                else:
+                    fallback.append(entry)
             sub_index += 1
 
+    return preferred + fallback if include_deprioritized else preferred
+
+
+def find_pgs_stream(
+    fname: str,
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Optional[str]:
+    """Return the ffmpeg stream specifier for the first PGS/VobSub subtitle track in *fname*.
+
+    Uses ``ffprobe`` to inspect the file.  Returns a string like ``"0:s:0"`` on
+    success, or ``None`` if the file has no ``hdmv_pgs_subtitle`` or
+    ``dvd_subtitle`` streams.
+    """
+    candidates = _find_bitmap_timing_streams(
+        fname,
+        ffmpeg_path=ffmpeg_path,
+        gui_mode=gui_mode,
+        include_deprioritized=True,
+    )
+    if candidates:
+        specifier, stream_idx, codec_name = candidates[0]
+        logger.info(
+            "auto-detected %s stream: %s (ffmpeg stream index %s)",
+            codec_name,
+            specifier,
+            stream_idx,
+        )
+        return specifier
     return None
 
 
@@ -1101,7 +1221,7 @@ def _get_pgs_timings_via_ffprobe(
             size = int(size_str)
         except ValueError:
             continue
-        if size > 50:  # skip clear events (~30 bytes)
+        if size > 50 and duration_time > 0:  # skip clear events (~30 bytes) and zero-duration packets
             results.append((pts_time, pts_time + duration_time))
 
     if not results:
@@ -1153,13 +1273,14 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
         self.ref_stream: Optional[str] = ref_stream
         self.gui_mode: bool = gui_mode
         self.pgs_speech_results_: Optional[np.ndarray] = None
+        self.num_timings_: int = 0
 
     def fit(self, fname: str, *_) -> "PGSSpeechTransformer":
         if self.ref_stream is None:
             stream = find_pgs_stream(fname, self.ffmpeg_path, self.gui_mode)
             if stream is None:
                 raise ValueError(
-                    "No hdmv_pgs_subtitle stream found in {}. "
+                    "No hdmv_pgs_subtitle / dvd_subtitle (PGS/VobSub) stream found in {}. "
                     "Specify one explicitly with --pgs-ref-stream.".format(fname)
                 )
         else:
@@ -1167,21 +1288,23 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
             if not stream.startswith("0:"):
                 stream = "0:" + stream
 
-        logger.info("reading PGS timings for stream %s from %s...", stream, fname)
+        logger.info("reading PGS/VobSub timings for stream %s from %s...", stream, fname)
         timings = _get_pgs_timings_via_ffprobe(
             fname, stream, self.ffmpeg_path, self.gui_mode
         )
         if timings is None:
             raise ValueError(
-                "Failed to get PGS timings via ffprobe for stream {} from {}. "
-                "Make sure the stream exists and is an hdmv_pgs_subtitle track "
+                "Failed to get PGS/VobSub timings via ffprobe for stream {} from {}. "
+                "Make sure the stream exists and is an hdmv_pgs_subtitle / dvd_subtitle track "
                 "(check with: ffprobe -show_streams {}).".format(stream, fname, fname)
             )
 
         if not timings:
             raise ValueError(
-                "No subtitle timings found in PGS stream {}.".format(stream)
+                "No subtitle timings found in PGS/VobSub stream {}.".format(stream)
             )
+
+        self.num_timings_ = len(timings)
 
         logger.info("found %d PGS subtitle segments", len(timings))
         for i, (s, e) in enumerate(timings[:8]):

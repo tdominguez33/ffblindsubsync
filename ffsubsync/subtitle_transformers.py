@@ -2,7 +2,7 @@
 from datetime import timedelta
 import logging
 import numbers
-from typing import List, Union
+from typing import List, Optional, Union
 
 from ffsubsync.generic_subtitles import GenericSubtitle, GenericSubtitlesFile, SubsMixin
 from ffsubsync.sklearn_shim import TransformerMixin
@@ -31,14 +31,17 @@ class VariableSubtitleShifter(SubsMixin, TransformerMixin):
     """Shift each cue by its own offset (alass-style piecewise alignment).
 
     ``offsets_seconds`` must be parallel to the input cues -- one offset per cue,
-    in the same order. This is the per-cue analogue of :class:`SubtitleShifter`
-    (which applies a single offset to the whole file).
+    in the same order (``None`` drops orphan cues from deleted scenes). This is
+    the per-cue analogue of :class:`SubtitleShifter` (which applies a single
+    offset to the whole file).
     """
 
-    def __init__(self, offsets_seconds: List[Union[float, timedelta]]):
+    def __init__(self, offsets_seconds: List[Optional[Union[float, timedelta]]]):
         super(SubsMixin, self).__init__()
-        self.offsets = [
-            off if isinstance(off, timedelta) else timedelta(seconds=off)
+        self.offsets: List[Optional[timedelta]] = [
+            None
+            if off is None
+            else (off if isinstance(off, timedelta) else timedelta(seconds=off))
             for off in offsets_seconds
         ]
 
@@ -48,10 +51,31 @@ class VariableSubtitleShifter(SubsMixin, TransformerMixin):
                 "expected one offset per cue (got %d offsets for %d cues)"
                 % (len(self.offsets), len(subs))
             )
-        shifted = [
-            GenericSubtitle(sub.start + td, sub.end + td, sub.inner)
-            for sub, td in zip(subs, self.offsets)
-        ]
+        zero = timedelta(0)
+        min_dur = timedelta(milliseconds=100)
+        min_prev_dur = timedelta(milliseconds=50)
+        shifted: List[GenericSubtitle] = []
+        prev_td: Optional[timedelta] = None
+        for sub, td in zip(subs, self.offsets):
+            if td is None:
+                continue
+            start = sub.start + td
+            end = sub.end + td
+            if start < zero:
+                start = zero
+                end = max(end, min_dur) if end > zero else min_dur
+            if end < start:
+                end = start
+            if shifted and prev_td is not None and prev_td != td:
+                prev_sub = shifted[-1]
+                if prev_sub.end > start:
+                    prev_sub.end = max(
+                        prev_sub.start + min_prev_dur, min(prev_sub.end, start)
+                    )
+                    start = max(start, prev_sub.end)
+                    end = max(end, start + min_dur)
+            shifted.append(GenericSubtitle(start, end, sub.inner))
+            prev_td = td
         self.subs_ = subs.clone_props_for_subs(shifted)
         return self
 

@@ -115,3 +115,18 @@ def test_skips_packets_with_missing_fields(mock_probe, mock_bin):
     }
     result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
     assert result == [(10.0, 11.0)]
+
+
+@patch("ffsubsync.speech_transformers.ffmpeg_bin_path", return_value="ffprobe")
+@patch("ffsubsync.speech_transformers.ffmpeg.probe")
+def test_skips_zero_duration_packets(mock_probe, mock_bin):
+    """Packets with duration_time <= 0 must be skipped."""
+    mock_probe.return_value = {
+        "packets": [
+            _make_packet(1.0, 0.0, 1000),
+            _make_packet(2.0, -0.5, 1000),
+            _make_packet(5.0, 1.5, 900),
+        ]
+    }
+    result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
+    assert result == [(5.0, 6.5)]

@@ -63,6 +63,8 @@ def subprocess_args(include_stdout=True):
             "env": env,
         }
     )
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        ret["creationflags"] = subprocess.CREATE_NO_WINDOW
     return ret
 
 
