@@ -6,6 +6,14 @@ Automatically synchronize out-of-sync subtitles to any video, audio track, or
 reference subtitle — available as a **standalone Windows app**, a **browser
 app** (100% local, nothing uploaded), and a **command-line tool**.
 
+**Why "blind"?** When you download subtitles for a movie or episode you haven't
+watched yet, you don't want to scrub through scenes, tweak flags, or risk
+spoilers just to get the timing right. Unlike the original `ffsubsync`,
+**FFblindsubsync** is built around doing the best possible **one-shot,
+hands-off sync** out of the box — automatically choosing the cleanest reference
+in your video, safely handling mid-file cuts or release differences, and giving
+you a ready-to-use desktop and browser interface with zero guesswork.
+
 > Based on [smacke/ffsubsync](https://github.com/smacke/ffsubsync) **v0.5.1**
 > by Stephen Macke.
 
