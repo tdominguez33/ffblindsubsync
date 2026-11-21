@@ -56,6 +56,74 @@ def _is_subtitle_ref(path: str) -> bool:
     return ext in SUBTITLE_EXTENSIONS or ext in ("npz", "npy")
 
 
+_DEFAULT_WIN_WIDTH = 760
+_DEFAULT_WIN_HEIGHT = 720
+_MIN_WIN_WIDTH = 620
+_MIN_WIN_HEIGHT = 580
+
+
+def _is_rect_visible_on_screens(x: int, y: int, width: int, height: int) -> bool:
+    """Return True if at least a draggable portion of the window is on a connected screen."""
+    try:
+        screens = list(webview.screens)
+    except Exception:
+        screens = []
+    if not screens:
+        return True
+    for s in screens:
+        sx, sy, sw, sh = int(s.x), int(s.y), int(s.width), int(s.height)
+        overlap_w = min(x + width, sx + sw) - max(x, sx)
+        overlap_h = min(y + height, sy + sh) - max(y, sy)
+        # Ensure the titlebar area isn't completely off the top of the screen.
+        if overlap_w >= 80 and overlap_h >= 40 and y >= sy - 16:
+            return True
+    return False
+
+
+def _resolve_initial_window_geometry(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Read and validate persisted window size/position from desktop config."""
+    win = cfg.get("window") if isinstance(cfg.get("window"), dict) else {}
+    try:
+        width = int(win.get("width", _DEFAULT_WIN_WIDTH))
+    except (TypeError, ValueError):
+        width = _DEFAULT_WIN_WIDTH
+    try:
+        height = int(win.get("height", _DEFAULT_WIN_HEIGHT))
+    except (TypeError, ValueError):
+        height = _DEFAULT_WIN_HEIGHT
+
+    width = max(_MIN_WIN_WIDTH, min(width, 10000))
+    height = max(_MIN_WIN_HEIGHT, min(height, 10000))
+    maximized = bool(win.get("maximized", False))
+
+    x = win.get("x")
+    y = win.get("y")
+    try:
+        x_int = int(x) if x is not None else None
+        y_int = int(y) if y is not None else None
+    except (TypeError, ValueError):
+        x_int, y_int = None, None
+
+    if (
+        x_int is not None
+        and y_int is not None
+        and x_int > -10000
+        and y_int > -10000
+        and _is_rect_visible_on_screens(x_int, y_int, width, height)
+    ):
+        pos_x, pos_y = x_int, y_int
+    else:
+        pos_x, pos_y = None, None
+
+    return {
+        "width": width,
+        "height": height,
+        "x": pos_x,
+        "y": pos_y,
+        "maximized": maximized,
+    }
+
+
 def _config_path() -> Path:
     return get_portable_dir() / "config.json"
 
@@ -130,7 +198,7 @@ class _PhaseLogHandler(logging.Handler):
 class DesktopApi:
     """Thread-safe JS <-> Python bridge for the native Windows desktop UI."""
 
-    def __init__(self) -> None:
+    def __init__(self, initial_geom: Optional[Dict[str, Any]] = None) -> None:
         self._window: Optional[webview.Window] = None
         self._lock = threading.Lock()
         self._dl_seq = 0
@@ -141,6 +209,15 @@ class DesktopApi:
         self._sync_state: Dict[str, Any] = {"active": False, "done": False, "seq": 0}
         self._config: Dict[str, Any] = _load_desktop_config()
         self._custom_ffmpeg_path: str = str(self._config.get("ffmpeg_path") or "").strip()
+        geom = initial_geom or _resolve_initial_window_geometry(self._config)
+        self._win_state: Dict[str, Any] = {
+            "width": geom["width"],
+            "height": geom["height"],
+            "x": geom["x"],
+            "y": geom["y"],
+            "maximized": geom["maximized"],
+        }
+        self._win_save_timer: Optional[threading.Timer] = None
 
     def attach_window(self, window: webview.Window) -> None:
         self._window = window
@@ -692,6 +769,90 @@ class DesktopApi:
         except Exception:
             return False
 
+    def _window_is_minimized(self) -> bool:
+        native, _ = self._get_native_winforms()
+        if native is None:
+            return False
+        try:
+            import System.Windows.Forms as WinForms
+
+            return native.WindowState == WinForms.FormWindowState.Minimized
+        except Exception:
+            return False
+
+    def _schedule_window_state_save(self) -> None:
+        with self._lock:
+            if self._win_save_timer is not None:
+                self._win_save_timer.cancel()
+            timer = threading.Timer(0.4, self._persist_window_state)
+            timer.daemon = True
+            self._win_save_timer = timer
+            timer.start()
+
+    def _persist_window_state(self) -> None:
+        with self._lock:
+            if self._win_save_timer is not None:
+                self._win_save_timer.cancel()
+                self._win_save_timer = None
+            state = dict(self._win_state)
+            self._config["window"] = state
+            _save_desktop_config(self._config)
+
+    def record_window_resize(self, width: int, height: int) -> None:
+        if self._window_is_minimized() or self.window_is_maximized():
+            return
+        w, h = int(width), int(height)
+        if w < _MIN_WIN_WIDTH or h < _MIN_WIN_HEIGHT:
+            return
+        with self._lock:
+            self._win_state["width"] = w
+            self._win_state["height"] = h
+        self._schedule_window_state_save()
+
+    def record_window_move(self, x: int, y: int) -> None:
+        if self._window_is_minimized() or self.window_is_maximized():
+            return
+        xi, yi = int(x), int(y)
+        if xi <= -10000 or yi <= -10000:
+            return
+        with self._lock:
+            self._win_state["x"] = xi
+            self._win_state["y"] = yi
+        self._schedule_window_state_save()
+
+    def record_window_maximized(self, is_max: bool) -> None:
+        with self._lock:
+            self._win_state["maximized"] = bool(is_max)
+        self._schedule_window_state_save()
+
+    def flush_window_state(self) -> None:
+        # Capture latest normal bounds directly from WinForms if available.
+        native, _ = self._get_native_winforms()
+        if native is not None:
+            try:
+                import System.Windows.Forms as WinForms
+
+                ws = native.WindowState
+                with self._lock:
+                    if ws == WinForms.FormWindowState.Maximized:
+                        self._win_state["maximized"] = True
+                    elif ws == WinForms.FormWindowState.Normal:
+                        scale = getattr(native, "_scale", 1.0) or 1.0
+                        w = int(round(native.Width / scale))
+                        h = int(round(native.Height / scale))
+                        x = int(round(native.Location.X / scale))
+                        y = int(round(native.Location.Y / scale))
+                        self._win_state["maximized"] = False
+                        if w >= _MIN_WIN_WIDTH and h >= _MIN_WIN_HEIGHT:
+                            self._win_state["width"] = w
+                            self._win_state["height"] = h
+                        if x > -10000 and y > -10000:
+                            self._win_state["x"] = x
+                            self._win_state["y"] = y
+            except Exception:
+                pass
+        self._persist_window_state()
+
     def window_toggle_maximize(self) -> bool:
         native, _ = self._get_native_winforms()
         if native is None:
@@ -723,6 +884,7 @@ class DesktopApi:
             return False
 
     def window_close(self) -> None:
+        self.flush_window_state()
         if self._window is not None:
             self._window.destroy()
 
@@ -775,11 +937,14 @@ def _wire_drop_zones(window: webview.Window) -> None:
         drop_in.events.drop += DOMEventHandler(_make_drop("in"), prevent_default=True)
 
 
-def _wire_desktop_window(window: webview.Window) -> None:
-    """Wire native drop zones and maximized-state notifications for frameless mode."""
+def _wire_desktop_window(
+    window: webview.Window, api: DesktopApi, start_maximized: bool = False
+) -> None:
+    """Wire native drop zones and window geometry persistence for frameless mode."""
     _wire_drop_zones(window)
 
     def _notify_max(is_max: bool) -> None:
+        api.record_window_maximized(is_max)
         try:
             window.evaluate_js(
                 "window.setWindowMaximized && window.setWindowMaximized(%s)"
@@ -790,6 +955,13 @@ def _wire_desktop_window(window: webview.Window) -> None:
 
     window.events.maximized += lambda: _notify_max(True)
     window.events.restored += lambda: _notify_max(False)
+    window.events.resized += lambda w, h: api.record_window_resize(w, h)
+    window.events.moved += lambda x, y: api.record_window_move(x, y)
+    window.events.closing += lambda: api.flush_window_state()
+
+    if start_maximized:
+        api.window_toggle_maximize()
+        _notify_max(True)
 
 
 def main() -> int:
@@ -798,21 +970,25 @@ def main() -> int:
     mimetypes.add_type("text/javascript", ".mjs")
     mimetypes.add_type("text/css", ".css")
 
+    cfg = _load_desktop_config()
+    geom = _resolve_initial_window_geometry(cfg)
     ui_entry = str(_ui_dir() / "index.html") + "#desktop"
-    api = DesktopApi()
+    api = DesktopApi(initial_geom=geom)
     window = webview.create_window(
         "ffblindsubsync — Windows Desktop",
         url=ui_entry,
         js_api=api,
-        width=760,
-        height=720,
-        min_size=(620, 580),
+        width=geom["width"],
+        height=geom["height"],
+        x=geom["x"],
+        y=geom["y"],
+        min_size=(_MIN_WIN_WIDTH, _MIN_WIN_HEIGHT),
         frameless=True,
         easy_drag=False,
         background_color="#09090b",
     )
     api.attach_window(window)
-    webview.start(_wire_desktop_window, window, http_server=True)
+    webview.start(_wire_desktop_window, (window, api, geom["maximized"]), http_server=True)
     return 0
 
 

@@ -36,9 +36,12 @@ function buildFfmpegStatus(info) {
     } else if (info.source === "portable") {
       text = `FFmpeg ready (portable · ${info.version || "local"})`;
       actionLabel = "Update FFmpeg";
+    } else if (info.source === "appdata") {
+      text = `FFmpeg ready (${info.version || "local"})`;
+      actionLabel = "Update FFmpeg";
     } else {
       text = `FFmpeg ready (system PATH · ${info.version || "system"})`;
-      actionLabel = "Download portable FFmpeg";
+      actionLabel = "Download FFmpeg";
     }
     return {
       level: "ok",
@@ -52,7 +55,7 @@ function buildFfmpegStatus(info) {
   }
   const errText =
     (info && info.custom_error) ||
-    "FFmpeg not found (will auto-download on Sync, or click to download now)";
+    "FFmpeg not found";
   return {
     level: "err",
     text: errText,
@@ -250,10 +253,10 @@ export function createAdapter({ callbacks }) {
       const ff =
         state && state.ffmpeg
           ? {
-              ...state.ffmpeg,
-              portable_dir: state.portable_dir,
-              custom_path: state.custom_ffmpeg_path ?? state.ffmpeg.custom_path ?? "",
-            }
+            ...state.ffmpeg,
+            portable_dir: state.portable_dir,
+            custom_path: state.custom_ffmpeg_path ?? state.ffmpeg.custom_path ?? "",
+          }
           : null;
       callbacks.onRuntimeStatus(buildFfmpegStatus(ff));
     },
@@ -323,7 +326,7 @@ export function createAdapter({ callbacks }) {
 
     onThemeChange(isDark) {
       if (api && typeof api.set_theme === "function") {
-        api.set_theme(Boolean(isDark)).catch(() => {});
+        api.set_theme(Boolean(isDark)).catch(() => { });
       }
     },
   };

@@ -39,14 +39,32 @@ def _preferred_portable_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "gui"
 
 
-def _get_fallback_dir() -> Path:
-    """Return a user-writable fallback directory when the app dir is read-only."""
+def _get_appdata_dir() -> Path:
+    """Return the per-user AppData directory (default storage location)."""
     if platform.system() == "Windows":
         local_app = os.environ.get("LOCALAPPDATA")
         if local_app:
             return Path(local_app) / "ffblindsubsync"
         return Path.home() / "AppData" / "Local" / "ffblindsubsync"
     return Path.home() / ".local" / "share" / "ffblindsubsync"
+
+
+# Backwards-compatible alias
+_get_fallback_dir = _get_appdata_dir
+
+
+def is_portable_mode(app_dir: Optional[Path] = None) -> bool:
+    """Return True if a ``portable.txt`` marker (case-insensitive) exists next to the app."""
+    target = Path(app_dir) if app_dir is not None else _preferred_portable_dir()
+    try:
+        if not target.is_dir():
+            return False
+        for entry in target.iterdir():
+            if entry.is_file() and entry.name.lower() == "portable.txt":
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _is_dir_writable(path: Path) -> bool:
@@ -62,11 +80,11 @@ def _is_dir_writable(path: Path) -> bool:
 
 
 def get_portable_dir() -> Path:
-    """Return a writable portable folder next to the executable, or fallback app-data."""
+    """Return the active data directory (AppData by default, app folder if ``portable.txt`` exists)."""
     preferred = _preferred_portable_dir()
-    if _is_dir_writable(preferred):
+    if is_portable_mode(preferred) and _is_dir_writable(preferred):
         return preferred
-    return _get_fallback_dir()
+    return _get_appdata_dir()
 
 
 def _probe_ffmpeg_version(ffmpeg_exe: str) -> Optional[str]:
@@ -85,32 +103,80 @@ def _probe_ffmpeg_version(ffmpeg_exe: str) -> Optional[str]:
         return None
 
 
+def _which_in_system_path(
+    binary_name: str, exclude_dir: Optional[Path] = None
+) -> Optional[str]:
+    """Find ``binary_name`` on system PATH without implicitly matching Windows CWD ('.')."""
+    raw = shutil.which(binary_name)
+    if not raw:
+        return None
+    try:
+        excl = exclude_dir.resolve() if exclude_dir is not None else None
+        is_dot = os.path.dirname(raw) in ("", ".")
+        is_excluded = excl is not None and os.path.exists(raw) and Path(raw).resolve().parent == excl
+    except OSError:
+        is_dot = False
+        is_excluded = False
+
+    if not is_dot and not is_excluded:
+        return str(Path(raw).resolve()) if os.path.exists(raw) else raw
+
+    path_env = os.environ.get("PATH") or ""
+    for entry in path_env.split(os.pathsep):
+        cleaned = entry.strip().strip('"')
+        if not cleaned or cleaned == ".":
+            continue
+        try:
+            cand_dir = Path(cleaned).resolve()
+        except OSError:
+            continue
+        if exclude_dir is not None:
+            try:
+                if cand_dir == exclude_dir.resolve():
+                    continue
+            except OSError:
+                pass
+        cand = cand_dir / binary_name
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
 def find_ffmpeg_binaries(
     portable_dir: Optional[Path] = None,
     custom_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Locate ``ffmpeg`` and ``ffprobe`` in custom path, portable dirs, or system PATH."""
+    """Locate ``ffmpeg`` and ``ffprobe`` in custom path, data/app dirs, or system PATH."""
     ffmpeg_name, ffprobe_name = _REQUIRED_BINS
     if portable_dir is not None:
         base = Path(portable_dir)
-        candidates = [base, base / "ffmpeg-bin"]
+        candidates: List[Tuple[Path, str]] = [
+            (base, "portable"),
+            (base / "ffmpeg-bin", "portable"),
+        ]
     else:
         pref = _preferred_portable_dir()
-        fallback = _get_fallback_dir()
-        base = pref if _is_dir_writable(pref) else fallback
-        raw_candidates = [pref, pref / "ffmpeg-bin"]
-        if not getattr(sys, "frozen", False):
-            raw_candidates.extend(
-                [pref / "dist" / "FFblindsubsync", pref / "dist" / "FFsubsync"]
-            )
-        raw_candidates.extend([fallback, fallback / "ffmpeg-bin"])
+        appdata = _get_appdata_dir()
+        portable = is_portable_mode(pref)
+        if portable and _is_dir_writable(pref):
+            base = pref
+            raw_candidates: List[Tuple[Path, str]] = [
+                (pref, "portable"),
+                (pref / "ffmpeg-bin", "portable"),
+            ]
+        else:
+            base = appdata
+            raw_candidates = [
+                (appdata, "appdata"),
+                (appdata / "ffmpeg-bin", "appdata"),
+            ]
         candidates = []
         seen = set()
-        for c in raw_candidates:
+        for c, src in raw_candidates:
             key = str(c)
             if key not in seen:
                 seen.add(key)
-                candidates.append(c)
+                candidates.append((c, src))
 
     cleaned_custom = (custom_path or "").strip()
     if cleaned_custom:
@@ -143,13 +209,13 @@ def find_ffmpeg_binaries(
             "version": None,
         }
 
-    for candidate_dir in candidates:
+    for candidate_dir, source_kind in candidates:
         ff = candidate_dir / ffmpeg_name
         fp = candidate_dir / ffprobe_name
         if ff.is_file() and fp.is_file():
             return {
                 "available": True,
-                "source": "portable",
+                "source": source_kind,
                 "custom_path": "",
                 "custom_error": None,
                 "portable_dir": str(base),
@@ -159,8 +225,11 @@ def find_ffmpeg_binaries(
                 "version": _probe_ffmpeg_version(str(ff)),
             }
 
-    sys_ff = shutil.which(ffmpeg_name)
-    sys_fp = shutil.which(ffprobe_name)
+    exclude_dir = None
+    if portable_dir is None and not is_portable_mode(_preferred_portable_dir()):
+        exclude_dir = _preferred_portable_dir()
+    sys_ff = _which_in_system_path(ffmpeg_name, exclude_dir=exclude_dir)
+    sys_fp = _which_in_system_path(ffprobe_name, exclude_dir=exclude_dir)
     if sys_ff and sys_fp:
         return {
             "available": True,

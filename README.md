@@ -40,12 +40,14 @@ mid-file break alignment.
   (`.SRT`, `.VTT`, etc.), and automatic `.sub` output conversion to
   `.synced.srt` when writing text subtitles.
 
-## Windows Desktop App (Portable)
+## Windows Desktop App
 
-The portable bundle (`gui/dist/FFblindsubsync/FFblindsubsync.exe`) runs directly
-without installing Python. On first launch, if `ffmpeg` / `ffprobe` are not
-already present next to the executable (or on `PATH`), you can download them
-directly from the UI.
+The bundled app (`gui/dist/FFblindsubsync/FFblindsubsync.exe`) runs directly
+without installing Python. By default, configuration (`config.json`, including
+saved window size/position and custom FFmpeg path) and downloaded `ffmpeg` /
+`ffprobe` binaries are stored in `%LOCALAPPDATA%\ffblindsubsync`. To run in
+**portable mode** (storing everything next to `FFblindsubsync.exe`), place an
+empty `portable.txt` file (case-insensitive) next to the executable.
 
 To build the portable executable from source (Windows PowerShell):
 
@@ -53,7 +55,7 @@ To build the portable executable from source (Windows PowerShell):
 powershell -ExecutionPolicy Bypass -File .\gui\build-windows-native.ps1
 ```
 
-This outputs the portable bundle to `gui/dist/FFblindsubsync/FFblindsubsync.exe`.
+This outputs the single-file executable to `gui/dist/FFblindsubsync.exe`.
 
 ## Web Version (Browser / WebAssembly)
 

@@ -42,7 +42,41 @@ a = Analysis(
     hookspath=[os.path.join(gui_dir, "hooks")],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Unused GUI toolkits / non-Windows pywebview backends
+        "tkinter",
+        "_tkinter",
+        "tcl",
+        "tk",
+        "webview.platforms.cocoa",
+        "webview.platforms.gtk",
+        "webview.platforms.qt",
+        "webview.platforms.android",
+        "webview.platforms.cef",
+        # Redundant/CLI-only packages (cchardet + charset_normalizer cover encoding; console=False)
+        "chardet",
+        "rich",
+        "pygments",
+        "tzdata",
+        # Dev / test modules not needed at runtime
+        "pytest",
+        "_pytest",
+        "unittest",
+        "pydoc",
+        "doctest",
+        "pdb",
+        "lib2to3",
+        "numpy.testing",
+        "numpy.f2py",
+        "numpy.distutils",
+        # Optional heavy ML/scientific deps not used by desktop app
+        "PIL",
+        "matplotlib",
+        "scipy",
+        "torch",
+        "sklearn",
+        "IPython",
+    ],
     noarchive=False,
 )
 
@@ -52,22 +86,16 @@ icon_path = os.path.join(repo_root, "resources", "img", "program_icon.ico")
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="FFblindsubsync",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
     console=False,
     icon=icon_path if os.path.exists(icon_path) else None,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    name="FFblindsubsync",
 )

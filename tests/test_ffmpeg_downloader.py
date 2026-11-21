@@ -86,25 +86,69 @@ def test_download_latest_ffmpeg_extracts_binaries_and_falls_back(tmp_path, monke
     assert [p.name for p in tmp_path.iterdir() if p.suffix == ".zip"] == []
 
 
-def test_get_portable_dir_falls_back_when_preferred_readonly(tmp_path, monkeypatch):
-    readonly_dir = tmp_path / "program_files"
-    fallback_dir = tmp_path / "local_appdata"
-    fallback_dir.mkdir()
-    (fallback_dir / "ffmpeg.exe").write_bytes(b"ff")
-    (fallback_dir / "ffprobe.exe").write_bytes(b"fp")
+def test_get_portable_dir_defaults_to_appdata_and_supports_portable_marker(tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    appdata_dir = tmp_path / "local_appdata"
+    app_dir.mkdir()
+    appdata_dir.mkdir()
+    (appdata_dir / "ffmpeg.exe").write_bytes(b"ff")
+    (appdata_dir / "ffprobe.exe").write_bytes(b"fp")
 
-    monkeypatch.setattr(fd, "_preferred_portable_dir", lambda: readonly_dir)
-    monkeypatch.setattr(fd, "_get_fallback_dir", lambda: fallback_dir)
-    monkeypatch.setattr(fd, "_is_dir_writable", lambda p: p == fallback_dir)
+    monkeypatch.setattr(fd, "_preferred_portable_dir", lambda: app_dir)
+    monkeypatch.setattr(fd, "_get_appdata_dir", lambda: appdata_dir)
     monkeypatch.setattr(fd, "_probe_ffmpeg_version", lambda _p: "9.0.2")
     monkeypatch.setattr(fd, "_REQUIRED_BINS", ("ffmpeg.exe", "ffprobe.exe"))
     monkeypatch.setattr(fd.shutil, "which", lambda _name: None)
 
-    assert fd.get_portable_dir() == fallback_dir
+    # Without portable.txt, AppData is the default storage directory and
+    # binaries sitting next to the executable are ignored.
+    (app_dir / "ffmpeg.exe").write_bytes(b"app_ff")
+    (app_dir / "ffprobe.exe").write_bytes(b"app_fp")
+    assert fd.is_portable_mode(app_dir) is False
+    assert fd.get_portable_dir() == appdata_dir
     info = fd.find_ffmpeg_binaries()
     assert info["available"] is True
-    assert info["source"] == "portable"
-    assert info["resource_dir"] == str(fallback_dir)
+    assert info["source"] == "appdata"
+    assert info["resource_dir"] == str(appdata_dir)
+
+    # Even if AppData is empty, app_dir binaries are NOT used without portable.txt.
+    (appdata_dir / "ffmpeg.exe").unlink()
+    (appdata_dir / "ffprobe.exe").unlink()
+    missing_info = fd.find_ffmpeg_binaries()
+    assert missing_info["available"] is False
+
+    # Adding PORTABLE.TXT (case-insensitive) switches storage and lookup to app_dir.
+    (app_dir / "PORTABLE.TXT").write_text("", encoding="utf-8")
+    assert fd.is_portable_mode(app_dir) is True
+    assert fd.get_portable_dir() == app_dir
+    port_info = fd.find_ffmpeg_binaries()
+    assert port_info["available"] is True
+    assert port_info["source"] == "portable"
+    assert port_info["resource_dir"] == str(app_dir)
+
+    # If app_dir is read-only even with portable.txt, fall back to AppData.
+    monkeypatch.setattr(fd, "_is_dir_writable", lambda p: p == appdata_dir)
+    assert fd.get_portable_dir() == appdata_dir
+
+
+def test_find_ffmpeg_ignores_windows_cwd_without_portable_marker(tmp_path, monkeypatch):
+    app_dir = tmp_path / "app"
+    appdata_dir = tmp_path / "local_appdata"
+    app_dir.mkdir()
+    appdata_dir.mkdir()
+    (app_dir / "ffmpeg.exe").write_bytes(b"ff")
+    (app_dir / "ffprobe.exe").write_bytes(b"fp")
+
+    monkeypatch.chdir(app_dir)
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(fd, "_preferred_portable_dir", lambda: app_dir)
+    monkeypatch.setattr(fd, "_get_appdata_dir", lambda: appdata_dir)
+    monkeypatch.setattr(fd, "_REQUIRED_BINS", ("ffmpeg.exe", "ffprobe.exe"))
+
+    # Even with CWD == app_dir (so shutil.which returns '.\\ffmpeg.exe' on Windows),
+    # without portable.txt those binaries must not be picked up as system PATH.
+    info = fd.find_ffmpeg_binaries()
+    assert info["available"] is False
 
 
 def test_find_ffmpeg_custom_path(tmp_path, monkeypatch):

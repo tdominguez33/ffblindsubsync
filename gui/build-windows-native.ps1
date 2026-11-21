@@ -16,20 +16,14 @@ $versionFile = Join-Path $repoRoot "__version__"
 Set-Content -Path $frozenMod -Value "FFSUBSYNC_VERSION = `"$version`"`n" -Encoding UTF8
 Set-Content -Path $versionFile -Value "$version`n" -Encoding UTF8
 
-$outAppDir = Join-Path $guiDir "dist\FFblindsubsync"
+$outExe = Join-Path $guiDir "dist\FFblindsubsync.exe"
+$legacyDir = Join-Path $guiDir "dist\FFblindsubsync"
 $running = Get-Process -Name "FFblindsubsync" -ErrorAction SilentlyContinue
 if ($running) {
     throw "FFblindsubsync.exe is currently running (PID $($running.Id -join ', ')). Close it before rebuilding."
 }
-
-$backupBins = @()
-foreach ($binName in @("ffmpeg.exe", "ffprobe.exe")) {
-    $src = Join-Path $outAppDir $binName
-    if (Test-Path $src) {
-        $bak = Join-Path $env:TEMP ("ffs_bak_" + $binName)
-        Move-Item -Force $src $bak
-        $backupBins += @{ Name = $binName; Bak = $bak }
-    }
+if (Test-Path $legacyDir) {
+    Remove-Item -Recurse -Force $legacyDir
 }
 
 try {
@@ -40,14 +34,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
-    Write-Host "Built portable Windows app at: $(Join-Path $outAppDir 'FFblindsubsync.exe')"
+    $sizeMb = [math]::Round((Get-Item $outExe).Length / 1MB, 1)
+    Write-Host "Built single-file Windows app at: $outExe ($sizeMb MB)"
 } finally {
-    if (Test-Path $outAppDir) {
-        foreach ($item in $backupBins) {
-            if (Test-Path $item.Bak) {
-                Move-Item -Force $item.Bak (Join-Path $outAppDir $item.Name)
-            }
-        }
-    }
     Remove-Item -Force $frozenMod, $versionFile -ErrorAction SilentlyContinue
 }
