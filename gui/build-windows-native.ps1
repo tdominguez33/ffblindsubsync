@@ -12,9 +12,7 @@ if (-not $version) { $version = "0.0.0+local" }
 $version = $version.Trim()
 
 $frozenMod = Join-Path $repoRoot "ffsubsync\_frozen_version.py"
-$versionFile = Join-Path $repoRoot "__version__"
 Set-Content -Path $frozenMod -Value "FFSUBSYNC_VERSION = `"$version`"`n" -Encoding UTF8
-Set-Content -Path $versionFile -Value "$version`n" -Encoding UTF8
 
 $outExe = Join-Path $guiDir "dist\FFblindsubsync.exe"
 $legacyDir = Join-Path $guiDir "dist\FFblindsubsync"
@@ -37,5 +35,5 @@ try {
     $sizeMb = [math]::Round((Get-Item $outExe).Length / 1MB, 1)
     Write-Host "Built single-file Windows app at: $outExe ($sizeMb MB)"
 } finally {
-    Remove-Item -Force $frozenMod, $versionFile -ErrorAction SilentlyContinue
+    Remove-Item -Force $frozenMod -ErrorAction SilentlyContinue
 }

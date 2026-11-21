@@ -1,9 +1,56 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ffsubsync"
-dynamic = ["authors", "classifiers", "dependencies", "license", "readme", "scripts", "version"]
+version = "0.5.1"
+description = "Language-agnostic synchronization of subtitles with video."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+dependencies = [
+    "auditok==0.1.5",
+    "chardet",
+    "charset_normalizer",
+    "faust-cchardet",
+    "ffmpeg-python",
+    "numpy>=1.12.0",
+    "pysubs2>=1.2.0",
+    "rich",
+    "srt>=3.0.0",
+    "tqdm",
+    "typing_extensions",
+    "webrtcvad-wheels",
+]
+
+[project.urls]
+Repository = "https://github.com/tdominguez33/ffblindsubsync"
+
+[project.optional-dependencies]
+desktop = [
+    "pywebview",
+    "pyinstaller",
+]
+torch = [
+    "torch",
+]
+dev = [
+    "pytest",
+    "black",
+]
+
+[project.scripts]
+ffs = "ffsubsync:main"
+subsync = "ffsubsync:main"
+ffsubsync = "ffsubsync:main"
+
+[tool.setuptools.packages.find]
+include = ["ffsubsync*"]
+
+[tool.pytest.ini_options]
+filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.black]
 line-length = 88
-target-version = ['py39']
-extend-exclude = '(^/versioneer|_version)\.py'
-
+target-version = ["py39"]

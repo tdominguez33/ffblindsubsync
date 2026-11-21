@@ -14,11 +14,7 @@ datas = [
         os.path.join(repo_root, "ui", "adapters", "desktop.js"),
         os.path.join("ui", "adapters"),
     ),
-    (os.path.join(repo_root, "resources", "img", "program_icon.png"), "."),
 ]
-version_file = os.path.join(repo_root, "__version__")
-if os.path.exists(version_file):
-    datas.append((version_file, "."))
 datas += copy_metadata("webrtcvad-wheels")
 
 a = Analysis(
@@ -82,7 +78,6 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-icon_path = os.path.join(repo_root, "resources", "img", "program_icon.ico")
 exe = EXE(
     pyz,
     a.scripts,
@@ -97,5 +92,4 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
-    icon=icon_path if os.path.exists(icon_path) else None,
 )
