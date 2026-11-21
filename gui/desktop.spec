@@ -15,6 +15,9 @@ datas = [
         os.path.join("ui", "adapters"),
     ),
 ]
+icon_path = os.path.join(gui_dir, "icon.ico")
+if os.path.exists(icon_path):
+    datas.append((icon_path, "."))
 datas += copy_metadata("webrtcvad-wheels")
 
 a = Analysis(
@@ -92,4 +95,5 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
+    icon=icon_path if os.path.exists(icon_path) else None,
 )

@@ -11,6 +11,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const webDir = path.resolve(here, "..");
 const repoRoot = path.resolve(webDir, "..");
 const uiDir = path.join(repoRoot, "ui");
+const guiDir = path.join(repoRoot, "gui");
 const distDir = path.join(webDir, "dist", "site");
 
 async function getAppVersion() {
@@ -67,6 +68,7 @@ async function main() {
     path.join(uiDir, "styles.css"),
     path.join(uiDir, "app.js"),
     path.join(uiDir, "adapters", "web.js"),
+    path.join(guiDir, "icon.ico"),
     path.join(webDir, "build.config.json"),
     path.join(webDir, "src", "worker.js"),
     path.join(webDir, "src", "ffsubsync_engine.mjs"),
@@ -87,6 +89,7 @@ async function main() {
     path.join(uiDir, "adapters", "web.js"),
     path.join(distDir, "adapters", "web.js"),
   );
+  await fs.copyFile(path.join(guiDir, "icon.ico"), path.join(distDir, "favicon.ico"));
 
   // Cache-busting + inject single-source-of-truth app version into HTML meta tag.
   // app.js threads the same ?v= query param to adapters/web.js and everything it loads.
@@ -96,6 +99,7 @@ async function main() {
       '<meta name="app-version" content="" />',
       `<meta name="app-version" content="${appVersion}" />`,
     )
+    .replace('href="./favicon.ico"', `href="./favicon.ico?v=${cacheVersion}"`)
     .replace('href="./styles.css"', `href="./styles.css?v=${cacheVersion}"`)
     .replace('src="./app.js"', `src="./app.js?v=${cacheVersion}"`);
   await fs.writeFile(path.join(distDir, "index.html"), versionedHtml, "utf8");

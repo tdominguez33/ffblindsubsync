@@ -16,6 +16,7 @@ on:
       - "ui/**"
       - "web/**"
       - "ffsubsync/**"
+      - "gui/icon.ico"
       - "pyproject.toml"
       - ".github/workflows/build-site.yml"
   workflow_dispatch:

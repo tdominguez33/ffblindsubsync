@@ -52,6 +52,14 @@ def _ui_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "ui"
 
 
+def _icon_path() -> Optional[Path]:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidate = Path(sys._MEIPASS) / "icon.ico"
+    else:
+        candidate = Path(__file__).resolve().parent / "icon.ico"
+    return candidate if candidate.is_file() else None
+
+
 def _is_subtitle_ref(path: str) -> bool:
     ext = os.path.splitext(path)[1].lstrip(".").lower()
     return ext in SUBTITLE_EXTENSIONS or ext in ("npz", "npy")
@@ -890,6 +898,28 @@ class DesktopApi:
         if self._window is not None:
             self._window.destroy()
 
+    def apply_window_icon(self) -> None:
+        native, _ = self._get_native_winforms()
+        icon = _icon_path()
+        if native is None or icon is None:
+            return
+        try:
+            from System import Action
+            import System.Drawing as Drawing
+
+            icon_str = str(icon)
+
+            def _apply():
+                native.Icon = Drawing.Icon(icon_str)
+                native.ShowIcon = True
+
+            if native.InvokeRequired:
+                native.BeginInvoke(Action(_apply))
+            else:
+                _apply()
+        except Exception:
+            pass
+
     def set_theme(self, is_dark: bool) -> None:
         """Sync native Windows 10/11 DWM border/caption theme with light/dark mode."""
         _, hwnd = self._get_native_winforms()
@@ -943,6 +973,7 @@ def _wire_desktop_window(
     window: webview.Window, api: DesktopApi, start_maximized: bool = False
 ) -> None:
     """Wire native drop zones and window geometry persistence for frameless mode."""
+    api.apply_window_icon()
     _wire_drop_zones(window)
 
     def _notify_max(is_max: bool) -> None:
