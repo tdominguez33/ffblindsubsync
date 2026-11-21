@@ -131,10 +131,9 @@ export function createAdapter({ withVersion, callbacks }) {
     meta: {
       pageTitle: "ffblindsubsync — In the Browser",
       subtitle: "In the Browser",
-      badgeText: "100% Local · WASM",
-      badgeTitle: "Runs entirely on your device via Pyodide & ffmpeg.wasm. Nothing is uploaded.",
-      refPlaceholder: "Drop or browse movie.mkv, audio, or reference.srt",
-      inPlaceholder: "Drop or browse subtitles.srt",
+      badgeText: "",
+      badgeVariant: "web",
+      badgeTitle: "",
       footerText:
         "Runs locally in your browser via WebAssembly (Pyodide + ffmpeg.wasm). Nothing is uploaded.",
     },
@@ -143,6 +142,7 @@ export function createAdapter({ withVersion, callbacks }) {
       outputPath: false,
       streamProbe: true,
       runtimeAction: false,
+      topbarStatus: true,
       refAccept: REF_ACCEPT,
       subtitleAccept: SUBTITLE_ACCEPT,
     },
@@ -158,10 +158,10 @@ export function createAdapter({ withVersion, callbacks }) {
     async init() {
       callbacks.onRuntimeStatus({
         level: "warn",
-        text: "Loading Python runtime (first load downloads a few MB)…",
+        text: "Loading Python runtime…",
+        visible: false,
         ready: false,
       });
-      callbacks.onRuntimeProgress({ active: true, fraction: null });
 
       const configUrl = withVersion(new URL("./build.config.json", document.baseURI).href);
       const workerUrl = withVersion(new URL("./src/worker.js", document.baseURI).href);
@@ -196,6 +196,7 @@ export function createAdapter({ withVersion, callbacks }) {
             callbacks.onRuntimeStatus({
               level: "warn",
               text: capitalize(msg.status),
+              visible: false,
               ready: false,
             });
           }
@@ -203,10 +204,10 @@ export function createAdapter({ withVersion, callbacks }) {
           engineReady = true;
           workerCaps = msg.capabilities || workerCaps;
           ffmpegConfig = msg.ffmpeg || ffmpegConfig;
-          callbacks.onRuntimeProgress({ active: false, fraction: null });
           callbacks.onRuntimeStatus({
             level: "ok",
-            text: "Ready. Pick a reference and a subtitle file to sync.",
+            text: "Ready",
+            visible: false,
             ready: true,
           });
         } else if (msg.type === "result") {
@@ -254,6 +255,7 @@ export function createAdapter({ withVersion, callbacks }) {
             callbacks.onRuntimeStatus({
               level: "err",
               text: "Error: " + msg.error,
+              visible: true,
               ready: false,
             });
           }

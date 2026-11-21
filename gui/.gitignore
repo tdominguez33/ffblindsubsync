@@ -3,3 +3,4 @@ dist
 ffmpeg.exe
 ffprobe.exe
 ffmpeg-bin/
+config.json

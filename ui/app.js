@@ -8,8 +8,38 @@ const withVersion = (url) => (V ? url + (url.includes("?") ? "&" : "?") + "v=" +
 const els = {
   envSubtitle: document.getElementById("env-subtitle"),
   envBadge: document.getElementById("env-badge"),
-  runtimeDot: document.getElementById("runtime-dot"),
+  topbarActionsDivider: document.getElementById("topbar-actions-divider"),
+  topbarStatusPill: document.getElementById("topbar-status-pill"),
+  topbarStatusDot: document.getElementById("topbar-status-dot"),
   status: document.getElementById("status"),
+  settingsBtn: document.getElementById("settings-btn"),
+  themeToggle: document.getElementById("theme-toggle"),
+  dragBrand: document.getElementById("drag-brand"),
+  dragSpacer: document.getElementById("drag-spacer"),
+  winControlsDivider: document.getElementById("win-controls-divider"),
+  winControls: document.getElementById("win-controls"),
+  winMinimize: document.getElementById("win-minimize"),
+  winMaximize: document.getElementById("win-maximize"),
+  winClose: document.getElementById("win-close"),
+  resizeHandles: document.getElementById("resize-handles"),
+  mainView: document.getElementById("main-view"),
+  settingsView: document.getElementById("settings-view"),
+  settingsCloseBtn: document.getElementById("settings-close-btn"),
+  settingsFfPill: document.getElementById("settings-ff-pill"),
+  settingsFfDot: document.getElementById("settings-ff-dot"),
+  settingsFfStatus: document.getElementById("settings-ff-status"),
+  settingsFfDir: document.getElementById("settings-ff-dir"),
+  settingsFfChange: document.getElementById("settings-ff-change"),
+  settingsFfOpen: document.getElementById("settings-ff-open"),
+  settingsFfDownload: document.getElementById("settings-ff-download"),
+  settingsFfDownloadLabel: document.getElementById("settings-ff-download-label"),
+  settingsFfProg: document.getElementById("settings-ff-progress"),
+  settingsFfFill: document.getElementById("settings-ff-fill"),
+  settingsFfPct: document.getElementById("settings-ff-pct"),
+  runtimeCard: document.getElementById("runtime-card"),
+  runtimePill: document.getElementById("runtime-pill"),
+  runtimeDot: document.getElementById("runtime-dot"),
+  runtimeStatusText: document.getElementById("runtime-status-text"),
   runtimeActionBtn: document.getElementById("runtime-action-btn"),
   runtimeProg: document.getElementById("runtime-progress"),
   runtimeFill: document.getElementById("runtime-fill"),
@@ -51,6 +81,70 @@ let selectedRef = null; // string path (desktop) or File (web)
 let selectedIn = null; // string path (desktop) or File (web)
 let lastResult = null;
 let streamProbeSeq = 0;
+let themeTransitionTimer = null;
+let settingsOpen = false;
+
+function setSettingsOpen(open) {
+  if (!adapter || !adapter.capabilities.settings) return;
+  settingsOpen = Boolean(open);
+  if (els.mainView) els.mainView.hidden = settingsOpen;
+  if (els.settingsView) els.settingsView.hidden = !settingsOpen;
+  if (els.settingsBtn) {
+    els.settingsBtn.classList.toggle("active", settingsOpen);
+    els.settingsBtn.setAttribute("aria-pressed", String(settingsOpen));
+  }
+}
+
+function isDarkTheme() {
+  return document.documentElement.classList.contains("dark");
+}
+
+function syncThemeToggleLabel(dark) {
+  if (els.themeToggle) {
+    els.themeToggle.title = dark ? "Switch to light theme" : "Switch to dark theme";
+    els.themeToggle.setAttribute("aria-label", els.themeToggle.title);
+  }
+}
+
+function syncMaximizedState(isMax) {
+  const max = Boolean(isMax);
+  document.body.classList.toggle("is-maximized", max);
+  if (els.winMaximize) {
+    els.winMaximize.classList.toggle("is-maximized", max);
+    const label = max ? "Restore" : "Maximize";
+    els.winMaximize.title = label;
+    els.winMaximize.setAttribute("aria-label", label);
+  }
+}
+
+function applyTheme(dark, { transition = false, persist = false } = {}) {
+  const root = document.documentElement;
+  if (transition) {
+    root.classList.add("theme-transitioning");
+    if (themeTransitionTimer) clearTimeout(themeTransitionTimer);
+    themeTransitionTimer = setTimeout(() => {
+      root.classList.remove("theme-transitioning");
+      themeTransitionTimer = null;
+    }, 250);
+  }
+  root.classList.toggle("dark", dark);
+  syncThemeToggleLabel(dark);
+  if (persist) {
+    try {
+      localStorage.setItem("ffs_theme", dark ? "dark" : "light");
+    } catch (_) {}
+  }
+  if (adapter && typeof adapter.onThemeChange === "function") {
+    adapter.onThemeChange(dark);
+  }
+}
+
+syncThemeToggleLabel(isDarkTheme());
+if (els.themeToggle) {
+  els.themeToggle.addEventListener("click", () => {
+    applyTheme(!isDarkTheme(), { transition: true, persist: true });
+  });
+}
 
 function setProgressBar(container, fill, pctEl, { active, fraction }) {
   if (!active) {
@@ -171,11 +265,26 @@ function setInputSubtitle(entry, { forceAutoOut = false } = {}) {
 
 function applyRuntimeStatus(update) {
   if (!update) return;
+  const useTopbar = Boolean(adapter && adapter.capabilities.topbarStatus);
+  if (update.visible !== undefined && els.runtimeCard) {
+    els.runtimeCard.hidden = useTopbar || !update.visible;
+  }
   if (update.level) {
-    els.runtimeDot.className = update.level === "muted" ? "dot" : `dot ${update.level}`;
+    const levelClass = update.level === "muted" ? "" : ` ${update.level}`;
+    els.runtimeDot.className = `dot${levelClass}`;
+    if (els.runtimePill) {
+      els.runtimePill.className = `status-pill${levelClass}`;
+    }
+    if (els.topbarStatusDot) els.topbarStatusDot.className = `dot${levelClass}`;
+    if (els.topbarStatusPill) els.topbarStatusPill.className = `status-pill topbar-status${levelClass}`;
+    if (els.settingsFfDot) els.settingsFfDot.className = `dot${levelClass}`;
+    if (els.settingsFfPill) els.settingsFfPill.className = `status-pill${levelClass}`;
   }
   if (update.text !== undefined) {
     els.status.textContent = update.text;
+    if (els.topbarStatusPill) els.topbarStatusPill.title = update.text;
+    if (els.runtimeStatusText) els.runtimeStatusText.textContent = update.text;
+    if (els.settingsFfStatus) els.settingsFfStatus.textContent = update.text;
   }
   if (update.badgeTitle !== undefined) {
     els.envBadge.title = update.badgeTitle;
@@ -184,14 +293,43 @@ function applyRuntimeStatus(update) {
     if (update.actionLabel !== undefined) {
       els.runtimeActionBtn.textContent = update.actionLabel;
       els.runtimeActionBtn.hidden = !update.actionLabel;
+      if (els.settingsFfDownloadLabel) {
+        els.settingsFfDownloadLabel.textContent = update.actionLabel || "Download latest FFmpeg";
+      }
     }
     if (update.actionDisabled !== undefined) {
       els.runtimeActionBtn.disabled = Boolean(update.actionDisabled);
+      if (els.settingsFfDownload) {
+        els.settingsFfDownload.disabled = Boolean(update.actionDisabled);
+      }
+    }
+  }
+  if (update.ffmpegInfo) {
+    const info = update.ffmpegInfo;
+    if (els.settingsFfDir) {
+      let dir = info.resource_dir || "";
+      if (!dir && info.ffmpeg_path) {
+        const sep = Math.max(info.ffmpeg_path.lastIndexOf("\\"), info.ffmpeg_path.lastIndexOf("/"));
+        dir = sep > 0 ? info.ffmpeg_path.slice(0, sep) : info.ffmpeg_path;
+      }
+      if (!dir) dir = info.custom_path || info.portable_dir || "Auto-detect";
+      els.settingsFfDir.textContent = dir;
+      els.settingsFfDir.title = info.ffmpeg_path || dir;
     }
   }
   if (update.ready !== undefined) {
     runtimeReady = Boolean(update.ready);
     refreshSyncBtn();
+  }
+}
+
+function scrollToResultTop() {
+  const mainEl = document.querySelector("main");
+  if (mainEl && mainEl.scrollTop > 0) {
+    mainEl.scrollTo({ top: 0, behavior: "smooth" });
+  }
+  if (window.scrollY > 0) {
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 }
 
@@ -204,6 +342,7 @@ function renderResult(res) {
     els.resultActionBtn.hidden = true;
     els.downloadLink.hidden = true;
     els.result.hidden = false;
+    scrollToResultTop();
     return;
   }
 
@@ -231,19 +370,60 @@ function renderResult(res) {
     }
   }
   els.result.hidden = false;
+  scrollToResultTop();
+}
+
+function resetFormState() {
+  selectedRef = null;
+  selectedIn = null;
+  els.refPath.value = "";
+  els.inPath.value = "";
+  els.outPath.value = "";
+  els.outPath.dataset.auto = "1";
+  els.refFile.value = "";
+  els.inputFile.value = "";
+  els.refStream.innerHTML = '<option value="">Auto (recommended)</option>';
+  els.refStream.value = "";
+  els.streamWrap.hidden = true;
+  if (els.vadMode.options.length > 0) els.vadMode.selectedIndex = 0;
+  els.splitMode.value = "auto";
+  els.noFixFramerate.checked = false;
+  els.gss.checked = false;
+  refreshSyncBtn();
 }
 
 function configureUiForAdapter(ad) {
   const { meta, capabilities } = ad;
+  resetFormState();
 
   document.title = meta.pageTitle || "ffblindsubsync";
-  els.envSubtitle.textContent = meta.subtitle || "";
+  if (meta.subtitle) {
+    els.envSubtitle.textContent = meta.subtitle;
+    els.envSubtitle.hidden = false;
+  } else {
+    els.envSubtitle.textContent = "";
+    els.envSubtitle.hidden = true;
+  }
+  const hasTopbarStatus = Boolean(capabilities.topbarStatus);
+  if (els.topbarStatusPill) {
+    els.topbarStatusPill.hidden = !hasTopbarStatus;
+  }
+  if (hasTopbarStatus && els.runtimeCard) {
+    els.runtimeCard.hidden = true;
+  }
   if (meta.badgeText) {
     els.envBadge.textContent = meta.badgeText;
     els.envBadge.title = meta.badgeTitle || "";
+    els.envBadge.className = meta.badgeVariant ? `badge ${meta.badgeVariant}` : "badge";
     els.envBadge.hidden = false;
   } else {
     els.envBadge.hidden = true;
+  }
+  if (els.topbarActionsDivider) {
+    els.topbarActionsDivider.hidden = !(hasTopbarStatus || Boolean(meta.badgeText));
+  }
+  if (els.settingsBtn) {
+    els.settingsBtn.hidden = !capabilities.settings;
   }
 
   els.refPath.placeholder = meta.refPlaceholder || els.refPath.placeholder;
@@ -275,21 +455,86 @@ function configureUiForAdapter(ad) {
   } else {
     els.footer.hidden = true;
   }
+
+  const hasCustomChrome = Boolean(capabilities.customWindowControls);
+  document.body.classList.toggle("is-desktop", hasCustomChrome);
+  if (els.winControls) els.winControls.hidden = !hasCustomChrome;
+  if (els.winControlsDivider) els.winControlsDivider.hidden = !hasCustomChrome;
+  if (els.resizeHandles) els.resizeHandles.hidden = !hasCustomChrome;
 }
 
 function wireEvents(ad) {
   const { capabilities } = ad;
 
-  // Drag-over visual highlight for both desktop and web.
+  if (capabilities.customWindowControls && ad.windowControls) {
+    const wc = ad.windowControls;
+    els.winMinimize.addEventListener("click", () => wc.minimize());
+    els.winMaximize.addEventListener("click", async () => {
+      const isMax = await wc.toggleMaximize();
+      syncMaximizedState(isMax);
+    });
+    els.winClose.addEventListener("click", () => wc.close());
+
+    let lastDragDownTime = 0;
+    let lastDragDownX = 0;
+    let lastDragDownY = 0;
+    for (const dragEl of [els.dragBrand, els.dragSpacer]) {
+      if (!dragEl) continue;
+      dragEl.addEventListener("mousedown", async (e) => {
+        if (e.button !== 0) return;
+        const now = performance.now();
+        const isDbl =
+          now - lastDragDownTime < 350 &&
+          Math.abs(e.clientX - lastDragDownX) < 6 &&
+          Math.abs(e.clientY - lastDragDownY) < 6;
+        if (isDbl) {
+          lastDragDownTime = 0;
+          const isMax = await wc.toggleMaximize();
+          syncMaximizedState(isMax);
+        } else {
+          lastDragDownTime = now;
+          lastDragDownX = e.clientX;
+          lastDragDownY = e.clientY;
+          wc.startDrag();
+        }
+      });
+    }
+
+    if (els.resizeHandles) {
+      for (const edge of els.resizeHandles.querySelectorAll(".resize-edge")) {
+        edge.addEventListener("mousedown", (e) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          wc.startResize(Number(edge.dataset.hit));
+        });
+      }
+    }
+  }
+
+  // Prevent accidental navigation if a file is dropped anywhere outside the drop zones
+  // (also enables HTML5 drop events in desktop WebView2 without Python dragover IPC).
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => e.preventDefault());
+
+  // Instant drag-enter / drag-over visual highlight for both desktop and web.
   for (const [zone, target] of [
     [els.dropRef, "ref"],
     [els.dropIn, "in"],
   ]) {
-    zone.addEventListener("dragover", (e) => {
+    zone.addEventListener("dragenter", (e) => {
       e.preventDefault();
       zone.classList.add("drag-over");
     });
-    zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
+    zone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      zone.classList.add("drag-over");
+    });
+    zone.addEventListener("dragleave", (e) => {
+      if (!zone.contains(e.relatedTarget)) {
+        zone.classList.remove("drag-over");
+      }
+    });
     zone.addEventListener("drop", (e) => {
       zone.classList.remove("drag-over");
       if (!capabilities.editablePaths) {
@@ -307,10 +552,6 @@ function wireEvents(ad) {
   }
 
   if (!capabilities.editablePaths) {
-    // Prevent accidental navigation if a user drops a media file outside the drop zones.
-    window.addEventListener("dragover", (e) => e.preventDefault());
-    window.addEventListener("drop", (e) => e.preventDefault());
-
     // Hidden <input type="file"> change handlers (also used by Playwright tests).
     els.refFile.addEventListener("change", () => {
       const file = els.refFile.files && els.refFile.files[0];
@@ -383,6 +624,38 @@ function wireEvents(ad) {
 
   if (capabilities.runtimeAction && ad.runRuntimeAction) {
     els.runtimeActionBtn.addEventListener("click", () => ad.runRuntimeAction());
+  }
+
+  if (capabilities.settings && ad.settings) {
+    if (els.settingsBtn) {
+      els.settingsBtn.addEventListener("click", () => setSettingsOpen(!settingsOpen));
+    }
+    if (els.settingsCloseBtn) {
+      els.settingsCloseBtn.addEventListener("click", () => setSettingsOpen(false));
+    }
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && settingsOpen) {
+        setSettingsOpen(false);
+      }
+    });
+
+    if (els.settingsFfChange) {
+      els.settingsFfChange.addEventListener("click", async () => {
+        const picked = await ad.settings.pickFfmpegDir();
+        if (picked) {
+          await ad.settings.setFfmpegPath(picked);
+          if (hasSelection(selectedRef)) {
+            refreshStreams(selectedRef);
+          }
+        }
+      });
+    }
+    if (els.settingsFfOpen) {
+      els.settingsFfOpen.addEventListener("click", () => ad.settings.openFfmpegFolder());
+    }
+    if (els.settingsFfDownload && ad.runRuntimeAction) {
+      els.settingsFfDownload.addEventListener("click", () => ad.runRuntimeAction());
+    }
   }
 
   if (capabilities.outputPath && ad.openOutput) {
@@ -460,8 +733,12 @@ async function boot() {
     withVersion,
     callbacks: {
       onRuntimeStatus: applyRuntimeStatus,
-      onRuntimeProgress: (prog) =>
-        setProgressBar(els.runtimeProg, els.runtimeFill, els.runtimePct, prog),
+      onRuntimeProgress: (prog) => {
+        setProgressBar(els.runtimeProg, els.runtimeFill, els.runtimePct, prog);
+        if (els.settingsFfProg) {
+          setProgressBar(els.settingsFfProg, els.settingsFfFill, els.settingsFfPct, prog);
+        }
+      },
       onExternalDrop: (target, entry) => {
         if (target === "ref") {
           setReference(entry);
@@ -469,16 +746,28 @@ async function boot() {
           setInputSubtitle(entry);
         }
       },
+      onWindowMaximizedChange: syncMaximizedState,
     },
   });
 
   configureUiForAdapter(adapter);
   wireEvents(adapter);
   await adapter.init();
+  if (typeof adapter.onThemeChange === "function") {
+    adapter.onThemeChange(isDarkTheme());
+  }
 }
 
 boot().catch((err) => {
   console.error(err);
+  const msg = "Error: " + ((err && err.message) || err);
+  if (els.topbarStatusDot) els.topbarStatusDot.className = "dot err";
+  if (els.topbarStatusPill) {
+    els.topbarStatusPill.className = "status-pill topbar-status err";
+    els.topbarStatusPill.hidden = false;
+  }
   els.runtimeDot.className = "dot err";
-  els.status.textContent = "Error: " + ((err && err.message) || err);
+  if (els.runtimePill) els.runtimePill.className = "status-pill err";
+  if (els.runtimeStatusText) els.runtimeStatusText.textContent = msg;
+  els.status.textContent = msg;
 });

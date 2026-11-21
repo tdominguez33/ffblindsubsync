@@ -27,35 +27,40 @@ function waitForPywebview() {
 }
 
 function buildFfmpegStatus(info) {
-  const badgeTitle =
-    info && info.portable_dir ? "Portable folder: " + info.portable_dir : undefined;
-  if (info && info.available && info.source === "portable") {
+  if (info && info.available) {
+    let text;
+    let actionLabel;
+    if (info.source === "custom") {
+      text = `FFmpeg ready (custom · ${info.version || "local"})`;
+      actionLabel = "Update FFmpeg";
+    } else if (info.source === "portable") {
+      text = `FFmpeg ready (portable · ${info.version || "local"})`;
+      actionLabel = "Update FFmpeg";
+    } else {
+      text = `FFmpeg ready (system PATH · ${info.version || "system"})`;
+      actionLabel = "Download portable FFmpeg";
+    }
     return {
       level: "ok",
-      text: `FFmpeg ready next to executable (${info.version || "local"})`,
-      actionLabel: "Update FFmpeg",
+      text,
+      actionLabel,
       actionDisabled: false,
-      badgeTitle,
+      visible: false,
       ready: true,
+      ffmpegInfo: info,
     };
   }
-  if (info && info.available && info.source === "system") {
-    return {
-      level: "warn",
-      text: `FFmpeg in system PATH (${info.version || "system"}) — click to copy portable build`,
-      actionLabel: "Download portable FFmpeg",
-      actionDisabled: false,
-      badgeTitle,
-      ready: true,
-    };
-  }
+  const errText =
+    (info && info.custom_error) ||
+    "FFmpeg not found (will auto-download on Sync, or click to download now)";
   return {
     level: "err",
-    text: "FFmpeg not found (will auto-download on Sync, or click to download now)",
+    text: errText,
     actionLabel: "Download latest FFmpeg",
     actionDisabled: false,
-    badgeTitle,
+    visible: true,
     ready: true,
+    ffmpegInfo: info || null,
   };
 }
 
@@ -66,10 +71,15 @@ export function createAdapter({ callbacks }) {
   let lastSyncSeq = 0;
   let pendingSync = null;
 
-  // Exposed for Python DOM drag-drop handler (gui/desktop_app.py).
+  // Exposed for Python DOM drag-drop handler and window-state events (gui/desktop_app.py).
   window.setDroppedPath = function (target, fullPath) {
     if (!fullPath) return;
     callbacks.onExternalDrop(target, { value: fullPath, display: fullPath });
+  };
+  window.setWindowMaximized = function (isMax) {
+    if (callbacks.onWindowMaximizedChange) {
+      callbacks.onWindowMaximizedChange(Boolean(isMax));
+    }
   };
 
   function ensurePolling() {
@@ -100,14 +110,15 @@ export function createAdapter({ callbacks }) {
       if (hasFrac) {
         const mb = (dl.downloaded / (1024 * 1024)).toFixed(1);
         const totMb = dl.total ? (dl.total / (1024 * 1024)).toFixed(1) : "?";
-        text = `Downloading FFmpeg (${dl.phase})… ${mb} / ${totMb} MB`;
+        text = `Downloading FFmpeg… ${mb} / ${totMb} MB`;
       } else {
-        text = `Downloading FFmpeg (${dl.phase || "connecting"})…`;
+        text = "Downloading FFmpeg…";
       }
       callbacks.onRuntimeStatus({
         level: "warn",
         text,
         actionDisabled: true,
+        visible: true,
         ready: true,
       });
       callbacks.onRuntimeProgress({
@@ -122,6 +133,7 @@ export function createAdapter({ callbacks }) {
           level: "err",
           text: "FFmpeg download failed: " + dl.error,
           actionDisabled: false,
+          visible: true,
           ready: true,
         });
       } else if (dl.info) {
@@ -169,12 +181,11 @@ export function createAdapter({ callbacks }) {
 
   return {
     meta: {
-      pageTitle: "ffblindsubsync — Windows Desktop",
-      subtitle: "Native Windows",
-      badgeText: "Portable Mode",
+      pageTitle: "ffblindsubsync",
+      subtitle: "",
+      badgeText: "",
+      badgeVariant: "desktop",
       badgeTitle: "",
-      refPlaceholder: "C:\\path\\to\\movie.mkv or reference.srt",
-      inPlaceholder: "C:\\path\\to\\subtitles.srt",
       footerText: null,
     },
     capabilities: {
@@ -182,6 +193,47 @@ export function createAdapter({ callbacks }) {
       outputPath: true,
       streamProbe: true,
       runtimeAction: true,
+      customWindowControls: true,
+      settings: true,
+    },
+
+    windowControls: {
+      minimize() {
+        if (api) api.window_minimize();
+      },
+      async toggleMaximize() {
+        if (!api) return false;
+        return Boolean(await api.window_toggle_maximize());
+      },
+      close() {
+        if (api) api.window_close();
+      },
+      startDrag() {
+        if (api) api.window_start_drag();
+      },
+      startResize(hitCode) {
+        if (api) api.window_start_resize(hitCode);
+      },
+    },
+
+    settings: {
+      async pickFfmpegDir() {
+        if (!api) return null;
+        return api.pick_ffmpeg_dir();
+      },
+      async setFfmpegPath(path) {
+        if (!api) return null;
+        const res = await api.set_ffmpeg_path(path || "");
+        const ff =
+          res && res.ffmpeg
+            ? { ...res.ffmpeg, custom_path: res.custom_ffmpeg_path ?? res.ffmpeg.custom_path ?? "" }
+            : null;
+        callbacks.onRuntimeStatus(buildFfmpegStatus(ff));
+        return ff;
+      },
+      openFfmpegFolder() {
+        if (api) api.open_ffmpeg_folder();
+      },
     },
 
     async init() {
@@ -190,11 +242,19 @@ export function createAdapter({ callbacks }) {
         text: "Checking FFmpeg…",
         actionLabel: "Download latest FFmpeg",
         actionDisabled: true,
+        visible: false,
         ready: false,
       });
       api = await waitForPywebview();
       const state = await api.get_init_state();
-      const ff = state && state.ffmpeg ? { ...state.ffmpeg, portable_dir: state.portable_dir } : null;
+      const ff =
+        state && state.ffmpeg
+          ? {
+              ...state.ffmpeg,
+              portable_dir: state.portable_dir,
+              custom_path: state.custom_ffmpeg_path ?? state.ffmpeg.custom_path ?? "",
+            }
+          : null;
       callbacks.onRuntimeStatus(buildFfmpegStatus(ff));
     },
 
@@ -224,7 +284,7 @@ export function createAdapter({ callbacks }) {
 
     async runRuntimeAction() {
       if (!api) return;
-      callbacks.onRuntimeStatus({ actionDisabled: true });
+      callbacks.onRuntimeStatus({ actionDisabled: true, visible: true });
       callbacks.onRuntimeProgress({ active: true, fraction: null });
       await api.start_ffmpeg_download();
       ensurePolling();
@@ -258,6 +318,12 @@ export function createAdapter({ callbacks }) {
     openOutput(result) {
       if (api && result && result.output_path) {
         api.open_output_folder(result.output_path);
+      }
+    },
+
+    onThemeChange(isDark) {
+      if (api && typeof api.set_theme === "function") {
+        api.set_theme(Boolean(isDark)).catch(() => {});
       }
     },
   };

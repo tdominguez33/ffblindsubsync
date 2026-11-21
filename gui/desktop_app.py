@@ -56,6 +56,31 @@ def _is_subtitle_ref(path: str) -> bool:
     return ext in SUBTITLE_EXTENSIONS or ext in ("npz", "npy")
 
 
+def _config_path() -> Path:
+    return get_portable_dir() / "config.json"
+
+
+def _load_desktop_config() -> Dict[str, Any]:
+    try:
+        p = _config_path()
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_desktop_config(cfg: Dict[str, Any]) -> None:
+    try:
+        p = _config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to save desktop config: %s", exc)
+
+
 _ALIGN_STEP_RE = re.compile(r"computing alignment (\d+)/(\d+)")
 
 
@@ -82,17 +107,24 @@ class _PhaseLogHandler(logging.Handler):
         if "writing output" in msg:
             self._on_message("Writing output…", 0.98)
             return
-        if any(
-            k in msg
-            for k in (
-                "Checking video for subtitles",
-                "using PGS subtitle stream",
-                "using VobSub subtitle stream",
-                "extracting speech segments",
-                "computing alignments",
-            )
-        ):
-            self._on_message(msg, None)
+        if "Checking video for subtitles" in msg:
+            self._on_message("Checking video for subtitles…", None)
+            return
+        if "using PGS subtitle stream" in msg:
+            self._on_message("Using PGS subtitle timings…", None)
+            return
+        if "using VobSub subtitle stream" in msg:
+            self._on_message("Using VobSub subtitle timings…", None)
+            return
+        if "extracting speech segments from subtitles" in msg:
+            self._on_message("Extracting subtitle timings…", None)
+            return
+        if "extracting speech segments" in msg:
+            self._on_message("Extracting speech segments…", None)
+            return
+        if "computing alignments" in msg:
+            self._on_message("Computing alignments…", None)
+            return
 
 
 class DesktopApi:
@@ -107,14 +139,54 @@ class DesktopApi:
         self._dl_done_event.set()
         self._ffmpeg_dl: Dict[str, Any] = {"active": False, "done": False, "seq": 0}
         self._sync_state: Dict[str, Any] = {"active": False, "done": False, "seq": 0}
+        self._config: Dict[str, Any] = _load_desktop_config()
+        self._custom_ffmpeg_path: str = str(self._config.get("ffmpeg_path") or "").strip()
 
     def attach_window(self, window: webview.Window) -> None:
         self._window = window
 
+    def _find_ffmpeg(self) -> Dict[str, Any]:
+        with self._lock:
+            custom = self._custom_ffmpeg_path
+        return find_ffmpeg_binaries(custom_path=custom or None)
+
+    def _get_download_target_dir(self) -> Path:
+        with self._lock:
+            custom = self._custom_ffmpeg_path
+        return Path(custom) if custom else get_portable_dir()
+
     def get_init_state(self) -> Dict[str, Any]:
         return {
-            "ffmpeg": find_ffmpeg_binaries(),
+            "ffmpeg": self._find_ffmpeg(),
             "portable_dir": str(get_portable_dir()),
+            "custom_ffmpeg_path": self._custom_ffmpeg_path,
+        }
+
+    def pick_ffmpeg_dir(self) -> Optional[str]:
+        assert self._window is not None
+        initial = self._custom_ffmpeg_path
+        if initial and os.path.isfile(initial):
+            initial = os.path.dirname(initial)
+        directory = initial if (initial and os.path.isdir(initial)) else ""
+        res = self._window.create_file_dialog(
+            webview.FileDialog.FOLDER,
+            directory=directory,
+        )
+        if not res:
+            return None
+        return res[0] if isinstance(res, (list, tuple)) else str(res)
+
+    def set_ffmpeg_path(self, path: str = "") -> Dict[str, Any]:
+        cleaned = str(path or "").strip()
+        if cleaned and os.path.isfile(cleaned):
+            cleaned = os.path.dirname(cleaned)
+        with self._lock:
+            self._custom_ffmpeg_path = cleaned
+            self._config["ffmpeg_path"] = cleaned
+            _save_desktop_config(self._config)
+        return {
+            "ffmpeg": self._find_ffmpeg(),
+            "custom_ffmpeg_path": cleaned,
         }
 
     def pick_reference(self) -> Optional[str]:
@@ -134,7 +206,7 @@ class DesktopApi:
         """Inspect audio and subtitle streams in ``ref_path`` with ffprobe."""
         if not ref_path or not os.path.isfile(ref_path) or _is_subtitle_ref(ref_path):
             return {"streams": [], "has_text_subs": False, "has_pgs_subs": False}
-        ff_info = find_ffmpeg_binaries()
+        ff_info = self._find_ffmpeg()
         ffprobe = ff_info.get("ffprobe_path")
         if not ffprobe:
             return {"streams": [], "has_text_subs": False, "has_pgs_subs": False}
@@ -288,7 +360,9 @@ class DesktopApi:
                             fraction=ev.get("fraction"),
                         )
 
-                info = download_latest_ffmpeg(get_portable_dir(), progress_cb=_on_dl)
+                target_dir = self._get_download_target_dir()
+                download_latest_ffmpeg(target_dir, progress_cb=_on_dl)
+                info = self._find_ffmpeg()
                 with self._lock:
                     self._ffmpeg_dl.update(
                         active=False,
@@ -336,13 +410,15 @@ class DesktopApi:
                 if not os.path.isfile(in_path):
                     raise FileNotFoundError("Subtitle file not found: %s" % in_path)
 
-                ff_info = find_ffmpeg_binaries()
+                ff_info = self._find_ffmpeg()
                 if not _is_subtitle_ref(ref_path) and not ff_info["available"]:
                     need_download = False
                     while True:
                         with self._lock:
                             if not self._ffmpeg_dl.get("active"):
-                                ff_info = find_ffmpeg_binaries()
+                                ff_info = find_ffmpeg_binaries(
+                                    custom_path=self._custom_ffmpeg_path or None
+                                )
                                 if not ff_info["available"]:
                                     self._dl_seq += 1
                                     dl_seq = self._dl_seq
@@ -383,14 +459,13 @@ class DesktopApi:
                                         fraction=ev.get("fraction"),
                                     )
                                     self._sync_state.update(
-                                        message="Downloading portable FFmpeg (%s)%s…"
-                                        % (ev.get("phase", "downloading"), pct),
+                                        message="Downloading FFmpeg%s…" % pct,
                                         fraction=ev.get("fraction"),
                                     )
 
-                            ff_info = download_latest_ffmpeg(
-                                get_portable_dir(), progress_cb=_on_dl
-                            )
+                            target_dir = self._get_download_target_dir()
+                            download_latest_ffmpeg(target_dir, progress_cb=_on_dl)
+                            ff_info = self._find_ffmpeg()
                             with self._lock:
                                 self._ffmpeg_dl.update(
                                     active=False,
@@ -547,12 +622,137 @@ class DesktopApi:
         if os.path.exists(norm):
             subprocess.Popen(["explorer", "/select,", norm])
 
+    def open_ffmpeg_folder(self) -> None:
+        ff_info = self._find_ffmpeg()
+        folder = None
+        if ff_info.get("resource_dir") and os.path.isdir(ff_info["resource_dir"]):
+            folder = ff_info["resource_dir"]
+        elif ff_info.get("ffmpeg_path") and os.path.exists(ff_info["ffmpeg_path"]):
+            folder = os.path.dirname(ff_info["ffmpeg_path"])
+        elif ff_info.get("custom_path") and os.path.isdir(ff_info["custom_path"]):
+            folder = ff_info["custom_path"]
+        else:
+            pdir = get_portable_dir()
+            pdir.mkdir(parents=True, exist_ok=True)
+            folder = str(pdir)
+        norm = os.path.normpath(folder)
+        if os.path.isdir(norm):
+            os.startfile(norm)
+
+    def _get_native_winforms(self):
+        if sys.platform != "win32" or self._window is None:
+            return None, 0
+        native = getattr(self._window, "native", None)
+        if native is None:
+            return None, 0
+        handle_obj = getattr(native, "Handle", None)
+        hwnd = int(handle_obj.ToInt64()) if handle_obj is not None else 0
+        return native, hwnd
+
+    def _begin_nc_drag(self, hit_code: int) -> None:
+        native, hwnd = self._get_native_winforms()
+        if native is None or not hwnd:
+            return
+        try:
+            import ctypes
+            from System import Action
+
+            user32 = ctypes.windll.user32
+
+            def _do_drag():
+                user32.ReleaseCapture()
+                user32.SendMessageW(hwnd, 0x00A1, int(hit_code), 0)
+
+            native.BeginInvoke(Action(_do_drag))
+        except Exception:
+            pass
+
+    def window_start_drag(self) -> None:
+        """Start native Win32 titlebar drag (supports smooth move & Aero Snap)."""
+        self._begin_nc_drag(2)  # HTCAPTION
+
+    def window_start_resize(self, hit_code: int) -> None:
+        """Start native Win32 borderless window resize for hit_code in 10..17."""
+        code = int(hit_code)
+        if 10 <= code <= 17:
+            self._begin_nc_drag(code)
+
+    def window_minimize(self) -> None:
+        if self._window is not None:
+            self._window.minimize()
+
+    def window_is_maximized(self) -> bool:
+        native, _ = self._get_native_winforms()
+        if native is None:
+            return False
+        try:
+            import System.Windows.Forms as WinForms
+
+            return native.WindowState == WinForms.FormWindowState.Maximized
+        except Exception:
+            return False
+
+    def window_toggle_maximize(self) -> bool:
+        native, _ = self._get_native_winforms()
+        if native is None:
+            return False
+        try:
+            from System import Action
+            from System.Drawing import Rectangle
+            import System.Windows.Forms as WinForms
+
+            currently_max = native.WindowState == WinForms.FormWindowState.Maximized
+            target_max = not currently_max
+
+            def _toggle():
+                if target_max:
+                    screen = WinForms.Screen.FromControl(native)
+                    wa = screen.WorkingArea
+                    sb = screen.Bounds
+                    # Keep maximized borderless window inside the working area (don't cover taskbar).
+                    native.MaximizedBounds = Rectangle(
+                        wa.X - sb.X, wa.Y - sb.Y, wa.Width, wa.Height
+                    )
+                    native.WindowState = WinForms.FormWindowState.Maximized
+                else:
+                    native.WindowState = WinForms.FormWindowState.Normal
+
+            native.Invoke(Action(_toggle))
+            return target_max
+        except Exception:
+            return False
+
+    def window_close(self) -> None:
+        if self._window is not None:
+            self._window.destroy()
+
+    def set_theme(self, is_dark: bool) -> None:
+        """Sync native Windows 10/11 DWM border/caption theme with light/dark mode."""
+        _, hwnd = self._get_native_winforms()
+        if not hwnd:
+            return
+        try:
+            import ctypes
+
+            val = ctypes.c_int(1 if is_dark else 0)
+            dwmapi = ctypes.windll.dwmapi
+            if dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(val), ctypes.sizeof(val)
+            ) != 0:
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, 19, ctypes.byref(val), ctypes.sizeof(val)
+                )
+        except Exception:
+            pass
+
 
 def _wire_drop_zones(window: webview.Window) -> None:
-    """Attach native pywebview DOM drop handlers so files pass full disk paths."""
-    def _on_drag(e):
-        pass
+    """Attach native pywebview DOM drop handlers so files pass full disk paths.
 
+    Note: dragover preventDefault is handled purely in JS (ui/app.js) — wiring
+    dragover through pywebview's DOMEventHandler would serialize and IPC every
+    60-120Hz mousemove event to Python and stall drops by seconds.
+    """
     def _make_drop(target: str):
         def _on_drop(e):
             files = (e.get("dataTransfer") or {}).get("files") or []
@@ -567,14 +767,29 @@ def _wire_drop_zones(window: webview.Window) -> None:
 
         return _on_drop
 
-    doc = window.dom.document
-    doc.events.dragover += DOMEventHandler(_on_drag, prevent_default=True)
     drop_ref = window.dom.get_element("#drop-ref")
     drop_in = window.dom.get_element("#drop-in")
     if drop_ref is not None:
         drop_ref.events.drop += DOMEventHandler(_make_drop("ref"), prevent_default=True)
     if drop_in is not None:
         drop_in.events.drop += DOMEventHandler(_make_drop("in"), prevent_default=True)
+
+
+def _wire_desktop_window(window: webview.Window) -> None:
+    """Wire native drop zones and maximized-state notifications for frameless mode."""
+    _wire_drop_zones(window)
+
+    def _notify_max(is_max: bool) -> None:
+        try:
+            window.evaluate_js(
+                "window.setWindowMaximized && window.setWindowMaximized(%s)"
+                % ("true" if is_max else "false")
+            )
+        except Exception:
+            pass
+
+    window.events.maximized += lambda: _notify_max(True)
+    window.events.restored += lambda: _notify_max(False)
 
 
 def main() -> int:
@@ -590,11 +805,14 @@ def main() -> int:
         url=ui_entry,
         js_api=api,
         width=760,
-        height=760,
-        min_size=(620, 620),
+        height=720,
+        min_size=(620, 580),
+        frameless=True,
+        easy_drag=False,
+        background_color="#09090b",
     )
     api.attach_window(window)
-    webview.start(_wire_drop_zones, window, http_server=True)
+    webview.start(_wire_desktop_window, window, http_server=True)
     return 0
 
 
