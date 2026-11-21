@@ -7,8 +7,8 @@ if (-not (Test-Path $python)) {
     $python = "python"
 }
 
-$version = (git -C $repoRoot describe --tags --always --dirty 2>$null)
-if (-not $version) { $version = "0.0.0+local" }
+$version = (& $python -c "from ffsubsync.version import _read_pyproject_version; print(_read_pyproject_version() or '0.0.0')" 2>$null)
+if (-not $version) { $version = "0.0.0" }
 $version = $version.Trim()
 
 $frozenMod = Join-Path $repoRoot "ffsubsync\_frozen_version.py"

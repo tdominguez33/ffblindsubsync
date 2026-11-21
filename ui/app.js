@@ -72,6 +72,10 @@ const els = {
   resultActionBtn: document.getElementById("result-action-btn"),
   downloadLink: document.getElementById("download"),
   footer: document.getElementById("app-footer"),
+  footerText: document.getElementById("footer-text"),
+  footerVersion: document.getElementById("footer-version"),
+  settingsFooter: document.getElementById("settings-footer"),
+  settingsVersion: document.getElementById("settings-version"),
 };
 
 let adapter = null;
@@ -392,6 +396,20 @@ function resetFormState() {
   refreshSyncBtn();
 }
 
+function applyAppVersion(rawVersion) {
+  const clean = String(rawVersion || "").trim();
+  if (!clean) return;
+  const label = clean.startsWith("v") ? clean : `v${clean}`;
+  if (els.footerVersion && adapter && adapter.meta && adapter.meta.footerText) {
+    els.footerVersion.textContent = label;
+    els.footerVersion.hidden = false;
+  }
+  if (els.settingsVersion && els.settingsFooter && adapter && adapter.capabilities && adapter.capabilities.settings) {
+    els.settingsVersion.textContent = label;
+    els.settingsFooter.hidden = false;
+  }
+}
+
 function configureUiForAdapter(ad) {
   const { meta, capabilities } = ad;
   resetFormState();
@@ -450,10 +468,18 @@ function configureUiForAdapter(ad) {
   }
 
   if (meta.footerText) {
-    els.footer.textContent = meta.footerText;
+    if (els.footerText) {
+      els.footerText.textContent = meta.footerText;
+    } else {
+      els.footer.textContent = meta.footerText;
+    }
     els.footer.hidden = false;
   } else {
     els.footer.hidden = true;
+  }
+
+  if (meta.appVersion) {
+    applyAppVersion(meta.appVersion);
   }
 
   const hasCustomChrome = Boolean(capabilities.customWindowControls);
@@ -747,6 +773,7 @@ async function boot() {
         }
       },
       onWindowMaximizedChange: syncMaximizedState,
+      onAppVersion: applyAppVersion,
     },
   });
 

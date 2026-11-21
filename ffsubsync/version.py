@@ -1,7 +1,31 @@
 # -*- coding: utf-8 -*-
 from importlib import metadata
+from pathlib import Path
+import re
+from typing import Optional
 
-_DEFAULT_VERSION = "0.5.1"
+
+def _read_pyproject_version() -> Optional[str]:
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_project = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            in_project = line == "[project]"
+            continue
+        if in_project:
+            m = re.match(r'^version\s*=\s*["\']([^"\']+)["\']', line)
+            if m:
+                return m.group(1).strip()
+    return None
 
 
 def _resolve_version() -> str:
@@ -11,10 +35,13 @@ def _resolve_version() -> str:
         return FFSUBSYNC_VERSION
     except ImportError:
         pass
+    pyproject_ver = _read_pyproject_version()
+    if pyproject_ver:
+        return pyproject_ver
     try:
         return metadata.version("ffsubsync")
     except metadata.PackageNotFoundError:
-        return _DEFAULT_VERSION
+        return "0.0.0"
 
 
 __version__ = _resolve_version()

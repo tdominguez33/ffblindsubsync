@@ -4,7 +4,6 @@
 
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { execSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,15 +13,27 @@ const repoRoot = path.resolve(webDir, "..");
 const uiDir = path.join(repoRoot, "ui");
 const distDir = path.join(webDir, "dist", "site");
 
-function getGitVersion() {
+async function getAppVersion() {
   if (process.env.VERSION) return process.env.VERSION.trim();
   try {
-    return execSync("git describe --tags --always --dirty", { cwd: repoRoot })
-      .toString()
-      .trim();
+    const text = await fs.readFile(path.join(repoRoot, "pyproject.toml"), "utf8");
+    let inProject = false;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      if (line.startsWith("[")) {
+        inProject = line === "[project]";
+        continue;
+      }
+      if (inProject) {
+        const m = line.match(/^version\s*=\s*["']([^"']+)["']/);
+        if (m) return m[1].trim();
+      }
+    }
   } catch {
-    return "dev";
+    /* fall through */
   }
+  return "0.0.0";
 }
 
 async function computeBuildHash(files) {
@@ -50,7 +61,7 @@ async function copyDir(src, dest, { excludeNames = new Set() } = {}) {
 }
 
 async function main() {
-  const gitVer = getGitVersion();
+  const appVersion = await getAppVersion();
   const buildHash = await computeBuildHash([
     path.join(uiDir, "index.html"),
     path.join(uiDir, "styles.css"),
@@ -63,7 +74,7 @@ async function main() {
     path.join(webDir, "vendor", "py_sources.json"),
   ]);
   // Always include a content hash so local dirty rebuilds bust browser & Worker caches.
-  const version = `${gitVer}-${buildHash}`;
+  const cacheVersion = `${appVersion}-${buildHash}`;
 
   await fs.rm(distDir, { recursive: true, force: true });
   await fs.mkdir(path.join(distDir, "adapters"), { recursive: true });
@@ -77,12 +88,16 @@ async function main() {
     path.join(distDir, "adapters", "web.js"),
   );
 
-  // Cache-busting: version entry CSS/JS so deploys never mix fresh + stale files.
+  // Cache-busting + inject single-source-of-truth app version into HTML meta tag.
   // app.js threads the same ?v= query param to adapters/web.js and everything it loads.
   const rawHtml = await fs.readFile(path.join(uiDir, "index.html"), "utf8");
   const versionedHtml = rawHtml
-    .replace('href="./styles.css"', `href="./styles.css?v=${version}"`)
-    .replace('src="./app.js"', `src="./app.js?v=${version}"`);
+    .replace(
+      '<meta name="app-version" content="" />',
+      `<meta name="app-version" content="${appVersion}" />`,
+    )
+    .replace('href="./styles.css"', `href="./styles.css?v=${cacheVersion}"`)
+    .replace('src="./app.js"', `src="./app.js?v=${cacheVersion}"`);
   await fs.writeFile(path.join(distDir, "index.html"), versionedHtml, "utf8");
 
   // Web runtime config, worker/engine JS, and vendored assets
@@ -95,7 +110,7 @@ async function main() {
   });
   await copyDir(path.join(webDir, "vendor"), path.join(distDir, "vendor"));
 
-  console.log(`assembled ${path.relative(repoRoot, distDir)} (v=${version})`);
+  console.log(`assembled ${path.relative(repoRoot, distDir)} (v=${appVersion}, cache=${cacheVersion})`);
 }
 
 main().catch((err) => {

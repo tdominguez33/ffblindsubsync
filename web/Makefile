@@ -10,8 +10,8 @@ PYODIDE_VERSION := $(shell python3 -c "import json;print(json.load(open('build.c
 # node may be provided via nvm and absent from make's bare PATH; fall back to the
 # newest nvm-installed node so `make` works outside an nvm-initialized shell.
 NODE ?= $(shell command -v node 2>/dev/null || ls $(HOME)/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1)
-# Build version for cache-busting (?v=...) — same source as _frozen_version.py.
-VERSION := $(shell cd "$(REPO_ROOT)" && git describe --tags --always --dirty 2>/dev/null || echo dev)
+# Single-source-of-truth app version from pyproject.toml.
+VERSION := $(shell python3 -c "import re; m=re.search(r'^version\s*=\s*[\"\x27]([^\"\x27]+)[\"\x27]', open('$(REPO_ROOT)/pyproject.toml').read(), re.M); print(m.group(1) if m else '0.0.0')" 2>/dev/null || echo 0.0.0)
 
 # Deps the native correctness tests need (mirror build.config.json + the
 # transitive libs ffsubsync imports at load time). webrtcvad-wheels is the native

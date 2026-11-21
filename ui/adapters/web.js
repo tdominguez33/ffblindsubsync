@@ -50,7 +50,10 @@ function sortByPriority(streams) {
   return [...preferred, ...deprioritized];
 }
 
-export function createAdapter({ withVersion, callbacks }) {
+export function createAdapter({ version, withVersion, callbacks }) {
+  const metaVersionEl = document.querySelector('meta[name="app-version"]');
+  const metaVersion = (metaVersionEl && metaVersionEl.getAttribute("content") || "").trim();
+  const appVersion = metaVersion || String(version || "").replace(/-[0-9a-f]{8}$/, "").trim();
   let worker = null;
   let engineReady = false;
   let workerCaps = { webrtcvad: false };
@@ -136,6 +139,7 @@ export function createAdapter({ withVersion, callbacks }) {
       badgeTitle: "",
       footerText:
         "Runs locally in your browser via WebAssembly (Pyodide + ffmpeg.wasm). Nothing is uploaded.",
+      appVersion,
     },
     capabilities: {
       editablePaths: false,

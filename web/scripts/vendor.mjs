@@ -12,13 +12,30 @@
 // Output: web/vendor/py_sources.json, web/vendor/wheels/manifest.json
 
 import { promises as fs } from "node:fs";
-import { execSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webDir = path.resolve(here, "..");
 const repoRoot = path.resolve(webDir, "..");
+
+async function readPyprojectVersion() {
+  const text = await fs.readFile(path.join(repoRoot, "pyproject.toml"), "utf8");
+  let inProject = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("[")) {
+      inProject = line === "[project]";
+      continue;
+    }
+    if (inProject) {
+      const m = line.match(/^version\s*=\s*["']([^"']+)["']/);
+      if (m) return m[1].trim();
+    }
+  }
+  return "0.0.0";
+}
 
 const ffsubsyncPkg = path.join(repoRoot, "ffsubsync");
 const bridgeSrc = path.join(webDir, "src", "ffsubsync_bridge.py");
@@ -40,18 +57,9 @@ async function main() {
 
   sources["ffsubsync_bridge.py"] = await fs.readFile(bridgeSrc, "utf8");
 
-  // ffsubsync's version is derived from git at runtime; there's no git in the
-  // browser, so versioneer yields "0+unknown" and get_version() falls into its
-  // frozen-binary branch (which reads a resource env var and crashes). Write the
-  // _frozen_version module the code looks for first, exactly as a CI freeze would.
-  let version = "0.0.0+browser";
-  try {
-    version = execSync("git describe --tags --always --dirty", { cwd: repoRoot })
-      .toString()
-      .trim();
-  } catch {
-    /* not a git checkout; keep the placeholder */
-  }
+  // Bake the single-source-of-truth version from pyproject.toml into the
+  // browser bundle so ffsubsync.version.get_version() works inside Pyodide.
+  const version = await readPyprojectVersion();
   sources["ffsubsync/_frozen_version.py"] =
     `FFSUBSYNC_VERSION = ${JSON.stringify(version)}\n`;
 

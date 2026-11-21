@@ -250,6 +250,9 @@ export function createAdapter({ callbacks }) {
       });
       api = await waitForPywebview();
       const state = await api.get_init_state();
+      if (state && state.version && callbacks.onAppVersion) {
+        callbacks.onAppVersion(state.version);
+      }
       const ff =
         state && state.ffmpeg
           ? {

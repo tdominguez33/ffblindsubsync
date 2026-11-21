@@ -4,6 +4,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="app-version" content="" />
   <title>ffblindsubsync</title>
   <script>
     (function () {
@@ -314,7 +315,10 @@
       </div>
     </div>
 
-      <footer id="app-footer" hidden></footer>
+      <footer id="app-footer" hidden>
+        <p id="footer-text"></p>
+        <p id="footer-version" class="app-version" hidden></p>
+      </footer>
     </div>
 
     <div id="settings-view" class="view-stack" hidden>
@@ -395,6 +399,10 @@
           </div>
         </div>
       </div>
+
+      <footer id="settings-footer" class="settings-footer" hidden>
+        <p id="settings-version" class="app-version"></p>
+      </footer>
     </div>
   </main>
 

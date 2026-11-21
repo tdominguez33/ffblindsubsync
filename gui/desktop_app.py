@@ -36,6 +36,7 @@ from ffsubsync.ffmpeg_downloader import (
 from ffsubsync.ffmpeg_utils import subprocess_args
 from ffsubsync.ffsubsync import make_parser, run
 from ffsubsync.speech_transformers import ProgressInfo
+from ffsubsync.version import get_version
 
 if sys.stdout is None:
     sys.stdout = io.StringIO()
@@ -234,6 +235,7 @@ class DesktopApi:
 
     def get_init_state(self) -> Dict[str, Any]:
         return {
+            "version": get_version(),
             "ffmpeg": self._find_ffmpeg(),
             "portable_dir": str(get_portable_dir()),
             "custom_ffmpeg_path": self._custom_ffmpeg_path,
