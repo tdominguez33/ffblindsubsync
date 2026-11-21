@@ -1,0 +1,114 @@
+name: Build & Release Windows Desktop
+
+# Builds the single-file Windows desktop executable (FFblindsubsync.exe).
+#
+# - Pushing a tag matching v* (e.g. v0.1.0) runs unit tests, builds the .exe,
+#   and creates/updates the GitHub Release with FFblindsubsync.exe attached.
+# - Manual runs (workflow_dispatch) always upload the built .exe as a workflow
+#   artifact for testing, and optionally publish a GitHub Release for v<version>
+#   from pyproject.toml when publish_release is checked.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish GitHub Release for v<version> from pyproject.toml"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "pyproject.toml"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[desktop,dev]"
+
+      - name: Run unit tests
+        shell: pwsh
+        run: pytest -q
+
+      - name: Resolve version & release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $pkgVersion = (python -c "from ffsubsync.version import _read_pyproject_version; print(_read_pyproject_version())").Trim()
+          if (-not $pkgVersion) {
+            throw "Could not read version from pyproject.toml"
+          }
+          $expectedTag = "v$pkgVersion"
+
+          if ("${{ github.event_name }}" -eq "push") {
+            $tag = "${{ github.ref_name }}"
+            if ($tag -ne $expectedTag) {
+              throw "Tag '$tag' does not match pyproject.toml version '$pkgVersion' (expected '$expectedTag')."
+            }
+            $publish = "true"
+          } else {
+            $tag = $expectedTag
+            $publish = "${{ github.event.inputs.publish_release }}"
+          }
+
+          "version=$pkgVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publish=$publish" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Version: $pkgVersion | Tag: $tag | Publish: $publish"
+
+      - name: Build single-file FFblindsubsync.exe
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\gui\build-windows-native.ps1
+
+      - name: Verify executable & checksum
+        shell: pwsh
+        run: |
+          $exe = "gui\dist\FFblindsubsync.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Expected executable not found at $exe"
+          }
+          $sizeMb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "$hash  FFblindsubsync.exe" | Set-Content -Path "gui\dist\FFblindsubsync.exe.sha256" -Encoding ascii
+          Write-Host "FFblindsubsync.exe: $sizeMb MB | SHA256: $hash"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FFblindsubsync-${{ steps.meta.outputs.tag }}-windows-x64
+          path: |
+            gui/dist/FFblindsubsync.exe
+            gui/dist/FFblindsubsync.exe.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: FFblindsubsync ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            gui/dist/FFblindsubsync.exe
+            gui/dist/FFblindsubsync.exe.sha256
