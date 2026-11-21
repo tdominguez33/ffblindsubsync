@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
 """Portable FFmpeg locator and auto-downloader for Windows desktop builds."""
 
+import json
 import logging
 import os
 from pathlib import Path, PurePosixPath
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import urllib.error
 import urllib.request
 import zipfile
+import zlib
 
 from ffsubsync.ffmpeg_utils import subprocess_args
 
 logger = logging.getLogger(__name__)
 
+GYAN_GITHUB_LATEST_API = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest"
 GYAN_VERSION_URL = "https://www.gyan.dev/ffmpeg/builds/release-version"
 GYAN_ESSENTIALS_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 BTBN_LATEST_ZIP_URL = (
@@ -80,8 +85,11 @@ def _probe_ffmpeg_version(ffmpeg_exe: str) -> Optional[str]:
         return None
 
 
-def find_ffmpeg_binaries(portable_dir: Optional[Path] = None) -> Dict[str, Any]:
-    """Locate ``ffmpeg`` and ``ffprobe`` in portable dirs first, then system PATH."""
+def find_ffmpeg_binaries(
+    portable_dir: Optional[Path] = None,
+    custom_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Locate ``ffmpeg`` and ``ffprobe`` in custom path, portable dirs, or system PATH."""
     ffmpeg_name, ffprobe_name = _REQUIRED_BINS
     if portable_dir is not None:
         base = Path(portable_dir)
@@ -104,6 +112,37 @@ def find_ffmpeg_binaries(portable_dir: Optional[Path] = None) -> Dict[str, Any]:
                 seen.add(key)
                 candidates.append(c)
 
+    cleaned_custom = (custom_path or "").strip()
+    if cleaned_custom:
+        custom_p = Path(cleaned_custom)
+        search_dirs = [custom_p.parent] if custom_p.is_file() else [custom_p, custom_p / "bin"]
+        for cdir in search_dirs:
+            ff = cdir / ffmpeg_name
+            fp = cdir / ffprobe_name
+            if ff.is_file() and fp.is_file():
+                return {
+                    "available": True,
+                    "source": "custom",
+                    "custom_path": str(cdir),
+                    "custom_error": None,
+                    "portable_dir": str(base),
+                    "resource_dir": str(cdir),
+                    "ffmpeg_path": str(ff),
+                    "ffprobe_path": str(fp),
+                    "version": _probe_ffmpeg_version(str(ff)),
+                }
+        return {
+            "available": False,
+            "source": None,
+            "custom_path": cleaned_custom,
+            "custom_error": "ffmpeg and ffprobe were not found in: %s" % cleaned_custom,
+            "portable_dir": str(base),
+            "resource_dir": None,
+            "ffmpeg_path": None,
+            "ffprobe_path": None,
+            "version": None,
+        }
+
     for candidate_dir in candidates:
         ff = candidate_dir / ffmpeg_name
         fp = candidate_dir / ffprobe_name
@@ -111,6 +150,8 @@ def find_ffmpeg_binaries(portable_dir: Optional[Path] = None) -> Dict[str, Any]:
             return {
                 "available": True,
                 "source": "portable",
+                "custom_path": "",
+                "custom_error": None,
                 "portable_dir": str(base),
                 "resource_dir": str(candidate_dir),
                 "ffmpeg_path": str(ff),
@@ -124,6 +165,8 @@ def find_ffmpeg_binaries(portable_dir: Optional[Path] = None) -> Dict[str, Any]:
         return {
             "available": True,
             "source": "system",
+            "custom_path": "",
+            "custom_error": None,
             "portable_dir": str(base),
             "resource_dir": None,
             "ffmpeg_path": sys_ff,
@@ -134,6 +177,8 @@ def find_ffmpeg_binaries(portable_dir: Optional[Path] = None) -> Dict[str, Any]:
     return {
         "available": False,
         "source": None,
+        "custom_path": "",
+        "custom_error": None,
         "portable_dir": str(base),
         "resource_dir": None,
         "ffmpeg_path": None,
@@ -190,6 +235,259 @@ def _extract_binaries_from_zip(
                 raise
 
 
+def _resolve_gyan_github_zip_url(timeout: float = 5.0) -> Optional[str]:
+    """Resolve the latest GyanD essentials zip URL hosted on GitHub Releases CDN."""
+    try:
+        req = urllib.request.Request(
+            GYAN_GITHUB_LATEST_API,
+            headers={
+                "User-Agent": "ffsubsync-desktop",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        for asset in data.get("assets") or []:
+            name = str(asset.get("name") or "").lower()
+            dl_url = asset.get("browser_download_url")
+            if dl_url and "essentials" in name and name.endswith(".zip"):
+                return str(dl_url)
+    except Exception as exc:
+        logger.debug("Could not resolve GyanD GitHub release URL: %s", exc)
+    return None
+
+
+def _default_download_urls() -> Tuple[str, ...]:
+    """Return mirrors ordered fastest-first (GitHub CDN before throttled gyan.dev)."""
+    urls: List[str] = []
+    gh_gyan = _resolve_gyan_github_zip_url()
+    if gh_gyan:
+        urls.append(gh_gyan)
+    urls.append(BTBN_LATEST_ZIP_URL)
+    urls.append(GYAN_ESSENTIALS_ZIP_URL)
+    return tuple(urls)
+
+
+def _read_exact(stream, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            raise EOFError("Unexpected EOF while reading %d bytes (got %d)" % (n, len(buf)))
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _parse_zip_central_directory(
+    cd_bytes: bytes, required: Tuple[str, ...]
+) -> Optional[Dict[str, Dict[str, int]]]:
+    """Parse ZIP Central Directory records and locate required binary entries."""
+    want = {name.lower(): name for name in required}
+    found: Dict[str, Dict[str, int]] = {}
+    pos = 0
+    end = len(cd_bytes)
+    while pos + 46 <= end:
+        sig = struct.unpack_from("<I", cd_bytes, pos)[0]
+        if sig != 0x02014B50:
+            break
+        (
+            comp_method,
+            _mtime,
+            _mdate,
+            crc32_val,
+            comp_size,
+            uncomp_size,
+            fn_len,
+            ex_len,
+            cm_len,
+            _disk,
+            _iattr,
+            _eattr,
+            loc_off,
+        ) = struct.unpack_from("<HHHIIIHHHHHII", cd_bytes, pos + 10)
+        name_end = pos + 46 + fn_len
+        if name_end > end:
+            return None
+        entry_name = cd_bytes[pos + 46 : name_end].decode("utf-8", errors="replace")
+        pos = name_end + ex_len + cm_len
+        if entry_name.endswith("/"):
+            continue
+        leaf = PurePosixPath(entry_name).name.lower()
+        if leaf in want and leaf not in found:
+            if comp_method not in (0, 8):
+                return None
+            if comp_size == 0xFFFFFFFF or uncomp_size == 0xFFFFFFFF or loc_off == 0xFFFFFFFF:
+                return None
+            found[leaf] = {
+                "target_name": want[leaf],
+                "comp_method": comp_method,
+                "crc32": crc32_val,
+                "comp_size": comp_size,
+                "uncomp_size": uncomp_size,
+                "fn_len": fn_len,
+                "loc_off": loc_off,
+            }
+    if len(found) != len(want):
+        return None
+    return found
+
+
+def _try_range_download_and_extract(
+    url: str,
+    dest_dir: Path,
+    required: Tuple[str, ...],
+    emit: Callable[[Dict[str, Any]], None],
+) -> bool:
+    """Download and decompress only required binaries via HTTP Range requests.
+
+    Skips unused large entries in the archive (e.g. ffplay.exe ~37 MB) and
+    decompresses directly to disk with CRC32 verification. Returns True on
+    success, or False if the server does not support Range requests so the
+    caller can fall back to a full-archive download.
+    """
+    head_req = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "ffsubsync-desktop"}
+    )
+    with urllib.request.urlopen(head_req, timeout=15) as head_resp:
+        final_url = getattr(head_resp, "geturl", lambda: url)() or url
+        total_hdr = head_resp.headers.get("Content-Length")
+        accept_ranges = (head_resp.headers.get("Accept-Ranges") or "").lower()
+    if not total_hdr or not total_hdr.isdigit() or "bytes" not in accept_ranges:
+        return False
+    archive_size = int(total_hdr)
+    if archive_size < 1024:
+        return False
+
+    # 1. Fetch ZIP End of Central Directory (last <=64 KB).
+    tail_len = min(65536, archive_size)
+    tail_start = archive_size - tail_len
+    tail_req = urllib.request.Request(
+        final_url,
+        headers={
+            "User-Agent": "ffsubsync-desktop",
+            "Range": "bytes=%d-%d" % (tail_start, archive_size - 1),
+        },
+    )
+    with urllib.request.urlopen(tail_req, timeout=20) as tail_resp:
+        if getattr(tail_resp, "status", None) != 206:
+            return False
+        tail = tail_resp.read()
+
+    eocd = tail.rfind(b"PK\x05\x06")
+    if eocd < 0 or eocd + 22 > len(tail):
+        return False
+    cd_size, cd_offset = struct.unpack_from("<II", tail, eocd + 12)
+    if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF or cd_size == 0:
+        return False
+
+    if cd_offset >= tail_start and (cd_offset - tail_start) + cd_size <= len(tail):
+        rel = cd_offset - tail_start
+        cd_bytes = tail[rel : rel + cd_size]
+    else:
+        cd_req = urllib.request.Request(
+            final_url,
+            headers={
+                "User-Agent": "ffsubsync-desktop",
+                "Range": "bytes=%d-%d" % (cd_offset, cd_offset + cd_size - 1),
+            },
+        )
+        with urllib.request.urlopen(cd_req, timeout=20) as cd_resp:
+            if getattr(cd_resp, "status", None) != 206:
+                return False
+            cd_bytes = cd_resp.read()
+
+    entries = _parse_zip_central_directory(cd_bytes, required)
+    if not entries:
+        return False
+
+    # Sort entries by offset in the archive and stream only their compressed bytes.
+    ordered = sorted(entries.values(), key=lambda e: e["loc_off"])
+    total_to_download = sum(e["comp_size"] for e in ordered)
+    downloaded = 0
+    staged: List[Tuple[str, Path]] = []
+
+    try:
+        for entry in ordered:
+            loc_off = entry["loc_off"]
+            comp_size = entry["comp_size"]
+            uncomp_size = entry["uncomp_size"]
+            comp_method = entry["comp_method"]
+            expected_crc = entry["crc32"]
+            # Request local header + generous headroom for local extra field + compressed data.
+            range_end = min(archive_size - 1, loc_off + 30 + entry["fn_len"] + 4096 + comp_size - 1)
+            part_req = urllib.request.Request(
+                final_url,
+                headers={
+                    "User-Agent": "ffsubsync-desktop",
+                    "Range": "bytes=%d-%d" % (loc_off, range_end),
+                },
+            )
+            fd, tmp_bin = tempfile.mkstemp(prefix=".tmp_", dir=str(dest_dir))
+            os.close(fd)
+            staged.append((tmp_bin, dest_dir / entry["target_name"]))
+            with urllib.request.urlopen(part_req, timeout=30) as resp, open(tmp_bin, "wb") as out_f:
+                if getattr(resp, "status", None) != 206:
+                    raise RuntimeError("Server did not honor byte range request")
+                lh = _read_exact(resp, 30)
+                if lh[:4] != b"PK\x03\x04":
+                    raise RuntimeError("Invalid ZIP local file header")
+                lh_fn_len, lh_ex_len = struct.unpack_from("<HH", lh, 26)
+                if lh_fn_len + lh_ex_len > 0:
+                    _read_exact(resp, lh_fn_len + lh_ex_len)
+
+                decomp = zlib.decompressobj(-zlib.MAX_WBITS) if comp_method == 8 else None
+                remaining = comp_size
+                crc = 0
+                written = 0
+                while remaining > 0:
+                    chunk = resp.read(min(262144, remaining))
+                    if not chunk:
+                        raise EOFError("Truncated compressed stream for %s" % entry["target_name"])
+                    remaining -= len(chunk)
+                    downloaded += len(chunk)
+                    plain = decomp.decompress(chunk) if decomp is not None else chunk
+                    if plain:
+                        out_f.write(plain)
+                        crc = zlib.crc32(plain, crc)
+                        written += len(plain)
+                    frac = min(1.0, downloaded / total_to_download) if total_to_download > 0 else None
+                    emit({
+                        "phase": "downloading",
+                        "downloaded": downloaded,
+                        "total": total_to_download,
+                        "fraction": frac,
+                        "url": url,
+                    })
+
+                if decomp is not None:
+                    tail_plain = decomp.flush()
+                    if tail_plain:
+                        out_f.write(tail_plain)
+                        crc = zlib.crc32(tail_plain, crc)
+                        written += len(tail_plain)
+
+                if (crc & 0xFFFFFFFF) != expected_crc or written != uncomp_size:
+                    raise RuntimeError(
+                        "CRC/size mismatch for %s (got %d/%#x, expected %d/%#x)"
+                        % (entry["target_name"], written, crc & 0xFFFFFFFF, uncomp_size, expected_crc)
+                    )
+
+        # Atomically move all verified binaries into place.
+        for tmp_bin, dest in staged:
+            os.replace(tmp_bin, dest)
+            if platform.system() != "Windows":
+                os.chmod(dest, 0o755)
+        staged.clear()
+        return True
+    finally:
+        for tmp_bin, _ in staged:
+            if os.path.exists(tmp_bin):
+                try:
+                    os.remove(tmp_bin)
+                except OSError:
+                    pass
+
+
 def download_latest_ffmpeg(
     target_dir: Optional[Path] = None,
     progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -207,7 +505,7 @@ def download_latest_ffmpeg(
 
     dest_dir = Path(target_dir) if target_dir is not None else get_portable_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
-    candidate_urls = urls or (GYAN_ESSENTIALS_ZIP_URL, BTBN_LATEST_ZIP_URL)
+    candidate_urls = urls or _default_download_urls()
 
     def _emit(payload: Dict[str, Any]) -> None:
         if progress_cb is not None:
@@ -218,10 +516,27 @@ def download_latest_ffmpeg(
 
     last_err: Optional[Exception] = None
     for url in candidate_urls:
+        _emit({"phase": "connecting", "downloaded": 0, "total": 0, "fraction": None, "url": url})
+        # Fast path: stream only ffmpeg + ffprobe via HTTP Range (skips ffplay.exe ~37 MB).
+        try:
+            if _try_range_download_and_extract(url, dest_dir, _REQUIRED_BINS, _emit):
+                info = find_ffmpeg_binaries(dest_dir)
+                if info["available"]:
+                    _emit({"phase": "ready", "downloaded": 0, "total": 0, "fraction": 1.0, "info": info})
+                    return info
+        except urllib.error.HTTPError as exc:
+            logger.debug("Range HEAD/GET rejected (%s) for %s, falling back to full zip", exc.code, url)
+        except OSError as exc:
+            last_err = exc
+            logger.warning("FFmpeg download from %s failed: %s", url, exc)
+            continue
+        except Exception as exc:
+            logger.debug("Range download for %s fell back to full archive: %s", url, exc)
+
+        # Fallback path: download full zip and extract required binaries.
         fd, tmp_zip = tempfile.mkstemp(prefix="ffmpeg_", suffix=".zip", dir=str(dest_dir))
         os.close(fd)
         try:
-            _emit({"phase": "connecting", "downloaded": 0, "total": 0, "fraction": None, "url": url})
             req = urllib.request.Request(url, headers={"User-Agent": "ffsubsync-desktop"})
             with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_zip, "wb") as out_f:
                 total_hdr = resp.headers.get("Content-Length")
