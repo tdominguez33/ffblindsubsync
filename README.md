@@ -7,8 +7,8 @@ reliable, one-shot **blind subtitle synchronization** -- featuring a portable
 Windows desktop app, automatic PGS/VobSub timing extraction, and safer
 mid-file break alignment.
 
-> Forked from [smacke/ffsubsync](https://github.com/smacke/ffsubsync) by
-> Stephen Macke.
+> Based on [smacke/ffsubsync](https://github.com/smacke/ffsubsync) **v0.5.1**
+> by Stephen Macke.
 
 ## What's New in This Fork
 
@@ -42,7 +42,7 @@ mid-file break alignment.
 
 ## Windows Desktop App
 
-The bundled app (`gui/dist/FFblindsubsync/FFblindsubsync.exe`) runs directly
+The bundled app (`gui/dist/FFblindsubsync.exe`) runs directly
 without installing Python. By default, configuration (`config.json`, including
 saved window size/position and custom FFmpeg path) and downloaded `ffmpeg` /
 `ffprobe` binaries are stored in `%LOCALAPPDATA%\ffblindsubsync`. To run in
@@ -91,7 +91,7 @@ pip install git+https://github.com/tdominguez33/ffblindsubsync
 
 ### Quick Examples
 
-All `ffs`, `ffsubsync`, and `subsync` CLI entrypoints work:
+All `ffblindsubsync`, `ffs`, `ffsubsync`, and `subsync` CLI entrypoints work:
 
 ```bash
 # Auto sync (embedded text -> PGS/VobSub timings -> 48 KHz audio VAD)

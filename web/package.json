@@ -1,9 +1,9 @@
 {
-  "name": "ffsubsync-web",
+  "name": "ffblindsubsync-web",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Browser (WebAssembly/Pyodide) build of ffsubsync — sync subtitles with no backend.",
+  "description": "Browser (WebAssembly/Pyodide) build of ffblindsubsync — sync subtitles with no backend.",
   "scripts": {
     "vendor": "node scripts/vendor.mjs",
     "build": "node scripts/build_site.mjs",

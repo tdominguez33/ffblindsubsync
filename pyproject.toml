@@ -3,8 +3,8 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ffsubsync"
-version = "0.5.1"
+name = "ffblindsubsync"
+version = "0.1.0"
 description = "Language-agnostic synchronization of subtitles with video."
 readme = "README.md"
 license = "MIT"
@@ -41,6 +41,7 @@ dev = [
 ]
 
 [project.scripts]
+ffblindsubsync = "ffsubsync:main"
 ffs = "ffsubsync:main"
 subsync = "ffsubsync:main"
 ffsubsync = "ffsubsync:main"

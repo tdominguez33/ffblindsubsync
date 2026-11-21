@@ -78,7 +78,7 @@ _cc_probe()
 `);
   }
 
-  status("loading ffsubsync…");
+  status("loading ffblindsubsync…");
   const sources = await (
     await fetch(withV(new URL(config.pySourcesManifest, configUrl).href))
   ).json();

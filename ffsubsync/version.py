@@ -38,10 +38,12 @@ def _resolve_version() -> str:
     pyproject_ver = _read_pyproject_version()
     if pyproject_ver:
         return pyproject_ver
-    try:
-        return metadata.version("ffsubsync")
-    except metadata.PackageNotFoundError:
-        return "0.0.0"
+    for pkg_name in ("ffblindsubsync", "ffsubsync"):
+        try:
+            return metadata.version(pkg_name)
+        except metadata.PackageNotFoundError:
+            continue
+    return "0.0.0"
 
 
 __version__ = _resolve_version()

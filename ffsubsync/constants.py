@@ -102,17 +102,17 @@ def is_remote_url(path: Optional[str]) -> bool:
     return path.startswith(REMOTE_URL_PROTOCOLS)
 
 
-GITHUB_DEV_USER: str = "smacke"
-PROJECT_NAME: str = "FFsubsync"
+GITHUB_DEV_USER: str = "tdominguez33"
+PROJECT_NAME: str = "FFblindsubsync"
 PROJECT_LICENSE: str = "MIT"
-COPYRIGHT_YEAR: str = "2019"
-GITHUB_REPO: str = "ffsubsync"
+COPYRIGHT_YEAR: str = "2026"
+GITHUB_REPO: str = "ffblindsubsync"
 DESCRIPTION: str = "Synchronize subtitles with video."
 LONG_DESCRIPTION: str = (
     "Automatic and language-agnostic synchronization of subtitles with video."
 )
 WEBSITE: str = "https://github.com/{}/{}/".format(GITHUB_DEV_USER, GITHUB_REPO)
-DEV_WEBSITE: str = "https://smacke.net/"
+DEV_WEBSITE: str = "https://github.com/{}/".format(GITHUB_DEV_USER)
 
 # No trailing slash important for this one...
 API_RELEASE_URL: str = "https://api.github.com/repos/{}/{}/releases/latest".format(

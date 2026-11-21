@@ -1,7 +1,7 @@
 name: Build Website
 
-# Builds and deploys the browser/WASM ffsubsync site to GitHub Pages
-# (https://smacke.github.io/ffsubsync). build-wheels cross-compiles the webrtcvad
+# Builds and deploys the browser/WASM ffblindsubsync site to GitHub Pages
+# (https://tdominguez33.github.io/ffblindsubsync). build-wheels cross-compiles the webrtcvad
 # (VAD) and cchardet (encoding) wasm wheels for exact CLI parity and feeds them
 # into build-site; if a wheel build fails, the site still deploys and falls back
 # (auditok VAD, charset-normalizer encoding detection).

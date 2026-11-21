@@ -1,4 +1,4 @@
-# Build automation for the browser (WebAssembly / Pyodide) ffsubsync site.
+# Build automation for the browser (WebAssembly / Pyodide) ffblindsubsync site.
 # Runs entirely inside this worktree; never touches the main checkout.
 
 SHELL := /bin/bash
@@ -25,7 +25,7 @@ TEST_DEPS := --with numpy --with pysubs2 --with srt --with ffmpeg-python \
         emsdk wheels webrtcvad-wheel cchardet-wheel
 
 help:
-	@echo "ffsubsync web (Pyodide=$(PYODIDE_VERSION)) targets:"
+	@echo "ffblindsubsync web (Pyodide=$(PYODIDE_VERSION)) targets:"
 	@echo "  make vendor         bundle local ffsubsync + bridge -> vendor/py_sources.json"
 	@echo "  make site           assemble deployable static bundle -> dist/site"
 	@echo "  make serve          serve dist/site at http://localhost:8000"

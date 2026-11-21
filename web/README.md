@@ -1,10 +1,10 @@
-# ffsubsync in the browser (WebAssembly / Pyodide)
+# ffblindsubsync in the browser (WebAssembly / Pyodide)
 
-A backendless static site that runs [ffsubsync](https://github.com/smacke/ffsubsync)
+A backendless static site that runs [ffblindsubsync](https://github.com/tdominguez33/ffblindsubsync)
 entirely client-side via [Pyodide](https://pyodide.org). Subtitle files never leave
 the user's machine.
 
-## 👉 Try it: https://smacke.github.io/ffsubsync
+## 👉 Try it: https://tdominguez33.github.io/ffblindsubsync
 
 No install, no upload. Pick a correctly-synced reference subtitle and an out-of-sync
 subtitle, click **Sync subtitles**, and download the corrected file. First load pulls
