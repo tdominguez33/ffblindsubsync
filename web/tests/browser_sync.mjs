@@ -18,6 +18,7 @@ const PORT = 8123;
 
 const MIME = {
   ".html": "text/html",
+  ".css": "text/css",
   ".js": "text/javascript",
   ".mjs": "text/javascript",
   ".json": "application/json",

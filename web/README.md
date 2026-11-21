@@ -35,7 +35,8 @@ see [Build & run](#build--run) below.
   `ffsubsync.run(...)` the same way the CLI does, over Pyodide's in-memory filesystem.
 - `src/ffsubsync_engine.mjs` boots Pyodide (numpy via `loadPackage`; `pysubs2` / `srt` /
   `ffmpeg-python` / `auditok` via `micropip`), loads the bundle, and calls the bridge.
-- `src/worker.js` runs all of that in a Web Worker; `src/main.js` + `index.html` are the UI.
+- `src/worker.js` runs all of that in a Web Worker; the UI is shared with the desktop
+  app in `../ui/` (`index.html`, `styles.css`, `app.js`) wired through `../ui/adapters/web.js`.
 
 Version pins (Pyodide, pip packages) live in one place: `build.config.json`.
 

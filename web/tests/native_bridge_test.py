@@ -131,6 +131,38 @@ def main() -> int:
     assert split_err < 0.1, "split_sync should correct both halves"
     print("PASS: split_sync fixes the mid-file break (Δ %.3fs) the single offset "
           "could not (Δ %.3fs)" % (split_err, plain_err))
+
+    # --- auto_split path: safe on unbroken file, fixes real break ------------
+    auto_clean = bridge.sync_subtitles(
+        "reference.srt", reference, "input.srt", delayed,
+        auto_split=True,
+    )
+    assert auto_clean["ok"], "auto_split on unbroken file should succeed"
+    assert auto_clean["split_segments"] and len(auto_clean["split_segments"]) == 1, (
+        "auto_split should produce 0 splits on unbroken input, got %r"
+        % (auto_clean["split_segments"],)
+    )
+    assert abs(auto_clean["offset_seconds"] - expected_offset) < 0.25
+
+    auto_break = bridge.sync_subtitles(
+        "reference.srt", ref_bytes, "broken.srt", broken_bytes,
+        auto_split=True, max_offset_seconds=30,
+    )
+    assert auto_break["ok"], "auto_split on broken file should succeed"
+    auto_starts = [c.start.total_seconds() for c in _srt.parse(auto_break["output_text"])]
+    auto_err = max(abs(a - b) for a, b in zip(ref_starts, auto_starts))
+    assert auto_err < 0.1, "auto_split should fix mid-file break (got Δ %.3fs)" % auto_err
+    assert len(auto_break["split_segments"]) == 2
+    print("PASS: auto_split leaves clean files unbroken and fixes mid-file break (Δ %.3fs)" % auto_err)
+
+    # --- PGS/VobSub timings path --------------------------------------------
+    timings = [(i * 2.0, i * 2.0 + 1.0) for i in range(40)]
+    pgs_res = bridge.sync_with_timings(timings, "input.srt", delayed)
+    assert pgs_res["ok"], "sync_with_timings should succeed"
+    assert abs(pgs_res["offset_seconds"] - expected_offset) < 0.25, (
+        "expected timings offset ~%.2f, got %.3f" % (expected_offset, pgs_res["offset_seconds"])
+    )
+    print("PASS: sync_with_timings recovered offset %.3fs" % pgs_res["offset_seconds"])
     return 0
 
 

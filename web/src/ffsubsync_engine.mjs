@@ -97,7 +97,10 @@ _cc_probe()
   return { pyodide, config, capabilities };
 }
 
-export function syncWithEngine(engine, { refName, refBytes, inName, inBytes, options = {} }) {
+export function syncWithEngine(
+  engine,
+  { refName, refBytes, inName, inBytes, options = {}, onProgress = null },
+) {
   const { pyodide } = engine;
   const opts = pyodide.toPy(options);
   pyodide.globals.set("_ref_name", refName);
@@ -105,17 +108,20 @@ export function syncWithEngine(engine, { refName, refBytes, inName, inBytes, opt
   pyodide.globals.set("_ref_bytes", refBytes);
   pyodide.globals.set("_in_bytes", inBytes);
   pyodide.globals.set("_opts", opts);
+  pyodide.globals.set("_on_progress", onProgress);
   let proxy;
   try {
     proxy = pyodide.runPython(`
 import ffsubsync_bridge
 ffsubsync_bridge.sync_subtitles(
     _ref_name, _ref_bytes, _in_name, _in_bytes,
+    progress_cb=_on_progress,
     **dict(_opts),
 )
 `);
     return proxy.toJs({ dict_converter: Object.fromEntries });
   } finally {
+    pyodide.globals.set("_on_progress", null);
     if (proxy) proxy.destroy();
     if (opts && opts.destroy) opts.destroy();
   }
@@ -125,7 +131,7 @@ ffsubsync_bridge.sync_subtitles(
 // reference. `vad` is "webrtc" or "auditok".
 export function syncAudioWithEngine(
   engine,
-  { pcm, frameRate, inName, inBytes, vad, options = {} },
+  { pcm, frameRate, inName, inBytes, vad, options = {}, onProgress = null },
 ) {
   const { pyodide } = engine;
   const opts = pyodide.toPy(options);
@@ -135,18 +141,53 @@ export function syncAudioWithEngine(
   pyodide.globals.set("_in_bytes", inBytes);
   pyodide.globals.set("_vad", vad);
   pyodide.globals.set("_opts", opts);
+  pyodide.globals.set("_on_progress", onProgress);
   let proxy;
   try {
     proxy = pyodide.runPython(`
 import ffsubsync_bridge
 ffsubsync_bridge.sync_with_audio(
     _pcm, _frame_rate, _in_name, _in_bytes, vad=_vad,
+    progress_cb=_on_progress,
     **dict(_opts),
 )
 `);
     return proxy.toJs({ dict_converter: Object.fromEntries });
   } finally {
+    pyodide.globals.set("_on_progress", null);
     if (proxy) proxy.destroy();
+    if (opts && opts.destroy) opts.destroy();
+  }
+}
+
+// Sync against extracted (start_s, end_s) timing intervals (e.g. PGS/VobSub).
+export function syncTimingsWithEngine(
+  engine,
+  { timings, inName, inBytes, options = {}, onProgress = null },
+) {
+  const { pyodide } = engine;
+  const pyTimings = pyodide.toPy(timings);
+  const opts = pyodide.toPy(options);
+  pyodide.globals.set("_timings", pyTimings);
+  pyodide.globals.set("_in_name", inName);
+  pyodide.globals.set("_in_bytes", inBytes);
+  pyodide.globals.set("_opts", opts);
+  pyodide.globals.set("_on_progress", onProgress);
+  let proxy;
+  try {
+    proxy = pyodide.runPython(`
+import ffsubsync_bridge
+ffsubsync_bridge.sync_with_timings(
+    _timings, _in_name, _in_bytes,
+    progress_cb=_on_progress,
+    **dict(_opts),
+)
+`);
+    return proxy.toJs({ dict_converter: Object.fromEntries });
+  } finally {
+    pyodide.globals.set("_on_progress", null);
+    if (proxy) proxy.destroy();
+    if (pyTimings && pyTimings.destroy) pyTimings.destroy();
     if (opts && opts.destroy) opts.destroy();
   }
 }

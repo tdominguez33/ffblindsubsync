@@ -17,7 +17,7 @@ const PORT = 8145;
 const FRAME_RATE = 16000;
 const EXPECTED = -5.0;
 const N = 40;
-const MIME = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json", ".whl": "application/octet-stream", ".wasm": "application/wasm" };
+const MIME = { ".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json", ".whl": "application/octet-stream", ".wasm": "application/wasm" };
 
 const ts = (t) => {
   if (t < 0) t = 0;
@@ -82,7 +82,6 @@ try {
     return s.includes("Ready");
   }, null, { timeout: 240000 });
 
-  await page.check('input[name="ref-type"][value="video"]');
   await page.setInputFiles("#ref-file", { name: "reference.wav", mimeType: "audio/wav", buffer: makeWav() });
   await page.setInputFiles("#input-file", { name: "input.srt", mimeType: "application/x-subrip", buffer: Buffer.from(makeSrt(5.0)) });
   await page.click("#sync-btn");

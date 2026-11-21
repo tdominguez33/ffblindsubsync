@@ -1,14 +1,13 @@
 // Module Web Worker: runs Pyodide + ffsubsync off the main thread so the UI stays
-// responsive. Audio decoding (ffmpeg.wasm) runs on the *main* thread — ffmpeg.wasm
-// spawns its own worker, and nesting that inside this worker is unreliable — so we
-// receive already-decoded PCM here.
-//
-// The engine module is imported inside `init` (not statically), using the
-// versioned URL the main thread passes, so cache-busting covers it too and the
-// message handler is registered synchronously (no top-level await).
+// responsive. Audio decoding and media probing (ffmpeg.wasm) run on the main
+// thread because nesting ffmpeg.wasm's worker inside this worker is unreliable.
 
 let eng = null; // the engine module
 let engine = null; // the booted engine
+
+const onProgress = (fraction, message) => {
+  post({ type: "progress", fraction, message });
+};
 
 self.onmessage = async (event) => {
   const msg = event.data || {};
@@ -26,11 +25,14 @@ self.onmessage = async (event) => {
       });
     } else if (msg.type === "sync") {
       if (!engine) throw new Error("engine not initialized");
-      post({ type: "status", status: "syncing…" });
-      post({ type: "result", result: eng.syncWithEngine(engine, msg.payload) });
+      post({ type: "progress", fraction: 0.02, message: "Syncing…" });
+      post({
+        type: "result",
+        result: eng.syncWithEngine(engine, { ...msg.payload, onProgress }),
+      });
     } else if (msg.type === "syncAudioPcm") {
       if (!engine) throw new Error("engine not initialized");
-      post({ type: "status", status: "detecting speech + aligning…" });
+      post({ type: "progress", fraction: 0.0, message: "Detecting speech + aligning…" });
       const { pcm, frameRate, inName, inBytes, vad, options } = msg.payload;
       const result = eng.syncAudioWithEngine(engine, {
         pcm,
@@ -39,8 +41,23 @@ self.onmessage = async (event) => {
         inBytes,
         vad,
         options,
+        onProgress,
       });
       post({ type: "result", result });
+    } else if (msg.type === "syncTimings") {
+      if (!engine) throw new Error("engine not initialized");
+      post({ type: "progress", fraction: 0.02, message: "Aligning subtitle timings…" });
+      const { timings, inName, inBytes, options } = msg.payload;
+      const result = eng.syncTimingsWithEngine(engine, {
+        timings,
+        inName,
+        inBytes,
+        options,
+        onProgress,
+      });
+      post({ type: "result", result });
+    } else {
+      throw new Error("unknown worker message type: " + msg.type);
     }
   } catch (err) {
     post({ type: "error", error: String((err && err.stack) || err) });
