@@ -26,12 +26,18 @@ from ffsubsync.constants import (
     VAD_CHOICES,
     is_remote_url,
 )
-from ffsubsync.ffmpeg_utils import ffmpeg_bin_path, subprocess_args
+from ffsubsync.ffmpeg_utils import (
+    ffmpeg_bin_path,
+    install_no_window_ffmpeg_probe,
+    subprocess_args,
+)
 from ffsubsync.generic_subtitles import GenericSubtitle
 from ffsubsync.sklearn_shim import TransformerMixin
 from ffsubsync.sklearn_shim import Pipeline
 from ffsubsync.subtitle_parser import make_subtitle_parser
 from ffsubsync.subtitle_transformers import SubtitleScaler
+
+install_no_window_ffmpeg_probe()
 
 
 logging.basicConfig(level=logging.INFO)

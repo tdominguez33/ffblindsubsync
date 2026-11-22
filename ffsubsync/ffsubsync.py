@@ -36,7 +36,7 @@ from ffsubsync.constants import (
     VAD_CHOICES,
     is_remote_url,
 )
-from ffsubsync.ffmpeg_utils import ffmpeg_bin_path
+from ffsubsync.ffmpeg_utils import ffmpeg_bin_path, subprocess_args
 from ffsubsync.sklearn_shim import Pipeline, TransformerMixin
 from ffsubsync.speech_transformers import (
     VideoSpeechTransformer,
@@ -720,7 +720,10 @@ def extract_subtitles_from_reference(args: argparse.Namespace) -> int:
             "stdout" if args.srtout is None else args.srtout
         )
     )
-    retcode = subprocess.call(ffmpeg_args)
+    call_kwargs = subprocess_args(include_stdout=False) if args.srtout is not None else {}
+    if args.srtout is None and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        call_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    retcode = subprocess.call(ffmpeg_args, **call_kwargs)
     if retcode == 0:
         logger.info("...done")
     else:

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 import logging
 import os
 import platform
@@ -29,6 +30,7 @@ def subprocess_args(include_stdout=True):
         # distraction.
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         # Windows doesn't search the path by default. Pass it an environment so
         # it will.
         env = os.environ
@@ -66,6 +68,40 @@ def subprocess_args(include_stdout=True):
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         ret["creationflags"] = subprocess.CREATE_NO_WINDOW
     return ret
+
+
+def probe_no_window(filename, cmd="ffprobe", **kwargs):
+    """Drop-in replacement for ``ffmpeg.probe`` that hides console windows on Windows.
+
+    ``ffmpeg-python``'s stock ``ffmpeg.probe`` spawns ``subprocess.Popen`` without
+    ``CREATE_NO_WINDOW`` / ``STARTF_USESHOWWINDOW``, causing a brief terminal
+    window flash every time ``ffprobe`` runs from a ``--noconsole`` PyInstaller
+    GUI build.
+    """
+    from ffmpeg._run import Error
+    from ffmpeg._utils import convert_kwargs_to_cmd_line_args
+
+    args = [cmd, "-show_format", "-show_streams", "-of", "json"]
+    args += convert_kwargs_to_cmd_line_args(kwargs)
+    args += [filename]
+
+    p = subprocess.Popen(args, **subprocess_args(include_stdout=True))
+    out, err = p.communicate()
+    if p.returncode != 0:
+        raise Error("ffprobe", out, err)
+    return json.loads(out.decode("utf-8", errors="replace"))
+
+
+def install_no_window_ffmpeg_probe():
+    """Patch ``ffmpeg.probe`` in place so all probe calls hide console windows."""
+    try:
+        import ffmpeg
+        from ffmpeg import _probe
+    except ImportError:
+        return
+    if getattr(ffmpeg, "probe", None) is getattr(_probe, "probe", None):
+        ffmpeg.probe = probe_no_window
+        _probe.probe = probe_no_window
 
 
 def ffmpeg_bin_path(bin_name, gui_mode, ffmpeg_resources_path=None):
