@@ -130,3 +130,50 @@ def test_skips_zero_duration_packets(mock_probe, mock_bin):
     }
     result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
     assert result == [(5.0, 6.5)]
+
+
+@patch("ffsubsync.speech_transformers.ffmpeg_bin_path", return_value="ffprobe")
+@patch("ffsubsync.speech_transformers.ffmpeg.probe")
+def test_infers_timings_from_paired_show_clear_without_duration_time(
+    mock_probe, mock_bin
+):
+    """MKV Blu-ray PGS streams omit duration_time; pair show (>50B) with clear (<=50B)."""
+    mock_probe.return_value = {
+        "packets": [
+            {"pts_time": "146.188000", "size": "15325"},
+            {"pts_time": "147.356000", "size": "30"},
+            {"pts_time": "147.439000", "size": "41471"},
+            {"pts_time": "150.401000", "size": "30"},
+        ]
+    }
+    result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
+    assert result == [(146.188, 147.356), (147.439, 150.401)]
+
+
+@patch("ffsubsync.speech_transformers.ffmpeg_bin_path", return_value="ffprobe")
+@patch("ffsubsync.speech_transformers.ffmpeg.probe")
+def test_infers_timings_with_na_duration_and_back_to_back_shows(mock_probe, mock_bin):
+    """Back-to-back show packets without an intermediate clear packet still close cleanly."""
+    mock_probe.return_value = {
+        "packets": [
+            _make_packet(10.0, None, 8000),
+            _make_packet(12.5, None, 9000),
+            _make_packet(15.0, None, 30),
+        ]
+    }
+    result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
+    assert result == [(10.0, 12.5), (12.5, 15.0)]
+
+
+@patch("ffsubsync.speech_transformers.ffmpeg_bin_path", return_value="ffprobe")
+@patch("ffsubsync.speech_transformers.ffmpeg.probe")
+def test_fallback_clamps_long_orphan_duration(mock_probe, mock_bin):
+    """If a clear packet is missing/far away, clamp inferred cue duration to 15s."""
+    mock_probe.return_value = {
+        "packets": [
+            {"pts_time": "10.0", "size": "5000"},
+            {"pts_time": "200.0", "size": "30"},
+        ]
+    }
+    result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
+    assert result == [(10.0, 25.0)]

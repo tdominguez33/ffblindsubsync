@@ -30,6 +30,7 @@ from ffsubsync.constants import (
     SAMPLE_RATE,
     SUBTITLE_EXTENSIONS,
     DEFAULT_MIN_SCORE,
+    DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD,
     DEFAULT_QUALITY_MAX_OFFSET_SECONDS,
     DEFAULT_MAX_FRAMERATE_DEVIATION,
     VAD_CHOICES,
@@ -259,6 +260,7 @@ def try_sync(
                 else args.max_offset_seconds
             )
             aligner: Optional[MaxScoreAligner] = None
+            best_peak_snr: Optional[float] = None
             if skip_sync:
                 best_score = 0.0
                 best_srt_pipe = cast(Pipeline, srt_pipes[0])
@@ -272,14 +274,81 @@ def try_sync(
                     reference_speech,
                     srt_pipes,
                 )
+                best_peak_snr = getattr(aligner, "best_peak_snr_", None)
+
+                ref_step = (
+                    reference_pipe[-1]
+                    if hasattr(reference_pipe, "__getitem__")
+                    else reference_pipe
+                )
+                alt_candidates = (
+                    getattr(ref_step, "alt_video_speech_results_", None) or []
+                )
+                for cand_label, cand_speech in alt_candidates:
+                    logger.info("comparing alignment with %s...", cand_label)
+                    cand_aligner = MaxScoreAligner(
+                        FFTAligner, srtin, SAMPLE_RATE, align_max_offset_seconds
+                    )
+                    (cand_score, cand_offset), cand_pipe = cand_aligner.fit_transform(
+                        cand_speech,
+                        srt_pipes,
+                    )
+                    cand_snr = getattr(cand_aligner, "best_peak_snr_", None)
+                    prefer_cand = (
+                        cand_snr is not None
+                        and (best_peak_snr is None or cand_snr > best_peak_snr)
+                    ) or (
+                        cand_snr is None
+                        and best_peak_snr is None
+                        and cand_score > best_score
+                    )
+                    if prefer_cand:
+                        logger.info(
+                            "%s alignment scored higher peak SNR (%.2f vs %.2f; "
+                            "offset %.3fs vs %.3fs); using %s",
+                            cand_label,
+                            cand_snr or 0.0,
+                            best_peak_snr or 0.0,
+                            cand_offset / float(SAMPLE_RATE),
+                            offset_samples / float(SAMPLE_RATE),
+                            cand_label,
+                        )
+                        reference_speech = cand_speech
+                        aligner = cand_aligner
+                        best_score = cand_score
+                        offset_samples = cand_offset
+                        best_srt_pipe = cand_pipe
+                        best_peak_snr = cand_snr
+                    else:
+                        logger.info(
+                            "keeping full mix over %s (peak SNR %.2f vs %.2f)",
+                            cand_label,
+                            best_peak_snr or 0.0,
+                            cand_snr or 0.0,
+                        )
             if best_score < 0:
-                sync_was_successful = False
+                if (
+                    best_peak_snr is not None
+                    and best_peak_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+                ):
+                    logger.info(
+                        "raw score was negative (%.1f) due to speech-density mismatch, "
+                        "but peak SNR is strong (%.2f >= %.1f); accepting alignment",
+                        best_score,
+                        best_peak_snr,
+                        DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD,
+                    )
+                else:
+                    sync_was_successful = False
             logger.info("...done")
             offset_seconds = (
                 offset_samples / float(SAMPLE_RATE) + args.apply_offset_seconds
             )
             scale_step = best_srt_pipe.named_steps["scale"]
-            logger.info("score: %.3f", best_score)
+            if best_peak_snr is not None:
+                logger.info("score: %.3f (peak SNR: %.2f)", best_score, best_peak_snr)
+            else:
+                logger.info("score: %.3f", best_score)
             logger.info("offset seconds: %.3f", offset_seconds)
             logger.info("framerate scale factor: %.3f", scale_step.scale_factor)
             low_quality_reasons: List[str] = []

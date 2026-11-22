@@ -554,7 +554,7 @@ def alignment_has_positive_signal(
         j = i + 1
         while j < n and offsets[j] is not None and abs(offsets[j] - off) < 1e-9:
             j += 1
-        _, _, lift, _, seg_dur = _segment_stats(
+        _, raw_ratio, lift, _, seg_dur = _segment_stats(
             i,
             j,
             off,
@@ -570,8 +570,24 @@ def alignment_has_positive_signal(
             sample_rate=sample_rate,
         )
         if seg_dur > 0.0:
+            # Compute symmetric max-achievable lift (Loevinger's H) so sparse
+            # VAD paired with dense subtitles (q > p) is not capped below 0.08
+            # even under near-perfect containment. Reduces identically to
+            # `_overlap_lift` whenever q <= p.
+            margin = 5.0 * sample_rate
+            lo = max(0.0, float(starts[i]) + off - margin)
+            hi = min(float(ref_len), float(ends[j - 1]) + off + margin)
+            eff_lift = lift
+            if hi > lo:
+                p_loc = _ref_density(padded, pad, ref_len, lo, hi)
+                q_loc = min(1.0, seg_dur / (hi - lo))
+                min_pq = min(p_loc, q_loc)
+                if min_pq > 0.005:
+                    denom = max(0.15 * min_pq, min_pq - p_loc * q_loc)
+                    sym_lift = (raw_ratio * q_loc - p_loc * q_loc) / denom
+                    eff_lift = max(lift, sym_lift)
             total_dur += seg_dur
-            weighted_lift += seg_dur * lift
+            weighted_lift += seg_dur * eff_lift
         i = j
 
     return total_dur > 0.0 and (weighted_lift / total_dur) > 0.08

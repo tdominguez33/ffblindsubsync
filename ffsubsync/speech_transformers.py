@@ -391,6 +391,80 @@ class ComputeSpeechFrameBoundariesMixin:
         return self
 
 
+_CENTER_CHANNEL_LAYOUT_PREFIXES = (
+    "3.0",
+    "3.1",
+    "4.0",
+    "4.1",
+    "5.0",
+    "5.1",
+    "6.0",
+    "6.1",
+    "7.0",
+    "7.1",
+)
+_CENTER_CHANNEL_LAYOUT_NAMES = frozenset({"hexagonal", "octagonal"})
+_NO_CENTER_LAYOUTS = frozenset({"mono", "stereo", "2.1", "2.2", "quad", "quad(side)", "2.1.2"})
+
+
+def _layout_has_center_channel(channel_layout: str) -> bool:
+    """Return True if an ffprobe ``channel_layout`` includes a dedicated ``FC`` channel."""
+    low = (channel_layout or "").strip().lower()
+    if not low or low == "unknown" or low in _NO_CENTER_LAYOUTS:
+        return False
+    if low in _CENTER_CHANNEL_LAYOUT_NAMES:
+        return True
+    if low.startswith(_CENTER_CHANNEL_LAYOUT_PREFIXES):
+        return True
+    return "fc" in re.split(r"[^a-z0-9]+", low)
+
+
+def _probe_audio_stream_has_center(
+    probe_data: Optional[Dict[str, Any]], ref_stream: Optional[str] = None
+) -> bool:
+    """Return True when the target audio stream in ``probe_data`` is surround with ``FC``."""
+    if not isinstance(probe_data, dict):
+        return False
+    streams = probe_data.get("streams")
+    if not isinstance(streams, list):
+        return False
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        return False
+
+    target = None
+    if ref_stream:
+        spec = ref_stream[2:] if ref_stream.startswith("0:") else ref_stream
+        if spec.startswith("a:"):
+            try:
+                idx = int(spec.split(":", 1)[1])
+                if 0 <= idx < len(audio_streams):
+                    target = audio_streams[idx]
+            except ValueError:
+                pass
+        elif spec.isdigit():
+            global_idx = int(spec)
+            for s in audio_streams:
+                if s.get("index") == global_idx:
+                    target = s
+                    break
+    if target is None:
+        for s in audio_streams:
+            if (s.get("disposition") or {}).get("default"):
+                target = s
+                break
+        if target is None:
+            target = audio_streams[0]
+
+    try:
+        channels = int(target.get("channels") or 0)
+    except (TypeError, ValueError):
+        channels = 0
+    if channels < 3:
+        return False
+    return _layout_has_center_channel(str(target.get("channel_layout") or ""))
+
+
 class VideoSpeechTransformer(TransformerMixin):
     def __init__(
         self,
@@ -423,6 +497,7 @@ class VideoSpeechTransformer(TransformerMixin):
             Callable[["ProgressInfo"], None]
         ] = progress_handler
         self.video_speech_results_: Optional[np.ndarray] = None
+        self.alt_video_speech_results_: List[Tuple[str, np.ndarray]] = []
 
     def _probe_embedded_subtitle_streams(self, fname: str) -> Optional[List[str]]:
         return _probe_embedded_subtitle_streams(
@@ -557,7 +632,9 @@ class VideoSpeechTransformer(TransformerMixin):
         subs_to_use = embedded_subs[best_idx]
         self.video_speech_results_ = subs_to_use.subtitle_speech_results_
 
-    def _build_ffmpeg_args(self, fname: str) -> List[str]:
+    def _build_ffmpeg_args(
+        self, fname: str, dual_center: bool = False
+    ) -> List[str]:
         ffmpeg_args = [
             ffmpeg_bin_path(
                 "ffmpeg", self.gui_mode, ffmpeg_resources_path=self.ffmpeg_path
@@ -579,6 +656,21 @@ class VideoSpeechTransformer(TransformerMixin):
         ffmpeg_args.extend(["-loglevel", "fatal", "-nostdin", "-i", fname])
         if self.ref_stream is not None and self.ref_stream.startswith("0:a:"):
             ffmpeg_args.extend(["-map", self.ref_stream])
+        if dual_center:
+            # Single-pass 2ch output for surround audio:
+            #   ch0 = standard mono downmix, ch1 = isolated Front Center (FC)
+            # In 5.1/7.1/Atmos mixes, dialogue lives in FC and -ac 1 downmix
+            # attenuates it by ~10-14 dB, hurting WebRTC VAD mode 3 recall.
+            af_expr = (
+                "aresample=async=1,asplit=2[a][b];"
+                "[a]aresample=ochl=mono[m];"
+                "[b]pan=mono|c0=FC[c];"
+                "[m][c]amerge=inputs=2"
+            )
+            out_channels = "2"
+        else:
+            af_expr = "aresample=async=1"
+            out_channels = "1"
         ffmpeg_args.extend(
             [
                 "-vn",
@@ -589,11 +681,11 @@ class VideoSpeechTransformer(TransformerMixin):
                 "-f",
                 "s16le",
                 "-ac",
-                "1",
+                out_channels,
                 "-acodec",
                 "pcm_s16le",
                 "-af",
-                "aresample=async=1",
+                af_expr,
                 "-ar",
                 str(self.frame_rate),
                 "-",
@@ -724,58 +816,56 @@ class VideoSpeechTransformer(TransformerMixin):
                     logger.warning("failed to remove temp audio file %s", temp_audio)
         return self
 
-    def _fit_using_audio(self, fname: str) -> None:
-        try:
-            total_duration = (
-                float(
-                    ffmpeg.probe(
-                        fname,
-                        cmd=ffmpeg_bin_path(
-                            "ffprobe",
-                            self.gui_mode,
-                            ffmpeg_resources_path=self.ffmpeg_path,
-                        ),
-                    )["format"]["duration"]
-                )
-                - self.start_seconds
-            )
-        except Exception as e:
-            logger.warning(e)
-            total_duration = None
-        if self.max_duration_seconds is not None and total_duration is not None:
-            total_duration = min(total_duration, self.max_duration_seconds)
+    def _make_detector(self) -> Callable[[Any], np.ndarray]:
         if "fused" in self.vad:
             # e.g. "fused" or "fused:intersection"; default strategy is weighted
             fusion_strategy = (
                 self.vad.split(":", 1)[1] if ":" in self.vad else "weighted"
             )
-            detector = _make_fused_detector(
+            return _make_fused_detector(
                 self.sample_rate,
                 self.frame_rate,
                 self._non_speech_label,
                 fusion_strategy,
             )
         elif "webrtc" in self.vad:
-            detector = _make_webrtcvad_detector(
+            return _make_webrtcvad_detector(
                 self.sample_rate, self.frame_rate, self._non_speech_label
             )
         elif "auditok" in self.vad:
-            detector = _make_auditok_detector(
+            return _make_auditok_detector(
                 self.sample_rate, self.frame_rate, self._non_speech_label
             )
         elif "silero" in self.vad:
-            detector = _make_silero_detector(
+            return _make_silero_detector(
                 self.sample_rate, self.frame_rate, self._non_speech_label
             )
         else:
             raise ValueError("unknown vad: %s" % self.vad)
+
+    def _decode_audio_vad(
+        self,
+        fname: str,
+        total_duration: Optional[float],
+        dual_center: bool = False,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], int]:
+        detector = self._make_detector()
+        detector_fc = self._make_detector() if dual_center else None
         media_bstring: List[np.ndarray] = []
-        ffmpeg_args = self._build_ffmpeg_args(fname)
+        fc_bstring: List[np.ndarray] = []
+        ffmpeg_args = (
+            self._build_ffmpeg_args(fname, dual_center=True)
+            if dual_center
+            else self._build_ffmpeg_args(fname)
+        )
         process = subprocess.Popen(ffmpeg_args, **subprocess_args(include_stdout=True))
+        out_channels = 2 if dual_center else 1
         bytes_per_frame = 2
-        frames_per_window = bytes_per_frame * self.frame_rate // self.sample_rate
+        bytes_per_sample_step = bytes_per_frame * out_channels
+        frames_per_window = bytes_per_sample_step * self.frame_rate // self.sample_rate
         windows_per_buffer = 2500
         simple_progress = 0.0
+        carry = b""
 
         redirect_stderr = None
         tqdm_extra_args = {}
@@ -805,7 +895,11 @@ class VideoSpeechTransformer(TransformerMixin):
                     )
                     if not in_bytes:
                         break
-                    newstuff = len(in_bytes) / float(bytes_per_frame) / self.frame_rate
+                    newstuff = (
+                        len(in_bytes)
+                        / float(bytes_per_sample_step)
+                        / self.frame_rate
+                    )
                     if (
                         total_duration is not None
                         and simple_progress + newstuff > total_duration
@@ -831,19 +925,93 @@ class VideoSpeechTransformer(TransformerMixin):
                         assert self.gui_mode
                         # no need to flush since we pass -u to do unbuffered output for gui mode
                         print(pbar_output.read())
-                    # silero (and fused, which wraps it) needs the raw s16le
-                    # bytes for its own int16 reinterpretation
-                    if "silero" not in self.vad and "fused" not in self.vad:
-                        in_bytes = np.frombuffer(in_bytes, np.uint8)
-                    media_bstring.append(detector(in_bytes))
-        process.wait()
+                    if dual_center:
+                        assert detector_fc is not None
+                        buf = carry + in_bytes
+                        usable = (len(buf) // frames_per_window) * frames_per_window
+                        carry = buf[usable:]
+                        if usable == 0:
+                            continue
+                        stereo = np.frombuffer(buf[:usable], dtype=np.int16).reshape(
+                            -1, 2
+                        )
+                        mix_u8 = np.ascontiguousarray(stereo[:, 0]).view(np.uint8)
+                        fc_u8 = np.ascontiguousarray(stereo[:, 1]).view(np.uint8)
+                        media_bstring.append(detector(mix_u8))
+                        fc_bstring.append(detector_fc(fc_u8))
+                    else:
+                        # silero (and fused, which wraps it) needs the raw s16le
+                        # bytes for its own int16 reinterpretation
+                        if "silero" not in self.vad and "fused" not in self.vad:
+                            in_bytes = np.frombuffer(in_bytes, np.uint8)
+                        media_bstring.append(detector(in_bytes))
+        rc = process.wait()
+        return media_bstring, fc_bstring, rc
+
+    def _fit_using_audio(self, fname: str) -> None:
+        self.alt_video_speech_results_ = []
+        probe_data = None
+        try:
+            probe_data = ffmpeg.probe(
+                fname,
+                cmd=ffmpeg_bin_path(
+                    "ffprobe",
+                    self.gui_mode,
+                    ffmpeg_resources_path=self.ffmpeg_path,
+                ),
+            )
+            total_duration: Optional[float] = (
+                float(probe_data["format"]["duration"]) - self.start_seconds
+            )
+        except Exception as e:
+            logger.warning(e)
+            total_duration = None
+        if self.max_duration_seconds is not None and total_duration is not None:
+            total_duration = min(total_duration, self.max_duration_seconds)
+
+        use_dual_center = (
+            "silero" not in self.vad
+            and "fused" not in self.vad
+            and _probe_audio_stream_has_center(probe_data, self.ref_stream)
+        )
+        if use_dual_center:
+            logger.info(
+                "surround audio with center channel (FC) detected; extracting "
+                "downmix + FC in a single pass"
+            )
+        media_bstring, fc_bstring, rc = self._decode_audio_vad(
+            fname, total_duration, dual_center=use_dual_center
+        )
+        if use_dual_center and len(media_bstring) == 0:
+            logger.info(
+                "dual-channel surround extraction returned no audio (rc=%s); "
+                "falling back to standard mono downmix",
+                rc,
+            )
+            media_bstring, fc_bstring, _ = self._decode_audio_vad(
+                fname, total_duration, dual_center=False
+            )
         if len(media_bstring) == 0:
             raise ValueError(
                 "Unable to detect speech. "
                 "Perhaps try specifying a different stream / track, or a different vad."
             )
         self.video_speech_results_ = np.concatenate(media_bstring)
-        logger.info("total of speech segments: %s", np.sum(self.video_speech_results_))
+        if fc_bstring:
+            fc_results = np.concatenate(fc_bstring)
+            if np.any(fc_results > self._non_speech_label):
+                self.alt_video_speech_results_ = [
+                    ("center channel (FC)", fc_results)
+                ]
+            logger.info(
+                "total of speech segments: %s (center channel FC: %s)",
+                np.sum(self.video_speech_results_),
+                np.sum(fc_results),
+            )
+        else:
+            logger.info(
+                "total of speech segments: %s", np.sum(self.video_speech_results_)
+            )
 
     def transform(self, *_) -> np.ndarray:
         return self.video_speech_results_
@@ -1173,6 +1341,68 @@ def find_pgs_stream(
     return None
 
 
+_PGS_CLEAR_MAX_BYTES = 50
+_PGS_FALLBACK_MAX_CUE_SECONDS = 15.0
+
+
+def _parse_pgs_timings_from_packets(
+    packets: List[Dict[str, Any]],
+) -> Optional[List[Tuple[float, float]]]:
+    """Extract ``(start_s, end_s)`` intervals from ffprobe subtitle packets.
+
+    Prefers explicit packet ``duration_time`` values when present (e.g. VobSub
+    or containers storing per-block durations). When no packet carries an
+    explicit positive duration — common in Blu-ray HDMV PGS muxed into MKV —
+    falls back to pairing each large "show" packet (``size > 50``) with the
+    subsequent tiny "clear" packet (``size <= 50``) or next show packet.
+    """
+    explicit_results: List[Tuple[float, float]] = []
+    parsed_packets: List[Tuple[float, int, bool]] = []
+
+    for packet in packets:
+        pts_time_str = packet.get("pts_time")
+        size_str = packet.get("size")
+        if pts_time_str is None or size_str is None:
+            continue
+        try:
+            pts_time = float(pts_time_str)
+            size = int(size_str)
+        except ValueError:
+            continue
+
+        duration_time_str = packet.get("duration_time")
+        has_explicit_dur = False
+        if duration_time_str is not None and duration_time_str != "N/A":
+            try:
+                duration_time = float(duration_time_str)
+                has_explicit_dur = True
+                if size > _PGS_CLEAR_MAX_BYTES and duration_time > 0:
+                    explicit_results.append((pts_time, pts_time + duration_time))
+            except ValueError:
+                pass
+        parsed_packets.append((pts_time, size, has_explicit_dur))
+
+    if explicit_results:
+        return explicit_results
+
+    inferred_results: List[Tuple[float, float]] = []
+    open_start: Optional[float] = None
+    for pts_time, size, has_explicit_dur in sorted(parsed_packets, key=lambda x: x[0]):
+        if has_explicit_dur:
+            continue
+        if size > _PGS_CLEAR_MAX_BYTES:
+            if open_start is not None and pts_time > open_start:
+                end_time = min(pts_time, open_start + _PGS_FALLBACK_MAX_CUE_SECONDS)
+                inferred_results.append((open_start, end_time))
+            open_start = pts_time
+        elif open_start is not None and pts_time > open_start:
+            end_time = min(pts_time, open_start + _PGS_FALLBACK_MAX_CUE_SECONDS)
+            inferred_results.append((open_start, end_time))
+            open_start = None
+
+    return inferred_results or None
+
+
 def _get_pgs_timings_via_ffprobe(
     fname: str,
     stream: str,
@@ -1181,13 +1411,13 @@ def _get_pgs_timings_via_ffprobe(
 ) -> Optional[List[Tuple[float, float]]]:
     """Read PGS timings from container metadata using ffprobe.
 
-    MKV stores per-packet PTS and duration for subtitle streams, so we can
-    get start/end timestamps without extracting or parsing the raw SUP binary.
-    Show events are large packets with a numeric ``duration_time``; clear events
-    are tiny (~30-byte) packets with ``duration_time=N/A``.
+    MKV stores per-packet PTS (and sometimes duration) for subtitle streams, so
+    we can get start/end timestamps without extracting or parsing the raw SUP
+    binary. Show events are large packets; clear events are tiny (~30-byte)
+    packets with ``duration_time=N/A`` (or omitted).
 
     Returns a list of ``(start_seconds, end_seconds)`` tuples, or ``None`` if
-    ffprobe fails or returns no usable durations.
+    ffprobe fails or returns no usable timings.
     """
     ffprobe_cmd = ffmpeg_bin_path(
         "ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path
@@ -1206,27 +1436,7 @@ def _get_pgs_timings_via_ffprobe(
     except Exception:
         return None
 
-    results: List[Tuple[float, float]] = []
-    for packet in probe_data.get("packets", []):
-        pts_time_str = packet.get("pts_time")
-        duration_time_str = packet.get("duration_time")
-        size_str = packet.get("size")
-        if pts_time_str is None or duration_time_str is None or size_str is None:
-            continue
-        if duration_time_str == "N/A":
-            continue
-        try:
-            pts_time = float(pts_time_str)
-            duration_time = float(duration_time_str)
-            size = int(size_str)
-        except ValueError:
-            continue
-        if size > 50 and duration_time > 0:  # skip clear events (~30 bytes) and zero-duration packets
-            results.append((pts_time, pts_time + duration_time))
-
-    if not results:
-        return None
-    return results
+    return _parse_pgs_timings_from_packets(probe_data.get("packets", []))
 
 
 class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):

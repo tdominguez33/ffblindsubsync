@@ -26,6 +26,7 @@ class FFTAligner(TransformerMixin):
         self.max_offset_samples: Optional[int] = max_offset_samples
         self.best_offset_: Optional[int] = None
         self.best_score_: Optional[float] = None
+        self.best_peak_snr_: Optional[float] = None
         self.get_score_: bool = False
 
     def _eliminate_extreme_offsets_from_solutions(
@@ -46,6 +47,32 @@ class FFTAligner(TransformerMixin):
         best_idx = int(np.argmax(convolve))
         self.best_offset_ = len(convolve) - 1 - best_idx - len(substring)
         self.best_score_ = convolve[best_idx]
+        self.best_peak_snr_ = self._compute_peak_snr(convolve, best_idx)
+
+    @staticmethod
+    def _compute_peak_snr(convolve: np.ndarray, best_idx: int) -> Optional[float]:
+        """Compute peak z-score relative to the valid offset search window.
+
+        Measures how many standard deviations the winning cross-correlation peak
+        stands above the background offsets (excluding a small lobe around the
+        peak). Invariant to speech-density mismatch between reference and
+        subtitles, so it remains meaningful even when the raw dot-product score
+        is negative.
+        """
+        finite_idx = np.flatnonzero(np.isfinite(convolve))
+        n_finite = len(finite_idx)
+        if n_finite < 8:
+            return None
+        guard = min(200, max(1, n_finite // 10))
+        bg_idx = finite_idx[np.abs(finite_idx - best_idx) > guard]
+        if len(bg_idx) < 4:
+            return None
+        bg = convolve[bg_idx]
+        bg_std = float(np.std(bg))
+        if bg_std <= 0.0:
+            return None
+        bg_mean = float(np.mean(bg))
+        return float((convolve[best_idx] - bg_mean) / bg_std)
 
     def fit(self, refstring, substring, get_score: bool = False) -> "FFTAligner":
         refstring, substring = [
@@ -107,6 +134,8 @@ class MaxScoreAligner(TransformerMixin):
             self.base_aligner = base_aligner
         self.max_offset_seconds: Optional[int] = max_offset_seconds
         self._scores: List[Tuple[Tuple[float, int], Pipeline]] = []
+        self._snrs: List[Optional[float]] = []
+        self.best_peak_snr_: Optional[float] = None
 
     def fit_gss(self, refstring, subpipe_maker):
         def opt_func(framerate_ratio, is_last_iter):
@@ -123,6 +152,7 @@ class MaxScoreAligner(TransformerMixin):
             )
             if is_last_iter:
                 self._scores.append((score, subpipe))
+                self._snrs.append(getattr(self.base_aligner, "best_peak_snr_", None))
             return -score[0]
 
         gss(opt_func, MIN_FRAMERATE_RATIO, MAX_FRAMERATE_RATIO)
@@ -151,19 +181,23 @@ class MaxScoreAligner(TransformerMixin):
                     subpipe,
                 )
             )
+            self._snrs.append(getattr(self.base_aligner, "best_peak_snr_", None))
         return self
 
     def transform(self, *_) -> Tuple[Tuple[float, float], Pipeline]:
-        scores = self._scores
+        indexed = list(enumerate(self._scores))
         if self.max_offset_samples is not None:
-            scores = list(
-                filter(lambda s: abs(s[0][1]) <= self.max_offset_samples, scores)
-            )
-        if len(scores) == 0:
+            indexed = [
+                (i, s)
+                for i, s in indexed
+                if abs(s[0][1]) <= self.max_offset_samples
+            ]
+        if len(indexed) == 0:
             raise FailedToFindAlignmentException(
                 "Synchronization failed; consider passing "
                 "--max-offset-seconds with a number larger than "
                 "{}".format(self.max_offset_seconds)
             )
-        (score, offset), subpipe = max(scores, key=lambda x: x[0][0])
+        best_i, ((score, offset), subpipe) = max(indexed, key=lambda x: x[1][0][0])
+        self.best_peak_snr_ = self._snrs[best_i] if best_i < len(self._snrs) else None
         return (score, offset), subpipe

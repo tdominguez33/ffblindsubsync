@@ -79,6 +79,7 @@ WHISPER_VAD: str = "whisper"
 # reject a legitimate correction -- it is a knob to tighten when you know the
 # framerate should not change.
 DEFAULT_MIN_SCORE: float = 0.0
+DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD: float = 5.0
 DEFAULT_QUALITY_MAX_OFFSET_SECONDS: float = 30.0
 DEFAULT_MAX_FRAMERATE_DEVIATION: float = 0.1
 

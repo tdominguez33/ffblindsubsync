@@ -243,19 +243,46 @@ export async function probePgsTimings(cfg, file, streamSpec, { status } = {}) {
       if (!raw || !raw.byteLength) return null;
       const data = JSON.parse(textDecoder.decode(raw));
       const packets = Array.isArray(data && data.packets) ? data.packets : [];
-      const timings = [];
+      const explicitTimings = [];
+      const parsed = [];
       for (const pkt of packets) {
-        if (pkt.pts_time == null || pkt.duration_time == null || pkt.size == null) continue;
-        if (pkt.duration_time === "N/A") continue;
+        if (pkt.pts_time == null || pkt.size == null) continue;
         const pts = Number(pkt.pts_time);
-        const dur = Number(pkt.duration_time);
         const size = Number(pkt.size);
-        if (!Number.isFinite(pts) || !Number.isFinite(dur) || !Number.isFinite(size)) continue;
-        if (size > 50 && dur > 0) {
-          timings.push([pts, pts + dur]);
+        if (!Number.isFinite(pts) || !Number.isFinite(size)) continue;
+        let hasExplicitDur = false;
+        if (pkt.duration_time != null && pkt.duration_time !== "N/A") {
+          const dur = Number(pkt.duration_time);
+          if (Number.isFinite(dur)) {
+            hasExplicitDur = true;
+            if (size > 50 && dur > 0) {
+              explicitTimings.push([pts, pts + dur]);
+            }
+          }
+        }
+        parsed.push({ pts, size, hasExplicitDur });
+      }
+      if (explicitTimings.length) return explicitTimings;
+
+      // Fallback for MKV Blu-ray PGS streams where duration_time is omitted:
+      // pair each large "show" packet (>50 B) with the next tiny "clear" packet.
+      const MAX_CUE_S = 15.0;
+      parsed.sort((a, b) => a.pts - b.pts);
+      const inferred = [];
+      let openStart = null;
+      for (const { pts, size, hasExplicitDur } of parsed) {
+        if (hasExplicitDur) continue;
+        if (size > 50) {
+          if (openStart !== null && pts > openStart) {
+            inferred.push([openStart, Math.min(pts, openStart + MAX_CUE_S)]);
+          }
+          openStart = pts;
+        } else if (openStart !== null && pts > openStart) {
+          inferred.push([openStart, Math.min(pts, openStart + MAX_CUE_S)]);
+          openStart = null;
         }
       }
-      return timings.length ? timings : null;
+      return inferred.length ? inferred : null;
     } catch {
       return null;
     } finally {
