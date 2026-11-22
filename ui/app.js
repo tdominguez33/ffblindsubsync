@@ -212,10 +212,133 @@ function formatResultSummary(res) {
   );
 }
 
+// Pixel-accurate truncation for all <select> dropdown options so native OS
+// popups never overflow the window. Preserves trailing bracketed metadata
+// (e.g. "[eac3]", "[PGS timings]", "[text: subrip]") whenever present.
+const _measureCanvas = document.createElement("canvas");
+const _measureCtx = _measureCanvas.getContext("2d");
+const _TRAILING_BRACKETS_RE = /^(.*?)(\s*(?:\[[^\]]+\]\s*)+)$/;
+const _selectObserved = new WeakSet();
+let _selectResizeObserver = null;
+
+function truncateSelectLabel(fullText, maxPx, measure) {
+  const text = String(fullText || "");
+  if (!text || !Number.isFinite(maxPx) || maxPx <= 0 || measure(text) <= maxPx) {
+    return text;
+  }
+  const ellipsis = "...";
+  const match = _TRAILING_BRACKETS_RE.exec(text);
+  if (match && match[1].trim().length > 0) {
+    const head = match[1].trimEnd();
+    const brackets = " " + match[2].trim();
+    const tail = ellipsis + brackets;
+    if (measure(tail) <= maxPx) {
+      let lo = 0;
+      let hi = head.length;
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        const prefix = head.slice(0, mid).replace(/[\s·,:;(\[-]+$/, "");
+        if (measure(prefix + tail) <= maxPx) {
+          lo = mid;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      const prefix = head.slice(0, lo).replace(/[\s·,:;(\[-]+$/, "");
+      return prefix ? prefix + tail : brackets.trim();
+    }
+    // Extreme narrow width: still prioritize bracketed metadata over the prefix.
+    const trimmedBrackets = brackets.trim();
+    if (measure(trimmedBrackets) <= maxPx) {
+      return trimmedBrackets;
+    }
+  }
+
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const prefix = text.slice(0, mid).replace(/[\s·,:;(\[-]+$/, "");
+    if (measure(prefix + ellipsis) <= maxPx) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  const prefix = text.slice(0, lo).replace(/[\s·,:;(\[-]+$/, "");
+  return prefix ? prefix + ellipsis : ellipsis;
+}
+
+function updateSelectTooltip(selectEl) {
+  if (!selectEl) return;
+  const opt = selectEl.options[selectEl.selectedIndex];
+  const full = opt ? (opt.dataset.fullLabel || opt.textContent || "") : "";
+  selectEl.title = opt && opt.textContent !== full ? full : "";
+}
+
+function fitSelectOptions(selectEl) {
+  if (!selectEl || !selectEl.options || selectEl.options.length === 0) return;
+  const width = selectEl.clientWidth;
+  if (width <= 0) return;
+  const cs = window.getComputedStyle(selectEl);
+  const padL = parseFloat(cs.paddingLeft) || 12;
+  const padR = parseFloat(cs.paddingRight) || 36;
+  const maxPx = Math.max(40, width - padL - padR - 8);
+  const font = `${cs.fontWeight || "500"} ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
+  const measure = (str) => {
+    if (_measureCtx) {
+      _measureCtx.font = font;
+      return _measureCtx.measureText(str).width;
+    }
+    return str.length * 7;
+  };
+
+  for (const opt of selectEl.options) {
+    if (opt.dataset.fullLabel === undefined) {
+      opt.dataset.fullLabel = opt.textContent || "";
+    }
+    const full = opt.dataset.fullLabel;
+    const fitted = truncateSelectLabel(full, maxPx, measure);
+    if (opt.textContent !== fitted) {
+      opt.textContent = fitted;
+    }
+    opt.title = fitted !== full ? full : "";
+  }
+  updateSelectTooltip(selectEl);
+}
+
+function observeSelect(selectEl) {
+  if (!selectEl || _selectObserved.has(selectEl)) return;
+  _selectObserved.add(selectEl);
+  selectEl.addEventListener("change", () => updateSelectTooltip(selectEl));
+  if (typeof ResizeObserver === "function") {
+    if (!_selectResizeObserver) {
+      _selectResizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          fitSelectOptions(entry.target);
+        }
+      });
+    }
+    _selectResizeObserver.observe(selectEl);
+  }
+}
+
+function fitAllSelectOptions() {
+  for (const sel of document.querySelectorAll("select")) {
+    observeSelect(sel);
+    fitSelectOptions(sel);
+  }
+}
+
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => fitAllSelectOptions()).catch(() => {});
+}
+
 async function refreshStreams(refValue) {
   const seq = ++streamProbeSeq;
   els.refStream.innerHTML = '<option value="">Auto (recommended)</option>';
   els.refStream.value = "";
+  els.refStream.title = "";
   els.streamHint.textContent = "Auto";
   els.streamWrap.hidden = true;
   if (!adapter || !adapter.capabilities.streamProbe || !refValue) return;
@@ -227,6 +350,7 @@ async function refreshStreams(refValue) {
     for (const item of list) {
       const opt = document.createElement("option");
       opt.value = item.value;
+      opt.dataset.fullLabel = item.label;
       opt.textContent = item.label;
       opt.dataset.kind = item.kind || "";
       if (item.is_bitmap) opt.disabled = true;
@@ -239,6 +363,8 @@ async function refreshStreams(refValue) {
       ? `${list.length} track(s) · ${notes.join(" · ")}`
       : `${list.length} track(s) · audio VAD`;
     els.streamWrap.hidden = false;
+    observeSelect(els.refStream);
+    fitSelectOptions(els.refStream);
   } catch (_) {
     if (seq === streamProbeSeq) els.streamWrap.hidden = true;
   }
@@ -461,11 +587,13 @@ function configureUiForAdapter(ad) {
     for (const mode of capabilities.vadModes) {
       const opt = document.createElement("option");
       opt.value = mode.value;
+      opt.dataset.fullLabel = mode.label;
       opt.textContent = mode.label;
       if (mode.selected) opt.selected = true;
       els.vadMode.appendChild(opt);
     }
   }
+  fitAllSelectOptions();
 
   if (meta.footerText) {
     if (els.footerText) {
