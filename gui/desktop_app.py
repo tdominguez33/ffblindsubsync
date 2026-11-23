@@ -3,6 +3,7 @@
 
 import io
 import json
+import locale
 import logging
 import mimetypes
 import os
@@ -13,7 +14,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 if not getattr(sys, "frozen", False):
     _repo_root = str(Path(__file__).resolve().parent.parent)
@@ -158,6 +159,76 @@ def _save_desktop_config(cfg: Dict[str, Any]) -> None:
         logger.warning("Failed to save desktop config: %s", exc)
 
 
+def _get_system_languages() -> List[str]:
+    """Return ordered BCP-47 system/OS UI language tags (e.g. ['es-AR', 'en-US'])."""
+    found: List[str] = []
+
+    def _add(tag: Optional[str]) -> None:
+        if not tag or not isinstance(tag, str):
+            return
+        cleaned = tag.strip().split(".")[0].split("@")[0].replace("_", "-")
+        if not cleaned or cleaned.lower() in ("c", "posix"):
+            return
+        if cleaned not in found:
+            found.append(cleaned)
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            MUI_LANGUAGE_NAME = 0x8
+            num_langs = wintypes.ULONG(0)
+            buf_len = wintypes.ULONG(0)
+            # First call queries required buffer size (in UTF-16 code units).
+            if kernel32.GetUserPreferredUILanguages(
+                MUI_LANGUAGE_NAME,
+                ctypes.byref(num_langs),
+                None,
+                ctypes.byref(buf_len),
+            ) and buf_len.value > 0:
+                buf = ctypes.create_unicode_buffer(buf_len.value)
+                if kernel32.GetUserPreferredUILanguages(
+                    MUI_LANGUAGE_NAME,
+                    ctypes.byref(num_langs),
+                    buf,
+                    ctypes.byref(buf_len),
+                ):
+                    raw_slice = ctypes.wstring_at(buf, buf_len.value)
+                    for item in raw_slice.split("\x00"):
+                        if item:
+                            _add(item)
+        except Exception:
+            pass
+
+        if not found:
+            try:
+                import ctypes
+
+                lcid = int(ctypes.windll.kernel32.GetUserDefaultUILanguage())
+                win_loc = locale.windows_locale.get(lcid)
+                _add(win_loc)
+            except Exception:
+                pass
+
+    for env_key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        _add(os.environ.get(env_key))
+    language_env = os.environ.get("LANGUAGE")
+    if language_env:
+        for part in language_env.split(":"):
+            _add(part)
+
+    if not found:
+        try:
+            loc_code, _ = locale.getlocale()
+            _add(loc_code)
+        except Exception:
+            pass
+
+    return found
+
+
 _ALIGN_STEP_RE = re.compile(r"computing alignment (\d+)/(\d+)")
 
 
@@ -176,31 +247,36 @@ class _PhaseLogHandler(logging.Handler):
         m = _ALIGN_STEP_RE.search(msg)
         if m:
             cur, tot = int(m.group(1)), max(1, int(m.group(2)))
-            self._on_message("Computing alignment (%d/%d)…" % (cur, tot), (cur - 1) / float(tot))
+            self._on_message(
+                "Computing alignment (%d/%d)…" % (cur, tot),
+                (cur - 1) / float(tot),
+                "progress.computingAlignmentStep",
+                {"cur": cur, "tot": tot},
+            )
             return
         if "split alignment" in msg:
-            self._on_message("Checking mid-file breaks…", 0.92)
+            self._on_message("Checking mid-file breaks…", 0.92, "progress.checkingBreaks")
             return
         if "writing output" in msg:
-            self._on_message("Writing output…", 0.98)
+            self._on_message("Writing output…", 0.98, "progress.writingOutput")
             return
         if "Checking video for subtitles" in msg:
-            self._on_message("Checking video for subtitles…", None)
+            self._on_message("Checking video for subtitles…", None, "progress.checkingVideoSubs")
             return
         if "using PGS subtitle stream" in msg:
-            self._on_message("Using PGS subtitle timings…", None)
+            self._on_message("Using PGS subtitle timings…", None, "progress.usingPgsTimings")
             return
         if "using VobSub subtitle stream" in msg:
-            self._on_message("Using VobSub subtitle timings…", None)
+            self._on_message("Using VobSub subtitle timings…", None, "progress.usingVobSubTimings")
             return
         if "extracting speech segments from subtitles" in msg:
-            self._on_message("Extracting subtitle timings…", None)
+            self._on_message("Extracting subtitle timings…", None, "progress.extractingSubTimings")
             return
         if "extracting speech segments" in msg:
-            self._on_message("Extracting speech segments…", None)
+            self._on_message("Extracting speech segments…", None, "progress.extractingSpeech")
             return
         if "computing alignments" in msg:
-            self._on_message("Computing alignments…", None)
+            self._on_message("Computing alignments…", None, "progress.computingAlignments")
             return
 
 
@@ -218,6 +294,7 @@ class DesktopApi:
         self._sync_state: Dict[str, Any] = {"active": False, "done": False, "seq": 0}
         self._config: Dict[str, Any] = _load_desktop_config()
         self._custom_ffmpeg_path: str = str(self._config.get("ffmpeg_path") or "").strip()
+        self._language: str = str(self._config.get("language") or "system").strip() or "system"
         geom = initial_geom or _resolve_initial_window_geometry(self._config)
         self._win_state: Dict[str, Any] = {
             "width": geom["width"],
@@ -247,7 +324,17 @@ class DesktopApi:
             "ffmpeg": self._find_ffmpeg(),
             "portable_dir": str(get_portable_dir()),
             "custom_ffmpeg_path": self._custom_ffmpeg_path,
+            "language": self._language,
+            "system_languages": _get_system_languages(),
         }
+
+    def set_language(self, language: str = "system") -> Dict[str, Any]:
+        cleaned = str(language or "system").strip() or "system"
+        with self._lock:
+            self._language = cleaned
+            self._config["language"] = cleaned
+            _save_desktop_config(self._config)
+        return {"language": cleaned}
 
     def pick_ffmpeg_dir(self) -> Optional[str]:
         assert self._window is not None
@@ -276,16 +363,22 @@ class DesktopApi:
             "custom_ffmpeg_path": cleaned,
         }
 
-    def pick_reference(self) -> Optional[str]:
+    def pick_reference(self, file_types: Optional[List[str]] = None) -> Optional[str]:
         assert self._window is not None
+        default_types = (
+            "Media files (*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v;*.mka;*.mp3;*.aac;*.flac;*.wav;*.srt;*.ass;*.ssa;*.sub;*.vtt)",
+            "Video files (*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v)",
+            "Subtitle files (*.srt;*.ass;*.ssa;*.sub;*.vtt)",
+            "All files (*.*)",
+        )
+        filters = (
+            tuple(str(x) for x in file_types if x)
+            if isinstance(file_types, (list, tuple)) and file_types
+            else default_types
+        )
         res = self._window.create_file_dialog(
             webview.FileDialog.OPEN,
-            file_types=(
-                "Media files (*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v;*.mka;*.mp3;*.aac;*.flac;*.wav;*.srt;*.ass;*.ssa;*.sub;*.vtt)",
-                "Video files (*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v)",
-                "Subtitle files (*.srt;*.ass;*.ssa;*.sub;*.vtt)",
-                "All files (*.*)",
-            ),
+            file_types=filters,
         )
         return res[0] if res else None
 
@@ -350,7 +443,20 @@ class DesktopApi:
                     flag_note,
                     codec,
                 )
-                items.append({"value": spec, "label": label, "kind": "audio"})
+                items.append(
+                    {
+                        "value": spec,
+                        "label": label,
+                        "kind": "audio",
+                        "index": audio_idx + 1,
+                        "spec": spec,
+                        "codec": codec,
+                        "lang": lang,
+                        "title": title,
+                        "forced": bool(disp.get("forced")),
+                        "comment": bool(disp.get("comment")),
+                    }
+                )
                 audio_idx += 1
             elif ctype == "subtitle":
                 spec = "s:%d" % sub_idx
@@ -359,15 +465,18 @@ class DesktopApi:
                     kind = "pgs"
                     is_bitmap = False
                     has_pgs_subs = True
-                    note = "PGS timings" if codec == "hdmv_pgs_subtitle" else "VobSub timings"
+                    note_kind = "pgs" if codec == "hdmv_pgs_subtitle" else "vobsub"
+                    note = "PGS timings" if note_kind == "pgs" else "VobSub timings"
                 elif codec in bitmap_codecs:
                     kind = "subtitle"
                     is_bitmap = True
+                    note_kind = "image"
                     note = "image: %s" % codec
                 else:
                     kind = "subtitle"
                     is_bitmap = False
                     has_text_subs = True
+                    note_kind = "text"
                     note = "text: %s" % codec
                 label = "Subtitle #%d (%s): %s%s [%s]" % (
                     sub_idx + 1,
@@ -381,6 +490,14 @@ class DesktopApi:
                         "value": spec,
                         "label": label,
                         "kind": kind,
+                        "index": sub_idx + 1,
+                        "spec": spec,
+                        "codec": codec,
+                        "lang": lang,
+                        "title": title,
+                        "forced": bool(disp.get("forced")),
+                        "comment": bool(disp.get("comment")),
+                        "note_kind": note_kind,
                         "is_bitmap": is_bitmap,
                         "is_pgs": is_pgs,
                     }
@@ -392,26 +509,40 @@ class DesktopApi:
             "has_pgs_subs": has_pgs_subs,
         }
 
-    def pick_subtitle(self) -> Optional[str]:
+    def pick_subtitle(self, file_types: Optional[List[str]] = None) -> Optional[str]:
         assert self._window is not None
+        default_types = (
+            "Subtitles (*.srt;*.ass;*.ssa;*.sub;*.vtt)",
+            "All files (*.*)",
+        )
+        filters = (
+            tuple(str(x) for x in file_types if x)
+            if isinstance(file_types, (list, tuple)) and file_types
+            else default_types
+        )
         res = self._window.create_file_dialog(
             webview.FileDialog.OPEN,
-            file_types=(
-                "Subtitles (*.srt;*.ass;*.ssa;*.sub;*.vtt)",
-                "All files (*.*)",
-            ),
+            file_types=filters,
         )
         return res[0] if res else None
 
-    def pick_output(self, default_path: str = "") -> Optional[str]:
+    def pick_output(
+        self, default_path: str = "", file_types: Optional[List[str]] = None
+    ) -> Optional[str]:
         assert self._window is not None
         directory = os.path.dirname(default_path) if default_path else ""
         filename = os.path.basename(default_path) if default_path else "synced.srt"
+        default_types = ("SubRip (*.srt)", "All files (*.*)")
+        filters = (
+            tuple(str(x) for x in file_types if x)
+            if isinstance(file_types, (list, tuple)) and file_types
+            else default_types
+        )
         res = self._window.create_file_dialog(
             webview.FileDialog.SAVE,
             directory=directory,
             save_filename=filename,
-            file_types=("SubRip (*.srt)", "All files (*.*)"),
+            file_types=filters,
         )
         if not res:
             return None
@@ -481,6 +612,8 @@ class DesktopApi:
                 "done": False,
                 "seq": sync_seq,
                 "message": "Preparing…",
+                "message_key": "progress.preparing",
+                "message_params": None,
                 "fraction": None,
             }
 
@@ -493,9 +626,31 @@ class DesktopApi:
                 in_path = str(params["in_path"])
                 out_path = str(params["out_path"])
                 if not os.path.isfile(ref_path):
-                    raise FileNotFoundError("Reference file not found: %s" % ref_path)
+                    with self._lock:
+                        self._sync_state = {
+                            "active": False,
+                            "done": True,
+                            "seq": sync_seq,
+                            "ok": False,
+                            "error": "Reference file not found: %s" % ref_path,
+                            "error_key": "errors.refNotFound",
+                            "error_params": {"path": ref_path},
+                            "elapsed_seconds": time.perf_counter() - t0,
+                        }
+                    return
                 if not os.path.isfile(in_path):
-                    raise FileNotFoundError("Subtitle file not found: %s" % in_path)
+                    with self._lock:
+                        self._sync_state = {
+                            "active": False,
+                            "done": True,
+                            "seq": sync_seq,
+                            "ok": False,
+                            "error": "Subtitle file not found: %s" % in_path,
+                            "error_key": "errors.subNotFound",
+                            "error_params": {"path": in_path},
+                            "elapsed_seconds": time.perf_counter() - t0,
+                        }
+                    return
 
                 ff_info = self._find_ffmpeg()
                 if not _is_subtitle_ref(ref_path) and not ff_info["available"]:
@@ -526,6 +681,8 @@ class DesktopApi:
                         with self._lock:
                             self._sync_state.update(
                                 message="Waiting for FFmpeg download…",
+                                message_key="progress.waitingFfmpeg",
+                                message_params=None,
                                 fraction=None,
                             )
                         self._dl_done_event.wait()
@@ -533,11 +690,9 @@ class DesktopApi:
                     if need_download:
                         try:
                             def _on_dl(ev: Dict[str, Any]) -> None:
-                                pct = (
-                                    " %d%%" % int(round(ev["fraction"] * 100))
-                                    if ev.get("fraction") is not None
-                                    else ""
-                                )
+                                has_frac = ev.get("fraction") is not None
+                                pct_num = int(round(ev["fraction"] * 100)) if has_frac else None
+                                pct = " %d%%" % pct_num if pct_num is not None else ""
                                 with self._lock:
                                     self._ffmpeg_dl.update(
                                         phase=ev.get("phase", "downloading"),
@@ -547,6 +702,14 @@ class DesktopApi:
                                     )
                                     self._sync_state.update(
                                         message="Downloading FFmpeg%s…" % pct,
+                                        message_key=(
+                                            "progress.downloadingFfmpegPct"
+                                            if pct_num is not None
+                                            else "progress.downloadingFfmpeg"
+                                        ),
+                                        message_params=(
+                                            {"pct": pct_num} if pct_num is not None else None
+                                        ),
                                         fraction=ev.get("fraction"),
                                     )
 
@@ -573,7 +736,10 @@ class DesktopApi:
 
                 with self._lock:
                     self._sync_state.update(
-                        message="Analyzing reference…", fraction=None
+                        message="Analyzing reference…",
+                        message_key="progress.analyzingRef",
+                        message_params=None,
+                        fraction=None,
                     )
 
                 ref_stream = params.get("ref_stream")
@@ -628,21 +794,32 @@ class DesktopApi:
                     frac = info.fraction
                     with self._lock:
                         if frac is not None:
+                            pct = int(round(frac * 100))
                             self._sync_state.update(
-                                message="Decoding audio + VAD (%d%%)…"
-                                % int(round(frac * 100)),
+                                message="Decoding audio + VAD (%d%%)…" % pct,
+                                message_key="progress.decodingAudioVadPct",
+                                message_params={"pct": pct},
                                 fraction=frac,
                             )
                         else:
+                            sec = "%.0f" % info.processed_seconds
                             self._sync_state.update(
-                                message="Decoding audio + VAD (%.0fs)…"
-                                % info.processed_seconds,
+                                message="Decoding audio + VAD (%ss)…" % sec,
+                                message_key="progress.decodingAudioVadSec",
+                                message_params={"sec": sec},
                                 fraction=None,
                             )
 
-                def _on_log(msg: str, frac: Optional[float] = None) -> None:
+                def _on_log(
+                    msg: str,
+                    frac: Optional[float] = None,
+                    msg_key: Optional[str] = None,
+                    msg_params: Optional[Dict[str, Any]] = None,
+                ) -> None:
                     with self._lock:
                         self._sync_state["message"] = msg
+                        self._sync_state["message_key"] = msg_key
+                        self._sync_state["message_params"] = msg_params
                         if frac is not None:
                             self._sync_state["fraction"] = frac
 
@@ -658,12 +835,16 @@ class DesktopApi:
                     else None
                 )
                 err_msg = None
+                err_key = None
+                err_params = None
                 if not ok:
-                    err_msg = (
-                        "Sync failed: %s" % last_err
-                        if last_err
-                        else "Sync failed (check input tracks/format)."
-                    )
+                    if last_err:
+                        err_msg = "Sync failed: %s" % last_err
+                        err_key = "errors.syncFailedWithReason"
+                        err_params = {"reason": last_err}
+                    else:
+                        err_msg = "Sync failed (check input tracks/format)."
+                        err_key = "errors.syncFailedCheckTracks"
                 with self._lock:
                     self._sync_state = {
                         "active": False,
@@ -678,6 +859,8 @@ class DesktopApi:
                         "elapsed_seconds": elapsed,
                         "ffmpeg_info": ff_info,
                         "error": err_msg,
+                        "error_key": err_key,
+                        "error_params": err_params,
                     }
             except Exception as exc:
                 logger.exception("Desktop sync failed")

@@ -50,7 +50,56 @@ function sortByPriority(streams) {
   return [...preferred, ...deprioritized];
 }
 
-export function createAdapter({ version, withVersion, callbacks }) {
+const WORKER_STATUS_KEY_MAP = new Map([
+  ["fetching config…", "status.fetchingConfig"],
+  ["loading python runtime…", "status.loadingPython"],
+  ["loading runtime packages…", "status.loadingPackages"],
+  ["installing libraries…", "status.installingLibs"],
+  ["loading ffblindsubsync…", "status.loadingApp"],
+  ["ready", "status.ready"],
+  ["syncing…", "progress.syncing"],
+  ["detecting speech + aligning…", "progress.detectingSpeechAligning"],
+  ["aligning subtitle timings…", "progress.aligningSubTimings"],
+  ["loading ffmpeg.wasm…", "progress.loadingFfmpegWasm"],
+  ["decoding audio (this can take a bit on long videos)…", "progress.decodingAudioLong"],
+]);
+
+function mapWorkerMessage(raw) {
+  if (!raw) return { messageKey: null, messageParams: null, message: undefined };
+  const s = String(raw).trim();
+  const low = s.toLowerCase();
+  if (WORKER_STATUS_KEY_MAP.has(low)) {
+    return { messageKey: WORKER_STATUS_KEY_MAP.get(low), messageParams: null, message: capitalize(s) };
+  }
+  const mAlign = /^computing alignment \((\d+)\/(\d+)\)/i.exec(s);
+  if (mAlign) {
+    return {
+      messageKey: "progress.computingAlignmentStep",
+      messageParams: { cur: Number(mAlign[1]), tot: Number(mAlign[2]) },
+      message: capitalize(s),
+    };
+  }
+  const mExtract = /^extracting embedded subtitle \(([^)]+)\)/i.exec(s);
+  if (mExtract) {
+    return {
+      messageKey: "progress.extractingEmbeddedStream",
+      messageParams: { stream: mExtract[1] },
+      message: capitalize(s),
+    };
+  }
+  const mPgs = /^reading pgs\/vobsub timings \(([^)]+)\)/i.exec(s);
+  if (mPgs) {
+    return {
+      messageKey: "progress.readingPgsStream",
+      messageParams: { stream: mPgs[1] },
+      message: capitalize(s),
+    };
+  }
+  return { messageKey: null, messageParams: null, message: capitalize(s) };
+}
+
+export function createAdapter({ version, withVersion, i18n, callbacks }) {
+  const t = (key, params) => (i18n ? i18n.t(key, params) : key);
   const metaVersionEl = document.querySelector('meta[name="app-version"]');
   const metaVersion = (metaVersionEl && metaVersionEl.getAttribute("content") || "").trim();
   const appVersion = metaVersion || String(version || "").replace(/-[0-9a-f]{8}$/, "").trim();
@@ -62,7 +111,20 @@ export function createAdapter({ version, withVersion, callbacks }) {
   let ffmpegModPromise = null;
   let pendingSync = null;
   let lastBlobUrl = null;
+  let lastRuntimeState = null;
   const probeCache = new WeakMap();
+
+  function emitRuntimeState(stateObj) {
+    lastRuntimeState = stateObj;
+    if (!stateObj) return;
+    const text = stateObj.textKey ? t(stateObj.textKey, stateObj.textParams) : stateObj.text;
+    callbacks.onRuntimeStatus({
+      level: stateObj.level,
+      text,
+      visible: stateObj.visible,
+      ready: stateObj.ready,
+    });
+  }
 
   function finishPending(result) {
     if (!pendingSync) return;
@@ -132,13 +194,18 @@ export function createAdapter({ version, withVersion, callbacks }) {
 
   return {
     meta: {
-      pageTitle: "ffblindsubsync — In the Browser",
-      subtitle: "In the Browser",
+      get pageTitle() {
+        return t("app.titleWeb");
+      },
+      get subtitle() {
+        return t("app.subtitleWeb");
+      },
       badgeText: "",
       badgeVariant: "web",
       badgeTitle: "",
-      footerText:
-        "Runs locally in your browser via WebAssembly (Pyodide + ffmpeg.wasm). Nothing is uploaded.",
+      get footerText() {
+        return t("app.footerWeb");
+      },
       appVersion,
     },
     capabilities: {
@@ -147,8 +214,16 @@ export function createAdapter({ version, withVersion, callbacks }) {
       streamProbe: true,
       runtimeAction: false,
       topbarStatus: true,
+      settings: true,
+      ffmpegSettings: false,
       refAccept: REF_ACCEPT,
       subtitleAccept: SUBTITLE_ACCEPT,
+    },
+
+    retranslate() {
+      if (lastRuntimeState) {
+        emitRuntimeState(lastRuntimeState);
+      }
     },
 
     formatFileDisplay(file) {
@@ -160,9 +235,9 @@ export function createAdapter({ version, withVersion, callbacks }) {
     },
 
     async init() {
-      callbacks.onRuntimeStatus({
+      emitRuntimeState({
         level: "warn",
-        text: "Loading Python runtime…",
+        textKey: "status.loadingPython",
         visible: false,
         ready: false,
       });
@@ -188,18 +263,29 @@ export function createAdapter({ version, withVersion, callbacks }) {
                   ),
                 )
               : null;
+            const mapped = mapWorkerMessage(msg.message);
             pendingSync.onProgress({
-              message: msg.message ? capitalize(msg.message) : undefined,
+              message: mapped.message,
+              messageKey: mapped.messageKey,
+              messageParams: mapped.messageParams,
               fraction: scaled,
             });
           }
         } else if (msg.type === "status") {
+          const mapped = mapWorkerMessage(msg.status);
           if (pendingSync && pendingSync.onProgress) {
-            pendingSync.onProgress({ message: capitalize(msg.status), fraction: null });
+            pendingSync.onProgress({
+              message: mapped.message,
+              messageKey: mapped.messageKey,
+              messageParams: mapped.messageParams,
+              fraction: null,
+            });
           } else if (!engineReady) {
-            callbacks.onRuntimeStatus({
+            emitRuntimeState({
               level: "warn",
-              text: capitalize(msg.status),
+              textKey: mapped.messageKey,
+              textParams: mapped.messageParams,
+              text: mapped.message,
               visible: false,
               ready: false,
             });
@@ -208,9 +294,9 @@ export function createAdapter({ version, withVersion, callbacks }) {
           engineReady = true;
           workerCaps = msg.capabilities || workerCaps;
           ffmpegConfig = msg.ffmpeg || ffmpegConfig;
-          callbacks.onRuntimeStatus({
+          emitRuntimeState({
             level: "ok",
-            text: "Ready",
+            textKey: "status.ready",
             visible: false,
             ready: true,
           });
@@ -221,7 +307,8 @@ export function createAdapter({ version, withVersion, callbacks }) {
             finishPending({
               ok: false,
               elapsed_seconds: elapsed,
-              error: raw.error || "Sync failed.",
+              error: raw.error || t("result.syncFailed"),
+              error_key: raw.error ? null : "result.syncFailed",
             });
             return;
           }
@@ -252,13 +339,16 @@ export function createAdapter({ version, withVersion, callbacks }) {
             finishPending({
               ok: false,
               elapsed_seconds: elapsed,
-              error: "Error: " + msg.error,
+              error: t("status.errorPrefix", { error: msg.error }),
+              error_key: "status.errorPrefix",
+              error_params: { error: msg.error },
             });
           } else {
             callbacks.onRuntimeProgress({ active: false, fraction: null });
-            callbacks.onRuntimeStatus({
+            emitRuntimeState({
               level: "err",
-              text: "Error: " + msg.error,
+              textKey: "status.errorPrefix",
+              textParams: { error: msg.error },
               visible: true,
               ready: false,
             });
@@ -267,22 +357,44 @@ export function createAdapter({ version, withVersion, callbacks }) {
       };
 
       worker.onerror = (e) => {
-        const message = "Worker failed to load: " + (e.message || e.filename || e);
+        const errDetail = e.message || e.filename || e;
+        const message = t("status.workerLoadFailed", { error: errDetail });
         if (pendingSync) {
-          finishPending({ ok: false, error: message });
+          finishPending({
+            ok: false,
+            error: message,
+            error_key: "status.workerLoadFailed",
+            error_params: { error: errDetail },
+          });
         } else {
           callbacks.onRuntimeProgress({ active: false, fraction: null });
-          callbacks.onRuntimeStatus({ level: "err", text: "Error: " + message, ready: false });
+          emitRuntimeState({
+            level: "err",
+            textKey: "status.errorPrefix",
+            textParams: { error: message },
+            visible: true,
+            ready: false,
+          });
         }
       };
 
       worker.onmessageerror = () => {
-        const message = "Worker message error";
+        const message = t("status.workerMessageError");
         if (pendingSync) {
-          finishPending({ ok: false, error: message });
+          finishPending({
+            ok: false,
+            error: message,
+            error_key: "status.workerMessageError",
+          });
         } else {
           callbacks.onRuntimeProgress({ active: false, fraction: null });
-          callbacks.onRuntimeStatus({ level: "err", text: "Error: " + message, ready: false });
+          emitRuntimeState({
+            level: "err",
+            textKey: "status.errorPrefix",
+            textParams: { error: message },
+            visible: true,
+            ready: false,
+          });
         }
       };
 
@@ -291,13 +403,21 @@ export function createAdapter({ version, withVersion, callbacks }) {
 
     async sync(request, { onProgress }) {
       if (!worker || !engineReady) {
-        return { ok: false, error: "Runtime is not ready yet." };
+        return {
+          ok: false,
+          error: t("errors.runtimeNotReady"),
+          error_key: "errors.runtimeNotReady",
+        };
       }
 
       const refFile = request.ref;
       const inFile = request.input;
       if (!(refFile instanceof File) || !(inFile instanceof File)) {
-        return { ok: false, error: "Please select both a reference file and a subtitle file." };
+        return {
+          ok: false,
+          error: t("errors.selectBothFiles"),
+          error_key: "errors.selectBothFiles",
+        };
       }
 
       const t0 = performance.now();
@@ -309,12 +429,12 @@ export function createAdapter({ version, withVersion, callbacks }) {
         auto_split: request.splitMode === "auto",
       };
 
-      onProgress({ message: "Reading input subtitles…", fraction: 0.02 });
+      onProgress({ messageKey: "progress.readingInputSubs", fraction: 0.02 });
       const inBytesRaw = new Uint8Array(await inFile.arrayBuffer());
 
       // 1. Direct subtitle reference file (.srt, .ass, .vtt, etc.)
       if (isSubtitleFile(refFile.name)) {
-        onProgress({ message: "Reading reference…", fraction: 0.05 });
+        onProgress({ messageKey: "progress.readingRef", fraction: 0.05 });
         const refBytes = new Uint8Array(await refFile.arrayBuffer());
         return postWorkerSync(
           {
@@ -339,7 +459,15 @@ export function createAdapter({ version, withVersion, callbacks }) {
         getFfmpegModule(),
         resolveFfmpegConfig(request.frameRate),
       ]);
-      const reportStatus = (s) => onProgress({ message: capitalize(s), fraction: null });
+      const reportStatus = (s) => {
+        const mapped = mapWorkerMessage(s);
+        onProgress({
+          message: mapped.message,
+          messageKey: mapped.messageKey,
+          messageParams: mapped.messageParams,
+          fraction: null,
+        });
+      };
 
       const refStream = request.refStream || null;
       const refStreamKind = request.refStreamKind || null;
@@ -357,16 +485,22 @@ export function createAdapter({ version, withVersion, callbacks }) {
 
       // 2a. Explicit PGS / VobSub timing stream selected
       if (isExplicitPgs) {
-        onProgress({ message: `Reading PGS/VobSub timings (${refStream})…`, fraction: 0.05 });
+        onProgress({
+          messageKey: "progress.readingPgsStream",
+          messageParams: { stream: refStream },
+          fraction: 0.05,
+        });
         const timings = await mod.probePgsTimings(ff, refFile, refStream, { status: reportStatus });
         if (!timings || !timings.length) {
           return {
             ok: false,
             elapsed_seconds: (performance.now() - t0) / 1000,
-            error: `Failed to read PGS/VobSub timings from stream ${refStream}.`,
+            error: t("errors.pgsReadFailed", { stream: refStream }),
+            error_key: "errors.pgsReadFailed",
+            error_params: { stream: refStream },
           };
         }
-        onProgress({ message: "Aligning PGS/VobSub timings…", fraction: 0.35 });
+        onProgress({ messageKey: "progress.aligningPgs", fraction: 0.35 });
         return postWorkerSync(
           {
             type: "syncTimings",
@@ -381,14 +515,19 @@ export function createAdapter({ version, withVersion, callbacks }) {
 
       // 2b. Explicit embedded text subtitle stream selected
       if (isExplicitSub) {
-        onProgress({ message: `Extracting embedded subtitle (${refStream})…`, fraction: 0.05 });
+        onProgress({
+          messageKey: "progress.extractingEmbeddedStream",
+          messageParams: { stream: refStream },
+          fraction: 0.05,
+        });
         const subBytes = await mod.extractSubtitleStream(ff, refFile, refStream, {
           status: reportStatus,
           onProgress: (p) => {
             if (Number.isFinite(p) && p > 0 && p <= 1) {
               const pct = Math.round(p * 100);
               onProgress({
-                message: `Extracting embedded subtitle (${pct}%)…`,
+                messageKey: "progress.extractingEmbeddedPct",
+                messageParams: { pct },
                 fraction: 0.05 + p * 0.30,
               });
             }
@@ -398,10 +537,12 @@ export function createAdapter({ version, withVersion, callbacks }) {
           return {
             ok: false,
             elapsed_seconds: (performance.now() - t0) / 1000,
-            error: `Failed to extract embedded subtitle stream ${refStream}.`,
+            error: t("errors.embeddedExtractFailed", { stream: refStream }),
+            error_key: "errors.embeddedExtractFailed",
+            error_params: { stream: refStream },
           };
         }
-        onProgress({ message: "Aligning against embedded subtitles…", fraction: 0.35 });
+        onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
         return postWorkerSync(
           {
             type: "sync",
@@ -423,7 +564,7 @@ export function createAdapter({ version, withVersion, callbacks }) {
       // 2c. Auto embedded subtitles -> PGS/VobSub timings fallback (subs_then_webrtc)
       const useEmbeddedFirst = !isExplicitAudio && String(request.vad || "").includes("subs");
       if (useEmbeddedFirst) {
-        onProgress({ message: "Checking video for subtitles…", fraction: 0.04 });
+        onProgress({ messageKey: "progress.checkingVideoSubs", fraction: 0.04 });
         const probed = await probeStreamsCached(refFile, reportStatus);
         const streams = (probed && probed.streams) || [];
 
@@ -438,14 +579,15 @@ export function createAdapter({ version, withVersion, callbacks }) {
               if (Number.isFinite(p) && p > 0 && p <= 1) {
                 const pct = Math.round(p * 100);
                 onProgress({
-                  message: `Extracting embedded subtitle (${pct}%)…`,
+                  messageKey: "progress.extractingEmbeddedPct",
+                  messageParams: { pct },
                   fraction: 0.05 + p * 0.30,
                 });
               }
             },
           });
           if (subBytes && subBytes.byteLength > 0) {
-            onProgress({ message: "Aligning against embedded subtitles…", fraction: 0.35 });
+            onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
             const inCopy = inBytesRaw.slice();
             const res = await postWorkerSync(
               {
@@ -470,7 +612,11 @@ export function createAdapter({ version, withVersion, callbacks }) {
         // Fall back to PGS / VobSub packet timings (up to 3 tracks, matching CLI/desktop).
         const pgsTracks = sortByPriority(streams.filter((s) => s.kind === "pgs")).slice(0, 3);
         for (const track of pgsTracks) {
-          onProgress({ message: `Reading PGS/VobSub timings (${track.value})…`, fraction: 0.08 });
+          onProgress({
+            messageKey: "progress.readingPgsStream",
+            messageParams: { stream: track.value },
+            fraction: 0.08,
+          });
           const timings = await mod.probePgsTimings(ff, refFile, track.value, {
             status: reportStatus,
           });
@@ -478,7 +624,8 @@ export function createAdapter({ version, withVersion, callbacks }) {
             const kindLabel =
               track.codec === "hdmv_pgs_subtitle" ? "PGS" : "VobSub";
             onProgress({
-              message: `Using ${kindLabel} subtitle stream ${track.value}…`,
+              messageKey: "progress.usingStreamKind",
+              messageParams: { kind: kindLabel, stream: track.value },
               fraction: 0.35,
             });
             const inCopy = inBytesRaw.slice();
@@ -502,15 +649,14 @@ export function createAdapter({ version, withVersion, callbacks }) {
         return {
           ok: false,
           elapsed_seconds: (performance.now() - t0) / 1000,
-          error:
-            "Video/audio sync needs the WebRTC VAD component, which isn't available " +
-            "in this build. Use a subtitle reference, or build the webrtcvad wheel.",
+          error: t("errors.missingWebrtcVad"),
+          error_key: "errors.missingWebrtcVad",
         };
       }
 
       let pcm;
       try {
-        onProgress({ message: "Loading ffmpeg.wasm…", fraction: 0.05 });
+        onProgress({ messageKey: "progress.loadingFfmpegWasm", fraction: 0.05 });
         pcm = await mod.decodeAudioToPcm(ff, refFile, {
           stream: isExplicitAudio ? refStream : undefined,
           status: reportStatus,
@@ -518,7 +664,8 @@ export function createAdapter({ version, withVersion, callbacks }) {
             if (Number.isFinite(p) && p > 0 && p <= 1) {
               const pct = Math.round(p * 100);
               onProgress({
-                message: `Decoding audio (${pct}%)…`,
+                messageKey: "progress.decodingAudioPct",
+                messageParams: { pct },
                 fraction: 0.05 + p * 0.45,
               });
             }
@@ -526,14 +673,17 @@ export function createAdapter({ version, withVersion, callbacks }) {
         });
       } catch (e) {
         console.error(e);
+        const errDetail = (e && e.message) || e;
         return {
           ok: false,
           elapsed_seconds: (performance.now() - t0) / 1000,
-          error: "Audio decode failed: " + ((e && e.message) || e),
+          error: t("errors.audioDecodeFailed", { error: errDetail }),
+          error_key: "errors.audioDecodeFailed",
+          error_params: { error: errDetail },
         };
       }
 
-      onProgress({ message: "Detecting speech + aligning…", fraction: 0.50 });
+      onProgress({ messageKey: "progress.detectingSpeechAligning", fraction: 0.50 });
       return postWorkerSync(
         {
           type: "syncAudioPcm",

@@ -26,22 +26,24 @@ function waitForPywebview() {
   });
 }
 
-function buildFfmpegStatus(info) {
+function buildFfmpegStatus(info, t) {
   if (info && info.available) {
     let text;
     let actionLabel;
+    const verLocal = info.version || t("ffmpeg.versionLocal");
+    const verSystem = info.version || t("ffmpeg.versionSystem");
     if (info.source === "custom") {
-      text = `FFmpeg ready (custom · ${info.version || "local"})`;
-      actionLabel = "Update FFmpeg";
+      text = t("ffmpeg.readyCustom", { version: verLocal });
+      actionLabel = t("ffmpeg.updateBtn");
     } else if (info.source === "portable") {
-      text = `FFmpeg ready (portable · ${info.version || "local"})`;
-      actionLabel = "Update FFmpeg";
+      text = t("ffmpeg.readyPortable", { version: verLocal });
+      actionLabel = t("ffmpeg.updateBtn");
     } else if (info.source === "appdata") {
-      text = `FFmpeg ready (${info.version || "local"})`;
-      actionLabel = "Update FFmpeg";
+      text = t("ffmpeg.readyAppdata", { version: verLocal });
+      actionLabel = t("ffmpeg.updateBtn");
     } else {
-      text = `FFmpeg ready (system PATH · ${info.version || "system"})`;
-      actionLabel = "Download FFmpeg";
+      text = t("ffmpeg.readySystem", { version: verSystem });
+      actionLabel = t("ffmpeg.downloadBtn");
     }
     return {
       level: "ok",
@@ -53,13 +55,16 @@ function buildFfmpegStatus(info) {
       ffmpegInfo: info,
     };
   }
-  const errText =
-    (info && info.custom_error) ||
-    "FFmpeg not found";
+  let errText;
+  if (info && info.custom_path && info.custom_error) {
+    errText = t("ffmpeg.notFoundInPath", { path: info.custom_path });
+  } else {
+    errText = (info && info.custom_error) || t("ffmpeg.notFound");
+  }
   return {
     level: "err",
     text: errText,
-    actionLabel: "Download latest FFmpeg",
+    actionLabel: t("ffmpeg.downloadLatestBtn"),
     actionDisabled: false,
     visible: true,
     ready: true,
@@ -67,12 +72,57 @@ function buildFfmpegStatus(info) {
   };
 }
 
-export function createAdapter({ callbacks }) {
+export function createAdapter({ i18n, callbacks }) {
+  const t = (key, params) => (i18n ? i18n.t(key, params) : key);
   let api = null;
   let pollTimer = null;
   let lastDlSeq = 0;
   let lastSyncSeq = 0;
   let pendingSync = null;
+  let lastStatusState = null;
+
+  function emitRuntimeStatus(stateObj) {
+    lastStatusState = stateObj;
+    if (!stateObj) return;
+    if (stateObj.kind === "checking") {
+      callbacks.onRuntimeStatus({
+        level: "muted",
+        text: t("ffmpeg.checking"),
+        actionLabel: t("ffmpeg.downloadLatestBtn"),
+        actionDisabled: true,
+        visible: false,
+        ready: false,
+      });
+    } else if (stateObj.kind === "ffmpeg") {
+      callbacks.onRuntimeStatus(buildFfmpegStatus(stateObj.info, t));
+    } else if (stateObj.kind === "downloading") {
+      const dl = stateObj.dl || {};
+      const hasFrac = dl.fraction !== null && dl.fraction !== undefined;
+      let text;
+      if (hasFrac) {
+        const mb = (dl.downloaded / (1024 * 1024)).toFixed(1);
+        const totalMb = dl.total ? (dl.total / (1024 * 1024)).toFixed(1) : "?";
+        text = t("ffmpeg.downloadingSize", { mb, totalMb });
+      } else {
+        text = t("ffmpeg.downloading");
+      }
+      callbacks.onRuntimeStatus({
+        level: "warn",
+        text,
+        actionDisabled: true,
+        visible: true,
+        ready: true,
+      });
+    } else if (stateObj.kind === "download_error") {
+      callbacks.onRuntimeStatus({
+        level: "err",
+        text: t("ffmpeg.downloadFailed", { error: stateObj.error }),
+        actionDisabled: false,
+        visible: true,
+        ready: true,
+      });
+    }
+  }
 
   // Exposed for Python DOM drag-drop handler and window-state events (gui/desktop_app.py).
   window.setDroppedPath = function (target, fullPath) {
@@ -109,21 +159,7 @@ export function createAdapter({ callbacks }) {
     const dl = st.ffmpeg_dl;
     if (dl && dl.active) {
       const hasFrac = dl.fraction !== null && dl.fraction !== undefined;
-      let text;
-      if (hasFrac) {
-        const mb = (dl.downloaded / (1024 * 1024)).toFixed(1);
-        const totMb = dl.total ? (dl.total / (1024 * 1024)).toFixed(1) : "?";
-        text = `Downloading FFmpeg… ${mb} / ${totMb} MB`;
-      } else {
-        text = "Downloading FFmpeg…";
-      }
-      callbacks.onRuntimeStatus({
-        level: "warn",
-        text,
-        actionDisabled: true,
-        visible: true,
-        ready: true,
-      });
+      emitRuntimeStatus({ kind: "downloading", dl });
       callbacks.onRuntimeProgress({
         active: true,
         fraction: hasFrac ? dl.fraction : null,
@@ -132,15 +168,9 @@ export function createAdapter({ callbacks }) {
       lastDlSeq = dl.seq;
       callbacks.onRuntimeProgress({ active: false, fraction: null });
       if (dl.error) {
-        callbacks.onRuntimeStatus({
-          level: "err",
-          text: "FFmpeg download failed: " + dl.error,
-          actionDisabled: false,
-          visible: true,
-          ready: true,
-        });
+        emitRuntimeStatus({ kind: "download_error", error: dl.error });
       } else if (dl.info) {
-        callbacks.onRuntimeStatus(buildFfmpegStatus(dl.info));
+        emitRuntimeStatus({ kind: "ffmpeg", info: dl.info });
       } else {
         callbacks.onRuntimeStatus({ actionDisabled: false, ready: true });
       }
@@ -150,14 +180,16 @@ export function createAdapter({ callbacks }) {
     if (sy && sy.active) {
       if (pendingSync && pendingSync.onProgress) {
         pendingSync.onProgress({
-          message: sy.message || "Syncing…",
+          message: sy.message || t("progress.syncing"),
+          messageKey: sy.message_key || (!sy.message ? "progress.syncing" : null),
+          messageParams: sy.message_params || null,
           fraction: sy.fraction !== null && sy.fraction !== undefined ? sy.fraction : null,
         });
       }
     } else if (sy && sy.done && sy.seq !== lastSyncSeq) {
       lastSyncSeq = sy.seq;
       if (sy.ffmpeg_info) {
-        callbacks.onRuntimeStatus(buildFfmpegStatus(sy.ffmpeg_info));
+        emitRuntimeStatus({ kind: "ffmpeg", info: sy.ffmpeg_info });
       }
       if (pendingSync) {
         const current = pendingSync;
@@ -172,6 +204,8 @@ export function createAdapter({ callbacks }) {
           output_path: sy.output_path,
           output_label: sy.output_path || "",
           error: sy.error || null,
+          error_key: sy.error_key || null,
+          error_params: sy.error_params || null,
         });
       }
     }
@@ -184,7 +218,9 @@ export function createAdapter({ callbacks }) {
 
   return {
     meta: {
-      pageTitle: "ffblindsubsync",
+      get pageTitle() {
+        return t("app.title");
+      },
       subtitle: "",
       badgeText: "",
       badgeVariant: "desktop",
@@ -198,6 +234,13 @@ export function createAdapter({ callbacks }) {
       runtimeAction: true,
       customWindowControls: true,
       settings: true,
+      ffmpegSettings: true,
+    },
+
+    retranslate() {
+      if (lastStatusState) {
+        emitRuntimeStatus(lastStatusState);
+      }
     },
 
     windowControls: {
@@ -231,7 +274,7 @@ export function createAdapter({ callbacks }) {
           res && res.ffmpeg
             ? { ...res.ffmpeg, custom_path: res.custom_ffmpeg_path ?? res.ffmpeg.custom_path ?? "" }
             : null;
-        callbacks.onRuntimeStatus(buildFfmpegStatus(ff));
+        emitRuntimeStatus({ kind: "ffmpeg", info: ff });
         return ff;
       },
       openFfmpegFolder() {
@@ -240,16 +283,17 @@ export function createAdapter({ callbacks }) {
     },
 
     async init() {
-      callbacks.onRuntimeStatus({
-        level: "muted",
-        text: "Checking FFmpeg…",
-        actionLabel: "Download latest FFmpeg",
-        actionDisabled: true,
-        visible: false,
-        ready: false,
-      });
+      emitRuntimeStatus({ kind: "checking" });
       api = await waitForPywebview();
       const state = await api.get_init_state();
+      if (i18n && state) {
+        if (Array.isArray(state.system_languages) && state.system_languages.length) {
+          i18n.setSystemLanguages(state.system_languages);
+        }
+        if (typeof state.language === "string" && state.language.trim()) {
+          i18n.setPreference(state.language, { persist: true });
+        }
+      }
       if (state && state.version && callbacks.onAppVersion) {
         callbacks.onAppVersion(state.version);
       }
@@ -261,24 +305,38 @@ export function createAdapter({ callbacks }) {
             custom_path: state.custom_ffmpeg_path ?? state.ffmpeg.custom_path ?? "",
           }
           : null;
-      callbacks.onRuntimeStatus(buildFfmpegStatus(ff));
+      emitRuntimeStatus({ kind: "ffmpeg", info: ff });
     },
 
     async pickReference() {
       if (!api) return null;
-      const p = await api.pick_reference();
+      const fileTypes = [
+        `${t("dialogs.mediaFiles")} (*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v;*.mka;*.mp3;*.aac;*.flac;*.wav;*.srt;*.ass;*.ssa;*.sub;*.vtt)`,
+        `${t("dialogs.videoFiles")} (*.mkv;*.mp4;*.avi;*.mov;*.webm;*.m4v)`,
+        `${t("dialogs.subtitleFiles")} (*.srt;*.ass;*.ssa;*.sub;*.vtt)`,
+        `${t("dialogs.allFiles")} (*.*)`,
+      ];
+      const p = await api.pick_reference(fileTypes);
       return p ? { value: p, display: p } : null;
     },
 
     async pickSubtitle() {
       if (!api) return null;
-      const p = await api.pick_subtitle();
+      const fileTypes = [
+        `${t("dialogs.subtitles")} (*.srt;*.ass;*.ssa;*.sub;*.vtt)`,
+        `${t("dialogs.allFiles")} (*.*)`,
+      ];
+      const p = await api.pick_subtitle(fileTypes);
       return p ? { value: p, display: p } : null;
     },
 
     async pickOutput(defaultPath) {
       if (!api) return null;
-      return api.pick_output(defaultPath || "");
+      const fileTypes = [
+        `${t("dialogs.subRip")} (*.srt)`,
+        `${t("dialogs.allFiles")} (*.*)`,
+      ];
+      return api.pick_output(defaultPath || "", fileTypes);
     },
 
     suggestOutputPath,
@@ -298,7 +356,11 @@ export function createAdapter({ callbacks }) {
 
     async sync(request, { onProgress }) {
       if (!api) {
-        return { ok: false, error: "Desktop API not ready." };
+        return {
+          ok: false,
+          error: t("errors.desktopApiNotReady"),
+          error_key: "errors.desktopApiNotReady",
+        };
       }
       const res = await api.start_sync({
         ref_path: String(request.ref),
@@ -313,7 +375,11 @@ export function createAdapter({ callbacks }) {
         gss: Boolean(request.gss),
       });
       if (!res || !res.started) {
-        return { ok: false, error: "A sync operation is already running." };
+        return {
+          ok: false,
+          error: t("errors.syncAlreadyRunning"),
+          error_key: "errors.syncAlreadyRunning",
+        };
       }
       return new Promise((resolve) => {
         pendingSync = { resolve, onProgress };
@@ -330,6 +396,12 @@ export function createAdapter({ callbacks }) {
     onThemeChange(isDark) {
       if (api && typeof api.set_theme === "function") {
         api.set_theme(Boolean(isDark)).catch(() => { });
+      }
+    },
+
+    onLanguageChange(pref) {
+      if (api && typeof api.set_language === "function") {
+        api.set_language(String(pref || "system")).catch(() => { });
       }
     },
   };

@@ -137,7 +137,18 @@ export async function probeStreams(cfg, file, { status } = {}) {
         if (ctype === "audio") {
           const spec = `a:${audioIdx}`;
           const label = `Audio #${audioIdx + 1} (${spec}): ${meta || "default"}${flagNote} [${codec}]`;
-          items.push({ value: spec, label, kind: "audio" });
+          items.push({
+            value: spec,
+            label,
+            kind: "audio",
+            index: audioIdx + 1,
+            spec,
+            codec,
+            lang,
+            title,
+            forced: Boolean(disp.forced),
+            comment: Boolean(disp.comment),
+          });
           audioIdx += 1;
         } else if (ctype === "subtitle") {
           const spec = `s:${subIdx}`;
@@ -145,19 +156,23 @@ export async function probeStreams(cfg, file, { status } = {}) {
           let kind;
           let isBitmap;
           let note;
+          let noteKind;
           if (isPgs) {
             kind = "pgs";
             isBitmap = false;
             hasPgsSubs = true;
-            note = codec === "hdmv_pgs_subtitle" ? "PGS timings" : "VobSub timings";
+            noteKind = codec === "hdmv_pgs_subtitle" ? "pgs" : "vobsub";
+            note = noteKind === "pgs" ? "PGS timings" : "VobSub timings";
           } else if (BITMAP_CODECS.has(codec)) {
             kind = "subtitle";
             isBitmap = true;
+            noteKind = "image";
             note = `image: ${codec}`;
           } else {
             kind = "subtitle";
             isBitmap = false;
             hasTextSubs = true;
+            noteKind = "text";
             note = `text: ${codec}`;
           }
           const label = `Subtitle #${subIdx + 1} (${spec}): ${meta || "default"}${flagNote} [${note}]`;
@@ -165,7 +180,14 @@ export async function probeStreams(cfg, file, { status } = {}) {
             value: spec,
             label,
             kind,
+            index: subIdx + 1,
+            spec,
             codec,
+            lang,
+            title,
+            forced: Boolean(disp.forced),
+            comment: Boolean(disp.comment),
+            note_kind: noteKind,
             is_bitmap: isBitmap,
             is_pgs: isPgs,
             deprioritized: isDeprioritized(title, disp),

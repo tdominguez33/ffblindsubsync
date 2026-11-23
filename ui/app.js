@@ -2,6 +2,8 @@
 // browser WebAssembly app (Pyodide + ffmpeg.wasm). Platform-specific behavior
 // is isolated in ./adapters/desktop.js and ./adapters/web.js.
 
+import { i18n, SYSTEM_LANGUAGE } from "./i18n/index.js";
+
 const V = new URL(import.meta.url).searchParams.get("v") || "";
 const withVersion = (url) => (V ? url + (url.includes("?") ? "&" : "?") + "v=" + V : url);
 
@@ -25,6 +27,8 @@ const els = {
   mainView: document.getElementById("main-view"),
   settingsView: document.getElementById("settings-view"),
   settingsCloseBtn: document.getElementById("settings-close-btn"),
+  settingsLanguage: document.getElementById("settings-language"),
+  settingsFfmpegCard: document.getElementById("settings-ffmpeg-card"),
   settingsFfPill: document.getElementById("settings-ff-pill"),
   settingsFfDot: document.getElementById("settings-ff-dot"),
   settingsFfStatus: document.getElementById("settings-ff-status"),
@@ -73,7 +77,6 @@ const els = {
   downloadLink: document.getElementById("download"),
   footer: document.getElementById("app-footer"),
   footerText: document.getElementById("footer-text"),
-  footerVersion: document.getElementById("footer-version"),
   settingsFooter: document.getElementById("settings-footer"),
   settingsVersion: document.getElementById("settings-version"),
 };
@@ -84,6 +87,9 @@ let busy = false;
 let selectedRef = null; // string path (desktop) or File (web)
 let selectedIn = null; // string path (desktop) or File (web)
 let lastResult = null;
+let lastStreamProbe = null;
+let lastFfmpegInfo = null;
+let lastSyncProgress = null;
 let streamProbeSeq = 0;
 let themeTransitionTimer = null;
 let settingsOpen = false;
@@ -97,6 +103,9 @@ function setSettingsOpen(open) {
     els.settingsBtn.classList.toggle("active", settingsOpen);
     els.settingsBtn.setAttribute("aria-pressed", String(settingsOpen));
   }
+  if (settingsOpen && els.settingsLanguage) {
+    fitSelectOptions(els.settingsLanguage);
+  }
 }
 
 function isDarkTheme() {
@@ -105,7 +114,7 @@ function isDarkTheme() {
 
 function syncThemeToggleLabel(dark) {
   if (els.themeToggle) {
-    els.themeToggle.title = dark ? "Switch to light theme" : "Switch to dark theme";
+    els.themeToggle.title = dark ? i18n.t("topbar.switchToLight") : i18n.t("topbar.switchToDark");
     els.themeToggle.setAttribute("aria-label", els.themeToggle.title);
   }
 }
@@ -115,7 +124,7 @@ function syncMaximizedState(isMax) {
   document.body.classList.toggle("is-maximized", max);
   if (els.winMaximize) {
     els.winMaximize.classList.toggle("is-maximized", max);
-    const label = max ? "Restore" : "Maximize";
+    const label = max ? i18n.t("topbar.restore") : i18n.t("topbar.maximize");
     els.winMaximize.title = label;
     els.winMaximize.setAttribute("aria-label", label);
   }
@@ -182,7 +191,9 @@ function refreshSyncBtn() {
   els.syncBtn.disabled =
     busy || !runtimeReady || !hasSelection(selectedRef) || !hasSelection(selectedIn);
   if (!busy) {
-    els.syncBtn.textContent = "Sync subtitles";
+    els.syncBtn.textContent = i18n.t("form.syncBtn");
+  } else if (lastSyncProgress && lastSyncProgress.messageKey) {
+    els.syncBtn.textContent = i18n.t(lastSyncProgress.messageKey, lastSyncProgress.messageParams);
   }
 }
 
@@ -191,23 +202,29 @@ function formatResultSummary(res) {
   const scale = Number(res.framerate_scale_factor);
   const segs = Array.isArray(res.split_segments) ? res.split_segments : null;
   const dropped = Number(res.dropped_cues || 0);
-  const dropNote = dropped > 0 ? ` · ${dropped} orphan cue(s) removed` : "";
+  const dropNote = dropped > 0 ? i18n.t("result.orphanCues", { count: dropped }) : "";
   let splitNote = "";
   if (segs) {
     if (segs.length <= 1) {
-      splitNote = ` · no mid-file breaks${dropNote}`;
+      splitNote = i18n.t("result.noBreaks", { dropNote });
     } else {
       const fmt = (v) => `${v >= 0 ? "+" : ""}${Number(v).toFixed(2)}s`;
       const chain = segs.slice(0, 4).map((x) => fmt(x.offset_seconds)).join(" → ");
-      const tail = segs.length > 4 ? ` → … (${segs.length} segments)` : "";
-      splitNote = ` · ${segs.length - 1} break(s) fixed (${chain}${tail}${dropNote})`;
+      const tail = segs.length > 4 ? i18n.t("result.segmentsTail", { count: segs.length }) : "";
+      splitNote = i18n.t("result.breaksFixed", {
+        count: segs.length - 1,
+        chain,
+        tail,
+        dropNote,
+      });
     }
   } else if (dropped > 0) {
     splitNote = dropNote;
   }
+  const offsetStr = `${off >= 0 ? "+" : ""}${off.toFixed(3)}`;
   return (
-    `offset ${off >= 0 ? "+" : ""}${off.toFixed(3)}s` +
-    (Math.abs(scale - 1) > 1e-6 ? ` · framerate ×${scale.toFixed(3)}` : "") +
+    i18n.t("result.offset", { offset: offsetStr }) +
+    (Math.abs(scale - 1) > 1e-6 ? i18n.t("result.framerate", { scale: scale.toFixed(3) }) : "") +
     splitNote
   );
 }
@@ -226,7 +243,7 @@ function truncateSelectLabel(fullText, maxPx, measure) {
   if (!text || !Number.isFinite(maxPx) || maxPx <= 0 || measure(text) <= maxPx) {
     return text;
   }
-  const ellipsis = "...";
+  const ellipsis = "…";
   const match = _TRAILING_BRACKETS_RE.exec(text);
   if (match && match[1].trim().length > 0) {
     const head = match[1].trimEnd();
@@ -269,11 +286,37 @@ function truncateSelectLabel(fullText, maxPx, measure) {
   return prefix ? prefix + ellipsis : ellipsis;
 }
 
+function measureSelectText(str, font) {
+  if (_measureCtx) {
+    _measureCtx.font = font;
+    return _measureCtx.measureText(str).width;
+  }
+  return str.length * 6.5;
+}
+
 function updateSelectTooltip(selectEl) {
   if (!selectEl) return;
   const opt = selectEl.options[selectEl.selectedIndex];
   const full = opt ? (opt.dataset.fullLabel || opt.textContent || "") : "";
-  selectEl.title = opt && opt.textContent !== full ? full : "";
+  if (!opt || !full) {
+    selectEl.title = "";
+    return;
+  }
+  if (opt.textContent !== full) {
+    selectEl.title = full;
+    return;
+  }
+  const width = selectEl.clientWidth;
+  if (width > 0) {
+    const cs = window.getComputedStyle(selectEl);
+    const padL = parseFloat(cs.paddingLeft) || 10;
+    const padR = parseFloat(cs.paddingRight) || 30;
+    const closedMaxPx = Math.max(40, width - padL - padR);
+    const closedFont = `${cs.fontWeight || "500"} ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
+    selectEl.title = measureSelectText(full, closedFont) > closedMaxPx ? full : "";
+  } else {
+    selectEl.title = "";
+  }
 }
 
 function fitSelectOptions(selectEl) {
@@ -281,24 +324,18 @@ function fitSelectOptions(selectEl) {
   const width = selectEl.clientWidth;
   if (width <= 0) return;
   const cs = window.getComputedStyle(selectEl);
-  const padL = parseFloat(cs.paddingLeft) || 12;
-  const padR = parseFloat(cs.paddingRight) || 36;
-  const maxPx = Math.max(40, width - padL - padR - 8);
-  const font = `${cs.fontWeight || "500"} ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
-  const measure = (str) => {
-    if (_measureCtx) {
-      _measureCtx.font = font;
-      return _measureCtx.measureText(str).width;
-    }
-    return str.length * 7;
-  };
+  // Fit options to the open popup width (no chevron, regular option weight)
+  // while CSS text-overflow: ellipsis handles the closed <select> edge cleanly.
+  const popupMaxPx = Math.max(40, width - 20);
+  const popupFont = `400 ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
+  const measure = (str) => measureSelectText(str, popupFont);
 
   for (const opt of selectEl.options) {
     if (opt.dataset.fullLabel === undefined) {
       opt.dataset.fullLabel = opt.textContent || "";
     }
     const full = opt.dataset.fullLabel;
-    const fitted = truncateSelectLabel(full, maxPx, measure);
+    const fitted = truncateSelectLabel(full, popupMaxPx, measure);
     if (opt.textContent !== fitted) {
       opt.textContent = fitted;
     }
@@ -334,39 +371,107 @@ if (document.fonts && document.fonts.ready) {
   document.fonts.ready.then(() => fitAllSelectOptions()).catch(() => {});
 }
 
-async function refreshStreams(refValue) {
-  const seq = ++streamProbeSeq;
-  els.refStream.innerHTML = '<option value="">Auto (recommended)</option>';
+function formatStreamLabel(item) {
+  if (!item || !item.index || !item.spec) {
+    return (item && item.label) || "";
+  }
+  const metaParts = [item.lang, item.title].filter(Boolean);
+  const meta = metaParts.length ? metaParts.join(" · ") : i18n.t("form.streamDefaultMeta");
+  const flagParts = [];
+  if (item.forced) flagParts.push(i18n.t("form.streamFlagForced"));
+  if (item.comment) flagParts.push(i18n.t("form.streamFlagCommentary"));
+  const flags = flagParts.length ? ` (${flagParts.join(", ")})` : "";
+
+  if (item.kind === "audio") {
+    return i18n.t("form.streamAudio", {
+      index: item.index,
+      spec: item.spec,
+      meta,
+      flags,
+      codec: item.codec || "unknown",
+    });
+  }
+
+  let note;
+  if (item.note_kind === "pgs") {
+    note = i18n.t("form.streamNotePgs");
+  } else if (item.note_kind === "vobsub") {
+    note = i18n.t("form.streamNoteVobSub");
+  } else if (item.note_kind === "image" || item.is_bitmap) {
+    note = i18n.t("form.streamNoteImage", { codec: item.codec || "unknown" });
+  } else {
+    note = i18n.t("form.streamNoteText", { codec: item.codec || "unknown" });
+  }
+  return i18n.t("form.streamSubtitle", {
+    index: item.index,
+    spec: item.spec,
+    meta,
+    flags,
+    note,
+  });
+}
+
+function resetStreamSelectToAuto() {
+  els.refStream.innerHTML = "";
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  const autoLabel = i18n.t("form.streamAutoOption");
+  autoOpt.dataset.fullLabel = autoLabel;
+  autoOpt.textContent = autoLabel;
+  els.refStream.appendChild(autoOpt);
   els.refStream.value = "";
   els.refStream.title = "";
-  els.streamHint.textContent = "Auto";
+  els.streamHint.textContent = i18n.t("form.streamHintAuto");
+}
+
+function renderStreamProbe(res, { preserveSelection = false } = {}) {
+  const prevVal = preserveSelection ? els.refStream.value : "";
+  resetStreamSelectToAuto();
+  const list = (res && res.streams) || [];
+  if (list.length <= 1) {
+    els.streamWrap.hidden = true;
+    return;
+  }
+  for (const item of list) {
+    const opt = document.createElement("option");
+    opt.value = item.value;
+    const label = formatStreamLabel(item);
+    opt.dataset.fullLabel = label;
+    opt.textContent = label;
+    opt.dataset.kind = item.kind || "";
+    if (item.is_bitmap) opt.disabled = true;
+    els.refStream.appendChild(opt);
+  }
+  if (preserveSelection && prevVal) {
+    els.refStream.value = prevVal;
+  }
+  const notes = [];
+  if (res.has_text_subs) notes.push(i18n.t("form.streamTextSubsAvailable"));
+  if (res.has_pgs_subs) notes.push(i18n.t("form.streamPgsAvailable"));
+  els.streamHint.textContent = notes.length
+    ? i18n.t("form.streamTracksNotes", { count: list.length, notes: notes.join(" · ") })
+    : i18n.t("form.streamTracksAudioVad", { count: list.length });
+  els.streamWrap.hidden = false;
+  observeSelect(els.refStream);
+  fitSelectOptions(els.refStream);
+}
+
+async function refreshStreams(refValue) {
+  const seq = ++streamProbeSeq;
+  lastStreamProbe = null;
+  resetStreamSelectToAuto();
   els.streamWrap.hidden = true;
   if (!adapter || !adapter.capabilities.streamProbe || !refValue) return;
   try {
     const res = await adapter.probeStreams(refValue);
     if (seq !== streamProbeSeq) return;
-    const list = (res && res.streams) || [];
-    if (list.length <= 1) return;
-    for (const item of list) {
-      const opt = document.createElement("option");
-      opt.value = item.value;
-      opt.dataset.fullLabel = item.label;
-      opt.textContent = item.label;
-      opt.dataset.kind = item.kind || "";
-      if (item.is_bitmap) opt.disabled = true;
-      els.refStream.appendChild(opt);
-    }
-    const notes = [];
-    if (res.has_text_subs) notes.push("text subs available");
-    if (res.has_pgs_subs) notes.push("PGS/VobSub timings available");
-    els.streamHint.textContent = notes.length
-      ? `${list.length} track(s) · ${notes.join(" · ")}`
-      : `${list.length} track(s) · audio VAD`;
-    els.streamWrap.hidden = false;
-    observeSelect(els.refStream);
-    fitSelectOptions(els.refStream);
+    lastStreamProbe = res;
+    renderStreamProbe(res);
   } catch (_) {
-    if (seq === streamProbeSeq) els.streamWrap.hidden = true;
+    if (seq === streamProbeSeq) {
+      lastStreamProbe = null;
+      els.streamWrap.hidden = true;
+    }
   }
 }
 
@@ -391,6 +496,18 @@ function setInputSubtitle(entry, { forceAutoOut = false } = {}) {
     els.outPath.dataset.auto = "1";
   }
   refreshSyncBtn();
+}
+
+function renderFfmpegDir(info) {
+  if (!els.settingsFfDir) return;
+  let dir = (info && info.resource_dir) || "";
+  if (!dir && info && info.ffmpeg_path) {
+    const sep = Math.max(info.ffmpeg_path.lastIndexOf("\\"), info.ffmpeg_path.lastIndexOf("/"));
+    dir = sep > 0 ? info.ffmpeg_path.slice(0, sep) : info.ffmpeg_path;
+  }
+  if (!dir) dir = (info && (info.custom_path || info.portable_dir)) || i18n.t("settings.ffmpegAutoDetect");
+  els.settingsFfDir.textContent = dir;
+  els.settingsFfDir.title = (info && info.ffmpeg_path) || dir;
 }
 
 function applyRuntimeStatus(update) {
@@ -424,7 +541,8 @@ function applyRuntimeStatus(update) {
       els.runtimeActionBtn.textContent = update.actionLabel;
       els.runtimeActionBtn.hidden = !update.actionLabel;
       if (els.settingsFfDownloadLabel) {
-        els.settingsFfDownloadLabel.textContent = update.actionLabel || "Download latest FFmpeg";
+        els.settingsFfDownloadLabel.textContent =
+          update.actionLabel || i18n.t("ffmpeg.downloadLatestBtn");
       }
     }
     if (update.actionDisabled !== undefined) {
@@ -434,17 +552,10 @@ function applyRuntimeStatus(update) {
       }
     }
   }
-  if (update.ffmpegInfo) {
-    const info = update.ffmpegInfo;
-    if (els.settingsFfDir) {
-      let dir = info.resource_dir || "";
-      if (!dir && info.ffmpeg_path) {
-        const sep = Math.max(info.ffmpeg_path.lastIndexOf("\\"), info.ffmpeg_path.lastIndexOf("/"));
-        dir = sep > 0 ? info.ffmpeg_path.slice(0, sep) : info.ffmpeg_path;
-      }
-      if (!dir) dir = info.custom_path || info.portable_dir || "Auto-detect";
-      els.settingsFfDir.textContent = dir;
-      els.settingsFfDir.title = info.ffmpeg_path || dir;
+  if (update.ffmpegInfo !== undefined) {
+    lastFfmpegInfo = update.ffmpegInfo;
+    if (update.ffmpegInfo) {
+      renderFfmpegDir(update.ffmpegInfo);
     }
   }
   if (update.ready !== undefined) {
@@ -463,16 +574,20 @@ function scrollToResultTop() {
   }
 }
 
-function renderResult(res) {
+function renderResult(res, { scroll = true } = {}) {
   lastResult = res;
   if (!res || !res.ok) {
     els.result.classList.add("error");
-    els.offset.textContent = (res && res.error) || "Sync failed.";
+    const errText =
+      (res && res.error_key ? i18n.t(res.error_key, res.error_params) : null) ||
+      (res && res.error) ||
+      i18n.t("result.syncFailed");
+    els.offset.textContent = errText;
     els.resultMeta.textContent = "";
     els.resultActionBtn.hidden = true;
     els.downloadLink.hidden = true;
     els.result.hidden = false;
-    scrollToResultTop();
+    if (scroll) scrollToResultTop();
     return;
   }
 
@@ -481,8 +596,8 @@ function renderResult(res) {
 
   const elapsed =
     typeof res.elapsed_seconds === "number" && Number.isFinite(res.elapsed_seconds)
-      ? `Completed in ${res.elapsed_seconds.toFixed(2)}s`
-      : "Completed";
+      ? i18n.t("result.completedIn", { seconds: res.elapsed_seconds.toFixed(2) })
+      : i18n.t("result.completed");
 
   if (adapter.capabilities.outputPath) {
     els.resultMeta.textContent = res.output_label ? `${elapsed} → ${res.output_label}` : elapsed;
@@ -500,20 +615,20 @@ function renderResult(res) {
     }
   }
   els.result.hidden = false;
-  scrollToResultTop();
+  if (scroll) scrollToResultTop();
 }
 
 function resetFormState() {
   selectedRef = null;
   selectedIn = null;
+  lastStreamProbe = null;
   els.refPath.value = "";
   els.inPath.value = "";
   els.outPath.value = "";
   els.outPath.dataset.auto = "1";
   els.refFile.value = "";
   els.inputFile.value = "";
-  els.refStream.innerHTML = '<option value="">Auto (recommended)</option>';
-  els.refStream.value = "";
+  resetStreamSelectToAuto();
   els.streamWrap.hidden = true;
   if (els.vadMode.options.length > 0) els.vadMode.selectedIndex = 0;
   els.splitMode.value = "auto";
@@ -526,34 +641,50 @@ function applyAppVersion(rawVersion) {
   const clean = String(rawVersion || "").trim();
   if (!clean) return;
   const label = clean.startsWith("v") ? clean : `v${clean}`;
-  if (els.footerVersion && adapter && adapter.meta && adapter.meta.footerText) {
-    els.footerVersion.textContent = label;
-    els.footerVersion.hidden = false;
-  }
   if (els.settingsVersion && els.settingsFooter && adapter && adapter.capabilities && adapter.capabilities.settings) {
     els.settingsVersion.textContent = label;
     els.settingsFooter.hidden = false;
   }
 }
 
-function configureUiForAdapter(ad) {
-  const { meta, capabilities } = ad;
-  resetFormState();
+function populateLanguageSelect() {
+  if (!els.settingsLanguage) return;
+  const resolvedSysCode = i18n.getSystemResolvedLocale();
+  const resolvedSysMeta = i18n.getLocaleMeta(resolvedSysCode);
+  const sysLangName = (resolvedSysMeta && resolvedSysMeta.nativeName) || resolvedSysCode;
 
-  document.title = meta.pageTitle || "ffblindsubsync";
+  els.settingsLanguage.innerHTML = "";
+
+  const sysOpt = document.createElement("option");
+  sysOpt.value = SYSTEM_LANGUAGE;
+  const sysLabel = i18n.t("settings.languageSystem", { language: sysLangName });
+  sysOpt.dataset.fullLabel = sysLabel;
+  sysOpt.textContent = sysLabel;
+  els.settingsLanguage.appendChild(sysOpt);
+
+  for (const loc of i18n.getAvailableLocales()) {
+    const opt = document.createElement("option");
+    opt.value = loc.code;
+    opt.dataset.fullLabel = loc.nativeName;
+    opt.textContent = loc.nativeName;
+    els.settingsLanguage.appendChild(opt);
+  }
+
+  els.settingsLanguage.value = i18n.getPreference();
+  observeSelect(els.settingsLanguage);
+  fitSelectOptions(els.settingsLanguage);
+}
+
+function applyAdapterMeta(ad) {
+  if (!ad) return;
+  const { meta } = ad;
+  document.title = meta.pageTitle || i18n.t("app.title");
   if (meta.subtitle) {
     els.envSubtitle.textContent = meta.subtitle;
     els.envSubtitle.hidden = false;
   } else {
     els.envSubtitle.textContent = "";
     els.envSubtitle.hidden = true;
-  }
-  const hasTopbarStatus = Boolean(capabilities.topbarStatus);
-  if (els.topbarStatusPill) {
-    els.topbarStatusPill.hidden = !hasTopbarStatus;
-  }
-  if (hasTopbarStatus && els.runtimeCard) {
-    els.runtimeCard.hidden = true;
   }
   if (meta.badgeText) {
     els.envBadge.textContent = meta.badgeText;
@@ -563,15 +694,76 @@ function configureUiForAdapter(ad) {
   } else {
     els.envBadge.hidden = true;
   }
+  if (meta.refPlaceholder) els.refPath.placeholder = meta.refPlaceholder;
+  if (meta.inPlaceholder) els.inPath.placeholder = meta.inPlaceholder;
+  if (meta.footerText) {
+    if (els.footerText) {
+      els.footerText.textContent = meta.footerText;
+    } else {
+      els.footer.textContent = meta.footerText;
+    }
+    els.footer.hidden = false;
+  } else {
+    els.footer.hidden = true;
+  }
+}
+
+function applyLanguageToUi() {
+  i18n.applyTranslations(document);
+  populateLanguageSelect();
+  syncThemeToggleLabel(isDarkTheme());
+  syncMaximizedState(document.body.classList.contains("is-maximized"));
+
+  if (adapter) {
+    applyAdapterMeta(adapter);
+    if (lastFfmpegInfo) {
+      renderFfmpegDir(lastFfmpegInfo);
+    }
+    if (typeof adapter.retranslate === "function") {
+      adapter.retranslate();
+    }
+  }
+
+  if (lastStreamProbe) {
+    renderStreamProbe(lastStreamProbe, { preserveSelection: true });
+  } else {
+    resetStreamSelectToAuto();
+  }
+
+  refreshSyncBtn();
+
+  if (lastResult && !els.result.hidden) {
+    renderResult(lastResult, { scroll: false });
+  }
+
+  fitAllSelectOptions();
+}
+
+i18n.onChange(() => {
+  applyLanguageToUi();
+});
+
+function configureUiForAdapter(ad) {
+  const { meta, capabilities } = ad;
+  resetFormState();
+  applyAdapterMeta(ad);
+
+  const hasTopbarStatus = Boolean(capabilities.topbarStatus);
+  if (els.topbarStatusPill) {
+    els.topbarStatusPill.hidden = !hasTopbarStatus;
+  }
+  if (hasTopbarStatus && els.runtimeCard) {
+    els.runtimeCard.hidden = true;
+  }
   if (els.topbarActionsDivider) {
     els.topbarActionsDivider.hidden = !(hasTopbarStatus || Boolean(meta.badgeText));
   }
   if (els.settingsBtn) {
     els.settingsBtn.hidden = !capabilities.settings;
   }
-
-  els.refPath.placeholder = meta.refPlaceholder || els.refPath.placeholder;
-  els.inPath.placeholder = meta.inPlaceholder || els.inPath.placeholder;
+  if (els.settingsFfmpegCard) {
+    els.settingsFfmpegCard.hidden = !capabilities.ffmpegSettings;
+  }
 
   els.refPath.readOnly = !capabilities.editablePaths;
   els.inPath.readOnly = !capabilities.editablePaths;
@@ -587,24 +779,16 @@ function configureUiForAdapter(ad) {
     for (const mode of capabilities.vadModes) {
       const opt = document.createElement("option");
       opt.value = mode.value;
-      opt.dataset.fullLabel = mode.label;
-      opt.textContent = mode.label;
+      const label = mode.labelKey ? i18n.t(mode.labelKey) : mode.label;
+      if (mode.labelKey) opt.dataset.i18n = mode.labelKey;
+      opt.dataset.fullLabel = label;
+      opt.textContent = label;
       if (mode.selected) opt.selected = true;
       els.vadMode.appendChild(opt);
     }
   }
-  fitAllSelectOptions();
 
-  if (meta.footerText) {
-    if (els.footerText) {
-      els.footerText.textContent = meta.footerText;
-    } else {
-      els.footer.textContent = meta.footerText;
-    }
-    els.footer.hidden = false;
-  } else {
-    els.footer.hidden = true;
-  }
+  applyLanguageToUi();
 
   if (meta.appVersion) {
     applyAppVersion(meta.appVersion);
@@ -780,7 +964,7 @@ function wireEvents(ad) {
     els.runtimeActionBtn.addEventListener("click", () => ad.runRuntimeAction());
   }
 
-  if (capabilities.settings && ad.settings) {
+  if (capabilities.settings) {
     if (els.settingsBtn) {
       els.settingsBtn.addEventListener("click", () => setSettingsOpen(!settingsOpen));
     }
@@ -793,22 +977,34 @@ function wireEvents(ad) {
       }
     });
 
-    if (els.settingsFfChange) {
-      els.settingsFfChange.addEventListener("click", async () => {
-        const picked = await ad.settings.pickFfmpegDir();
-        if (picked) {
-          await ad.settings.setFfmpegPath(picked);
-          if (hasSelection(selectedRef)) {
-            refreshStreams(selectedRef);
-          }
+    if (els.settingsLanguage) {
+      els.settingsLanguage.addEventListener("change", () => {
+        const nextPref = els.settingsLanguage.value || SYSTEM_LANGUAGE;
+        i18n.setPreference(nextPref, { persist: true });
+        if (typeof ad.onLanguageChange === "function") {
+          ad.onLanguageChange(i18n.getPreference());
         }
       });
     }
-    if (els.settingsFfOpen) {
-      els.settingsFfOpen.addEventListener("click", () => ad.settings.openFfmpegFolder());
-    }
-    if (els.settingsFfDownload && ad.runRuntimeAction) {
-      els.settingsFfDownload.addEventListener("click", () => ad.runRuntimeAction());
+
+    if (capabilities.ffmpegSettings && ad.settings) {
+      if (els.settingsFfChange) {
+        els.settingsFfChange.addEventListener("click", async () => {
+          const picked = await ad.settings.pickFfmpegDir();
+          if (picked) {
+            await ad.settings.setFfmpegPath(picked);
+            if (hasSelection(selectedRef)) {
+              refreshStreams(selectedRef);
+            }
+          }
+        });
+      }
+      if (els.settingsFfOpen) {
+        els.settingsFfOpen.addEventListener("click", () => ad.settings.openFfmpegFolder());
+      }
+      if (els.settingsFfDownload && ad.runRuntimeAction) {
+        els.settingsFfDownload.addEventListener("click", () => ad.runRuntimeAction());
+      }
     }
   }
 
@@ -821,8 +1017,9 @@ function wireEvents(ad) {
   els.syncBtn.addEventListener("click", async () => {
     if (busy || !runtimeReady || !hasSelection(selectedRef) || !hasSelection(selectedIn)) return;
     busy = true;
+    lastSyncProgress = { messageKey: "form.startingSync", messageParams: null };
     refreshSyncBtn();
-    els.syncBtn.textContent = "Starting sync…";
+    els.syncBtn.textContent = i18n.t("form.startingSync");
     els.result.hidden = true;
     els.result.classList.remove("error");
     setProgressBar(els.syncProg, els.syncFill, els.syncPct, { active: true, fraction: null });
@@ -857,8 +1054,14 @@ function wireEvents(ad) {
           gss: Boolean(els.gss.checked),
         },
         {
-          onProgress: ({ message, fraction }) => {
-            if (message) els.syncBtn.textContent = message;
+          onProgress: ({ message, messageKey, messageParams, fraction }) => {
+            if (messageKey) {
+              lastSyncProgress = { messageKey, messageParams: messageParams || null };
+              els.syncBtn.textContent = i18n.t(messageKey, messageParams);
+            } else if (message) {
+              lastSyncProgress = null;
+              els.syncBtn.textContent = message;
+            }
             setProgressBar(els.syncProg, els.syncFill, els.syncPct, {
               active: true,
               fraction,
@@ -871,6 +1074,7 @@ function wireEvents(ad) {
     }
 
     busy = false;
+    lastSyncProgress = null;
     setProgressBar(els.syncProg, els.syncFill, els.syncPct, { active: false, fraction: null });
     refreshSyncBtn();
     renderResult(res);
@@ -885,6 +1089,7 @@ async function boot() {
   adapter = mod.createAdapter({
     version: V,
     withVersion,
+    i18n,
     callbacks: {
       onRuntimeStatus: applyRuntimeStatus,
       onRuntimeProgress: (prog) => {
@@ -915,7 +1120,7 @@ async function boot() {
 
 boot().catch((err) => {
   console.error(err);
-  const msg = "Error: " + ((err && err.message) || err);
+  const msg = i18n.t("status.errorPrefix", { error: (err && err.message) || err });
   if (els.topbarStatusDot) els.topbarStatusDot.className = "dot err";
   if (els.topbarStatusPill) {
     els.topbarStatusPill.className = "status-pill topbar-status err";

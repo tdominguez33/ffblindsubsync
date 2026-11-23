@@ -15,6 +15,13 @@ datas = [
         os.path.join("ui", "adapters"),
     ),
 ]
+i18n_root = os.path.join(repo_root, "ui", "i18n")
+if os.path.isdir(i18n_root):
+    for root, _, files in os.walk(i18n_root):
+        rel_dir = os.path.relpath(root, os.path.join(repo_root, "ui"))
+        dest_dir = os.path.join("ui", rel_dir)
+        for fname in sorted(files):
+            datas.append((os.path.join(root, fname), dest_dir))
 icon_path = os.path.join(gui_dir, "icon.ico")
 if os.path.exists(icon_path):
     datas.append((icon_path, "."))

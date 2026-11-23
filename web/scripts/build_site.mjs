@@ -46,6 +46,21 @@ async function computeBuildHash(files) {
   return hash.digest("hex").slice(0, 8);
 }
 
+async function listFilesRecursive(dir) {
+  const out = [];
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...(await listFilesRecursive(full)));
+    } else {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 async function copyDir(src, dest, { excludeNames = new Set() } = {}) {
   await fs.mkdir(dest, { recursive: true });
   const entries = await fs.readdir(src, { withFileTypes: true });
@@ -63,11 +78,13 @@ async function copyDir(src, dest, { excludeNames = new Set() } = {}) {
 
 async function main() {
   const appVersion = await getAppVersion();
+  const i18nFiles = await listFilesRecursive(path.join(uiDir, "i18n"));
   const buildHash = await computeBuildHash([
     path.join(uiDir, "index.html"),
     path.join(uiDir, "styles.css"),
     path.join(uiDir, "app.js"),
     path.join(uiDir, "adapters", "web.js"),
+    ...i18nFiles,
     path.join(guiDir, "icon.ico"),
     path.join(webDir, "build.config.json"),
     path.join(webDir, "src", "worker.js"),
@@ -81,10 +98,21 @@ async function main() {
   await fs.rm(distDir, { recursive: true, force: true });
   await fs.mkdir(path.join(distDir, "adapters"), { recursive: true });
 
-  // Shared UI assets + web backend adapter
-  for (const file of ["styles.css", "app.js"]) {
-    await fs.copyFile(path.join(uiDir, file), path.join(distDir, file));
-  }
+  // Shared UI assets + i18n locales + web backend adapter
+  await fs.copyFile(path.join(uiDir, "styles.css"), path.join(distDir, "styles.css"));
+  const rawAppJs = await fs.readFile(path.join(uiDir, "app.js"), "utf8");
+  await fs.writeFile(
+    path.join(distDir, "app.js"),
+    rawAppJs.replace('from "./i18n/index.js"', `from "./i18n/index.js?v=${cacheVersion}"`),
+    "utf8",
+  );
+  await copyDir(path.join(uiDir, "i18n"), path.join(distDir, "i18n"));
+  const rawI18nIndex = await fs.readFile(path.join(distDir, "i18n", "index.js"), "utf8");
+  await fs.writeFile(
+    path.join(distDir, "i18n", "index.js"),
+    rawI18nIndex.replace(/from\s+"(\.\/locales\/[^"]+\.js)"/g, `from "$1?v=${cacheVersion}"`),
+    "utf8",
+  );
   await fs.copyFile(
     path.join(uiDir, "adapters", "web.js"),
     path.join(distDir, "adapters", "web.js"),

@@ -45,11 +45,11 @@
         <div class="topbar-actions">
           <span class="status-pill topbar-status" id="topbar-status-pill" hidden>
             <span class="dot" id="topbar-status-dot"></span>
-            <span id="status">Initializing…</span>
+            <span id="status" data-i18n="status.initializing">Initializing…</span>
           </span>
           <span class="badge" id="env-badge" hidden></span>
           <div class="topbar-divider" id="topbar-actions-divider" hidden></div>
-          <button type="button" class="icon-btn" id="settings-btn" title="Settings" aria-label="Settings" hidden>
+          <button type="button" class="icon-btn" id="settings-btn" title="Settings" aria-label="Settings" data-i18n-title="topbar.settings" data-i18n-aria-label="topbar.settings" hidden>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"></path>
               <circle cx="12" cy="12" r="3"></circle>
@@ -76,7 +76,7 @@
         <div class="topbar-divider" id="win-controls-divider" hidden></div>
 
         <div class="win-controls" id="win-controls" hidden>
-          <button type="button" class="win-btn" id="win-minimize" title="Minimize" aria-label="Minimize">
+          <button type="button" class="win-btn" id="win-minimize" title="Minimize" aria-label="Minimize" data-i18n-title="topbar.minimize" data-i18n-aria-label="topbar.minimize">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true">
               <line x1="3" y1="8" x2="13" y2="8"></line>
             </svg>
@@ -90,7 +90,7 @@
               <rect x="3" y="5" width="8" height="8" rx="0.5"></rect>
             </svg>
           </button>
-          <button type="button" class="win-btn close" id="win-close" title="Close" aria-label="Close">
+          <button type="button" class="win-btn close" id="win-close" title="Close" aria-label="Close" data-i18n-title="topbar.close" data-i18n-aria-label="topbar.close">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true">
               <line x1="3.5" y1="3.5" x2="12.5" y2="12.5"></line>
               <line x1="12.5" y1="3.5" x2="3.5" y2="12.5"></line>
@@ -126,7 +126,7 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"></path>
               </svg>
-              <span>Open folder</span>
+              <span data-i18n="result.openFolder">Open folder</span>
             </button>
             <a class="btn primary" id="download" href="#" hidden>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -134,7 +134,7 @@
                 <polyline points="7 10 12 15 17 10"></polyline>
                 <line x1="12" x2="12" y1="15" y2="3"></line>
               </svg>
-              <span>Download</span>
+              <span data-i18n="result.download">Download</span>
             </a>
           </div>
         </div>
@@ -145,7 +145,7 @@
           <div class="runtime-info">
             <span class="status-pill" id="runtime-pill">
               <span class="dot" id="runtime-dot"></span>
-              <span id="runtime-status-text">Initializing…</span>
+              <span id="runtime-status-text" data-i18n="status.initializing">Initializing…</span>
             </span>
           </div>
           <div class="actions">
@@ -174,16 +174,16 @@
               <path d="M17 7.5h4"></path>
               <path d="M17 16.5h4"></path>
             </svg>
-            <span>Reference video / audio / subtitle</span>
+            <span data-i18n="form.refLabel">Reference video / audio / subtitle</span>
           </span>
-          <span class="hint">Drag &amp; drop or browse</span>
+          <span class="hint" data-i18n="form.refHint">Drag &amp; drop or browse</span>
         </div>
         <div class="path-row">
           <div class="drop-zone" id="drop-ref">
-            <input type="text" id="ref-path" autocomplete="off" placeholder="Drop or browse movie.mkv, audio, or reference.srt" />
+            <input type="text" id="ref-path" autocomplete="off" placeholder="Drop or browse movie.mkv, audio, or reference.srt" data-i18n-placeholder="form.refPlaceholder" />
             <input type="file" id="ref-file" autocomplete="off" hidden />
           </div>
-          <button type="button" class="secondary" id="browse-ref">Browse…</button>
+          <button type="button" class="secondary" id="browse-ref" data-i18n="form.browse">Browse…</button>
         </div>
         <div id="stream-wrap" class="sub-field" hidden>
           <div class="field-label">
@@ -196,12 +196,12 @@
                 <path d="M18 5v13"></path>
                 <path d="M22 10v3"></path>
               </svg>
-              <span>Track / Stream</span>
+              <span data-i18n="form.streamLabel">Track / Stream</span>
             </span>
-            <span class="hint" id="stream-hint">Auto</span>
+            <span class="hint" id="stream-hint" data-i18n="form.streamHintAuto">Auto</span>
           </div>
           <select id="ref-stream">
-            <option value="">Auto (recommended)</option>
+            <option value="" data-i18n="form.streamAutoOption">Auto (recommended)</option>
           </select>
         </div>
       </div>
@@ -216,16 +216,16 @@
               <path d="M16 13H8"></path>
               <path d="M16 17H8"></path>
             </svg>
-            <span>Subtitles to sync</span>
+            <span data-i18n="form.inLabel">Subtitles to sync</span>
           </span>
           <span class="hint">.srt / .ass / .ssa / .sub / .vtt</span>
         </div>
         <div class="path-row">
           <div class="drop-zone" id="drop-in">
-            <input type="text" id="in-path" autocomplete="off" placeholder="Drop or browse subtitles.srt" />
+            <input type="text" id="in-path" autocomplete="off" placeholder="Drop or browse subtitles.srt" data-i18n-placeholder="form.inPlaceholder" />
             <input type="file" id="input-file" autocomplete="off" hidden />
           </div>
-          <button type="button" class="secondary" id="browse-in">Browse…</button>
+          <button type="button" class="secondary" id="browse-in" data-i18n="form.browse">Browse…</button>
         </div>
       </div>
 
@@ -235,13 +235,13 @@
             <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path>
             </svg>
-            <span>Output file</span>
+            <span data-i18n="form.outLabel">Output file</span>
           </span>
-          <span class="hint">Auto-filled next to input</span>
+          <span class="hint" data-i18n="form.outHint">Auto-filled next to input</span>
         </div>
         <div class="path-row">
-          <input type="text" id="out-path" placeholder="C:\path\to\subtitles.synced.srt" />
-          <button type="button" class="secondary" id="browse-out">Save as…</button>
+          <input type="text" id="out-path" placeholder="C:\path\to\subtitles.synced.srt" data-i18n-placeholder="form.outPlaceholder" />
+          <button type="button" class="secondary" id="browse-out" data-i18n="form.saveAs">Save as…</button>
         </div>
       </div>
     </div>
@@ -262,15 +262,23 @@
                 <line x1="8" x2="8" y1="10" y2="14"></line>
                 <line x1="16" x2="16" y1="18" y2="22"></line>
               </svg>
-              <span>Reference Mode</span>
+              <span data-i18n="form.vadModeLabel">Reference Mode</span>
+              <span class="help-tip" tabindex="0" role="note" aria-label="Chooses how speech is detected in the reference video. Embedded Subs tries built-in subtitles first and falls back to Audio VAD; higher KHz is more accurate, lower KHz is faster." data-i18n-aria-label="form.vadModeHelp">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+                  <path d="M12 17h.01"></path>
+                </svg>
+                <span class="help-tip-bubble" role="tooltip" data-i18n="form.vadModeHelp">Chooses how speech is detected in the reference video. Embedded Subs tries built-in subtitles first and falls back to Audio VAD; higher KHz is more accurate, lower KHz is faster.</span>
+              </span>
             </span>
           </div>
           <select id="vad-mode">
-            <option value="subs_then_webrtc:48000" selected>Embedded Subs → 48 KHz Audio VAD</option>
-            <option value="subs_then_webrtc:16000">Embedded Subs → 16 KHz Audio VAD (faster)</option>
-            <option value="webrtc:48000">48 KHz Audio VAD</option>
-            <option value="webrtc:32000">32 KHz Audio VAD</option>
-            <option value="webrtc:16000">16 KHz Audio VAD (faster)</option>
+            <option value="subs_then_webrtc:48000" data-i18n="form.vadSubs48" selected>Embedded Subs → 48 KHz Audio VAD</option>
+            <option value="subs_then_webrtc:16000" data-i18n="form.vadSubs16">Embedded Subs → 16 KHz Audio VAD</option>
+            <option value="webrtc:48000" data-i18n="form.vad48">48 KHz Audio VAD</option>
+            <option value="webrtc:32000" data-i18n="form.vad32">32 KHz Audio VAD</option>
+            <option value="webrtc:16000" data-i18n="form.vad16">16 KHz Audio VAD</option>
           </select>
         </div>
         <div>
@@ -283,31 +291,59 @@
                 <circle cx="6" cy="18" r="3"></circle>
                 <path d="M14.8 14.8 20 20"></path>
               </svg>
-              <span>Mid-file breaks</span>
+              <span data-i18n="form.splitModeLabel">Mid-file breaks</span>
+              <span class="help-tip tip-align-end" tabindex="0" role="note" aria-label="Handles sudden timing jumps mid-video (e.g. cut ads or extra scenes). Auto-detect fixes clear breaks safely, Off uses a single global offset, and Aggressive searches harder for splits." data-i18n-aria-label="form.splitModeHelp">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+                  <path d="M12 17h.01"></path>
+                </svg>
+                <span class="help-tip-bubble" role="tooltip" data-i18n="form.splitModeHelp">Handles sudden timing jumps mid-video (e.g. cut ads or extra scenes). Auto-detect fixes clear breaks safely, Off uses a single global offset, and Aggressive searches harder for splits.</span>
+              </span>
             </span>
           </div>
           <select id="split-mode">
-            <option value="auto" selected>Auto-detect (safe, recommended)</option>
-            <option value="off">Off (single global offset)</option>
-            <option value="force">Aggressive (--split-penalty)</option>
+            <option value="auto" data-i18n="form.splitAuto" selected>Auto-detect (safe, recommended)</option>
+            <option value="off" data-i18n="form.splitOff">Off (single global offset)</option>
+            <option value="force" data-i18n="form.splitForce">Aggressive (--split-penalty)</option>
           </select>
         </div>
       </div>
 
       <div class="options">
-        <label class="switch-label">
-          <input type="checkbox" id="no-fix-framerate" />
-          <span>Don't fix framerate</span>
-        </label>
-        <label class="switch-label">
-          <input type="checkbox" id="gss" />
-          <span>Golden-section search</span>
-        </label>
+        <div class="option-item">
+          <label class="switch-label">
+            <input type="checkbox" id="no-fix-framerate" />
+            <span data-i18n="form.noFixFramerate">Don't fix framerate</span>
+          </label>
+          <span class="help-tip" tabindex="0" role="note" aria-label="Only shifts subtitles by a constant offset without stretching or compressing their speed to fix FPS mismatches (e.g. 23.976 vs 25 fps)." data-i18n-aria-label="form.noFixFramerateHelp">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"></circle>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+              <path d="M12 17h.01"></path>
+            </svg>
+            <span class="help-tip-bubble" role="tooltip" data-i18n="form.noFixFramerateHelp">Only shifts subtitles by a constant offset without stretching or compressing their speed to fix FPS mismatches (e.g. 23.976 vs 25 fps).</span>
+          </span>
+        </div>
+        <div class="option-item">
+          <label class="switch-label">
+            <input type="checkbox" id="gss" />
+            <span data-i18n="form.gss">Golden-section search</span>
+          </label>
+          <span class="help-tip" tabindex="0" role="note" aria-label="Searches continuously for the exact optimal framerate ratio between video and subtitles instead of testing only standard FPS pairs. Slower, but helpful for unusual speed drift." data-i18n-aria-label="form.gssHelp">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"></circle>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+              <path d="M12 17h.01"></path>
+            </svg>
+            <span class="help-tip-bubble" role="tooltip" data-i18n="form.gssHelp">Searches continuously for the exact optimal framerate ratio between video and subtitles instead of testing only standard FPS pairs. Slower, but helpful for unusual speed drift.</span>
+          </span>
+        </div>
       </div>
     </div>
 
     <div>
-      <button type="button" class="primary" id="sync-btn" disabled>Sync subtitles</button>
+      <button type="button" class="primary" id="sync-btn" data-i18n="form.syncBtn" disabled>Sync subtitles</button>
       <div class="progress" id="sync-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden>
         <div class="progress-track">
           <div class="progress-fill" id="sync-fill"></div>
@@ -318,14 +354,13 @@
 
       <footer id="app-footer" hidden>
         <p id="footer-text"></p>
-        <p id="footer-version" class="app-version" hidden></p>
       </footer>
     </div>
 
     <div id="settings-view" class="view-stack" hidden>
       <div class="settings-header">
-        <h2>Settings</h2>
-        <button type="button" class="icon-btn" id="settings-close-btn" title="Close settings" aria-label="Close settings">
+        <h2 data-i18n="settings.title">Settings</h2>
+        <button type="button" class="icon-btn" id="settings-close-btn" title="Close settings" aria-label="Close settings" data-i18n-title="settings.close" data-i18n-aria-label="settings.close">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M18 6 6 18"></path>
             <path d="m6 6 12 12"></path>
@@ -333,7 +368,30 @@
         </button>
       </div>
 
-      <div class="card settings-card">
+      <div class="card settings-card" id="settings-language-card">
+        <div class="settings-row">
+          <div class="settings-card-title">
+            <h3>
+              <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"></path>
+                <path d="M2 12h20"></path>
+              </svg>
+              <span data-i18n="settings.languageTitle">Language</span>
+            </h3>
+            <p class="settings-desc" data-i18n="settings.languageDesc">
+              Choose the display language for the interface.
+            </p>
+          </div>
+          <div class="settings-control">
+            <select id="settings-language" aria-label="Language" data-i18n-aria-label="settings.languageTitle">
+              <option value="system">System default</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="card settings-card" id="settings-ffmpeg-card">
         <div class="settings-card-head">
           <div class="settings-card-title">
             <h3>
@@ -341,15 +399,15 @@
                 <polyline points="4 17 10 11 4 5"></polyline>
                 <line x1="12" x2="20" y1="19" y2="19"></line>
               </svg>
-              <span>FFmpeg</span>
+              <span data-i18n="settings.ffmpegTitle">FFmpeg</span>
             </h3>
-            <p class="settings-desc">
+            <p class="settings-desc" data-i18n-html="settings.ffmpegDescHtml">
               Folder containing <code>ffmpeg</code> and <code>ffprobe</code> used for media analysis and audio extraction.
             </p>
           </div>
           <span class="status-pill" id="settings-ff-pill">
             <span class="dot" id="settings-ff-dot"></span>
-            <span id="settings-ff-status">Checking FFmpeg…</span>
+            <span id="settings-ff-status" data-i18n="ffmpeg.checking">Checking FFmpeg…</span>
           </span>
         </div>
 
@@ -358,16 +416,16 @@
             <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path>
             </svg>
-            <span class="settings-path-text" id="settings-ff-dir">Auto-detect</span>
+            <span class="settings-path-text" id="settings-ff-dir" data-i18n="settings.ffmpegAutoDetect">Auto-detect</span>
           </div>
           <div class="settings-path-actions">
             <button type="button" class="primary settings-change-btn" id="settings-ff-change">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"></path>
               </svg>
-              <span>Change</span>
+              <span data-i18n="settings.ffmpegChange">Change</span>
             </button>
-            <button type="button" class="secondary settings-open-btn" id="settings-ff-open" title="Open folder in Explorer" aria-label="Open folder in Explorer">
+            <button type="button" class="secondary settings-open-btn" id="settings-ff-open" title="Open folder in Explorer" aria-label="Open folder in Explorer" data-i18n-title="settings.ffmpegOpenFolder" data-i18n-aria-label="settings.ffmpegOpenFolder">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M15 3h6v6"></path>
                 <path d="M10 14 21 3"></path>
@@ -380,8 +438,8 @@
         <div class="settings-divider">
           <div class="settings-row">
             <div class="settings-row-info">
-              <span class="settings-row-title">Download / Update</span>
-              <span class="settings-desc">Download or update the latest FFmpeg build into the selected folder.</span>
+              <span class="settings-row-title" data-i18n="settings.ffmpegDownloadTitle">Download / Update</span>
+              <span class="settings-desc" data-i18n="settings.ffmpegDownloadDesc">Download or update the latest FFmpeg build into the selected folder.</span>
             </div>
             <button type="button" class="secondary" id="settings-ff-download">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -389,7 +447,7 @@
                 <polyline points="7 10 12 15 17 10"></polyline>
                 <line x1="12" x2="12" y1="15" y2="3"></line>
               </svg>
-              <span id="settings-ff-download-label">Download latest FFmpeg</span>
+              <span id="settings-ff-download-label" data-i18n="ffmpeg.downloadLatestBtn">Download latest FFmpeg</span>
             </button>
           </div>
           <div class="progress" id="settings-ff-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden>
