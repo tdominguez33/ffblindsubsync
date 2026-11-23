@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ffblindsubsync"
-version = "0.2.0"
+version = "0.3.0"
 description = "Language-agnostic synchronization of subtitles with video."
 readme = "README.md"
 license = "MIT"
