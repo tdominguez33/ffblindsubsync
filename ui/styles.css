@@ -277,6 +277,8 @@ body.is-desktop main {
   font-weight: 400;
   color: var(--faint);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .topbar-right {
@@ -284,6 +286,7 @@ body.is-desktop main {
   align-items: center;
   height: 100%;
   gap: 0.4rem;
+  flex: none;
 }
 
 .topbar-actions {
@@ -452,6 +455,10 @@ main {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+}
+
+main:has(#main-view:not([hidden]) #status-row:not([hidden])) {
+  padding-top: 0.5rem;
 }
 
 .view-stack {
@@ -728,9 +735,20 @@ main {
   text-overflow: ellipsis;
 }
 
+.status-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-bottom: -0.25rem;
+}
+
 .topbar-status {
   max-width: 240px;
   white-space: nowrap;
+}
+
+.status-row .topbar-status {
+  max-width: 100%;
 }
 
 /* Form fields */
@@ -738,7 +756,8 @@ main {
   margin-bottom: 0.9rem;
 }
 
-.field:last-child {
+.field:last-child,
+.field:not(:has(~ :not([hidden]))) {
   margin-bottom: 0;
 }
 
@@ -961,6 +980,14 @@ input[type="text"][readonly] {
   align-items: center;
   padding-top: 0.75rem;
   border-top: 1px solid var(--border-subtle);
+}
+
+@media (max-width: 600px) {
+  .options {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.65rem;
+  }
 }
 
 .option-item {

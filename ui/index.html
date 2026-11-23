@@ -42,7 +42,7 @@
       <div class="drag-spacer" id="drag-spacer"></div>
 
       <div class="topbar-right">
-        <div class="topbar-actions">
+        <div class="topbar-actions" id="topbar-actions">
           <span class="status-pill topbar-status" id="topbar-status-pill" hidden>
             <span class="dot" id="topbar-status-dot"></span>
             <span id="status" data-i18n="status.initializing">Initializing…</span>
@@ -103,6 +103,8 @@
 
   <main>
     <div id="main-view" class="view-stack">
+      <div class="status-row" id="status-row" hidden></div>
+
       <div class="card" id="result" hidden>
         <div class="result-row">
           <div class="result-left">

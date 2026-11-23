@@ -10,7 +10,9 @@ const withVersion = (url) => (V ? url + (url.includes("?") ? "&" : "?") + "v=" +
 const els = {
   envSubtitle: document.getElementById("env-subtitle"),
   envBadge: document.getElementById("env-badge"),
+  topbarActions: document.getElementById("topbar-actions"),
   topbarActionsDivider: document.getElementById("topbar-actions-divider"),
+  statusRow: document.getElementById("status-row"),
   topbarStatusPill: document.getElementById("topbar-status-pill"),
   topbarStatusDot: document.getElementById("topbar-status-dot"),
   status: document.getElementById("status"),
@@ -743,20 +745,62 @@ i18n.onChange(() => {
   applyLanguageToUi();
 });
 
+const narrowLayoutMq =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(max-width: 600px)")
+    : null;
+
+function syncStatusPillPlacement() {
+  if (!els.topbarStatusPill || !els.statusRow || !els.topbarActions) return;
+  const hasTopbarStatus = Boolean(adapter && adapter.capabilities && adapter.capabilities.topbarStatus);
+  const hasBadge = Boolean(adapter && adapter.meta && adapter.meta.badgeText);
+  if (!hasTopbarStatus) {
+    els.statusRow.hidden = true;
+    els.topbarStatusPill.hidden = true;
+    if (els.topbarActionsDivider) {
+      els.topbarActionsDivider.hidden = !hasBadge;
+    }
+    return;
+  }
+  const isNarrow = Boolean(narrowLayoutMq && narrowLayoutMq.matches);
+  if (isNarrow) {
+    if (els.topbarStatusPill.parentElement !== els.statusRow) {
+      els.statusRow.appendChild(els.topbarStatusPill);
+    }
+    els.statusRow.hidden = false;
+    els.topbarStatusPill.hidden = false;
+    if (els.topbarActionsDivider) {
+      els.topbarActionsDivider.hidden = !hasBadge;
+    }
+  } else {
+    if (els.topbarStatusPill.parentElement !== els.topbarActions) {
+      els.topbarActions.prepend(els.topbarStatusPill);
+    }
+    els.statusRow.hidden = true;
+    els.topbarStatusPill.hidden = false;
+    if (els.topbarActionsDivider) {
+      els.topbarActionsDivider.hidden = false;
+    }
+  }
+}
+
+if (narrowLayoutMq) {
+  if (typeof narrowLayoutMq.addEventListener === "function") {
+    narrowLayoutMq.addEventListener("change", syncStatusPillPlacement);
+  } else if (typeof narrowLayoutMq.addListener === "function") {
+    narrowLayoutMq.addListener(syncStatusPillPlacement);
+  }
+}
+
 function configureUiForAdapter(ad) {
   const { meta, capabilities } = ad;
   resetFormState();
   applyAdapterMeta(ad);
 
   const hasTopbarStatus = Boolean(capabilities.topbarStatus);
-  if (els.topbarStatusPill) {
-    els.topbarStatusPill.hidden = !hasTopbarStatus;
-  }
+  syncStatusPillPlacement();
   if (hasTopbarStatus && els.runtimeCard) {
     els.runtimeCard.hidden = true;
-  }
-  if (els.topbarActionsDivider) {
-    els.topbarActionsDivider.hidden = !(hasTopbarStatus || Boolean(meta.badgeText));
   }
   if (els.settingsBtn) {
     els.settingsBtn.hidden = !capabilities.settings;
@@ -1121,6 +1165,9 @@ async function boot() {
 boot().catch((err) => {
   console.error(err);
   const msg = i18n.t("status.errorPrefix", { error: (err && err.message) || err });
+  if (els.statusRow && els.topbarStatusPill && els.topbarStatusPill.parentElement === els.statusRow) {
+    els.statusRow.hidden = false;
+  }
   if (els.topbarStatusDot) els.topbarStatusDot.className = "dot err";
   if (els.topbarStatusPill) {
     els.topbarStatusPill.className = "status-pill topbar-status err";
