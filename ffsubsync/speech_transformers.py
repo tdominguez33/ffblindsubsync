@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from datetime import timedelta
 from typing import cast, Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -18,6 +19,7 @@ import tqdm
 from ffsubsync.constants import (
     DEFAULT_ENCODING,
     DEFAULT_MAX_SUBTITLE_SECONDS,
+    DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
     DEFAULT_SCALE_FACTOR,
     DEFAULT_START_SECONDS,
     DEFAULT_WHISPER_LANGUAGE,
@@ -107,56 +109,88 @@ def make_subtitle_speech_pipeline(
         return subpipe_maker(scale_factor)
 
 
+def _parse_auditok_spec(vad: str) -> str:
+    """Extract the parameter from an ``auditok[:spec]`` vad name (with or
+    without a ``subs_then_`` prefix). Bare ``auditok`` means ``auto``."""
+    base = vad.split("subs_then_")[-1]
+    return base.split(":", 1)[1] if ":" in base else "auto"
+
+
 def _make_auditok_detector(
-    sample_rate: int, frame_rate: int, non_speech_label: float
+    sample_rate: int,
+    frame_rate: int,
+    non_speech_label: float,
+    vad_spec: str = "auto",
 ) -> Callable[[bytes], np.ndarray]:
     try:
-        from auditok import (
-            BufferAudioSource,
-            ADSFactory,
-            AudioEnergyValidator,
-            StreamTokenizer,
-        )
+        import auditok
     except ImportError as e:
         logger.error(
-            """Error: auditok not installed!
-        Consider installing it with `pip install auditok`. Note that auditok
-        is GPLv3 licensed, which means that successfully importing it at
-        runtime creates a derivative work that is GPLv3 licensed. For personal
-        use this is fine, but note that any commercial use that relies on
-        auditok must be open source as per the GPLv3!*
-        *Not legal advice. Consult with a lawyer.
-        """
+            "Error: auditok not installed!\n"
+            "        Consider installing it with `pip install auditok` "
+            "(MIT-licensed since v0.2)."
         )
         raise e
+    if vad_spec.startswith("webrtc"):
+        try:
+            import webrtcvad  # noqa: F401
+        except ImportError as e:
+            logger.error(
+                "Error: the auditok:webrtc detector requires the webrtcvad "
+                "package (`pip install webrtcvad-wheels`)."
+            )
+            raise e
+    # A numeric spec is a fixed energy threshold in dB on auditok's scale
+    # (the historical hard-coded value was 50); anything else ("otsu",
+    # "pXX", "webrtc[:N]") is an auditok validator spec. "auto" is otsu,
+    # auditok's default estimation method; estimation runs per chunk
+    # (~100 s), so the threshold adapts across the reference.
+    if vad_spec == "auto":
+        vad_spec = "otsu"
+    try:
+        threshold_kwargs: Dict[str, Any] = {"energy_threshold": float(vad_spec)}
+    except ValueError:
+        threshold_kwargs = {"validator": vad_spec}
+    # threshold estimation degenerates on silent chunks (see the guard in
+    # _detect); fixed thresholds and the webrtc backend need no guard
+    estimates_threshold = "validator" in threshold_kwargs and not vad_spec.startswith(
+        "webrtc"
+    )
     bytes_per_frame = 2
     frames_per_window = frame_rate // sample_rate
-    validator = AudioEnergyValidator(sample_width=bytes_per_frame, energy_threshold=50)
-    tokenizer = StreamTokenizer(
-        validator=validator,
-        min_length=0.2 * sample_rate,
-        max_length=int(5 * sample_rate),
-        max_continuous_silence=0.25 * sample_rate,
-    )
 
-    def _detect(asegment: bytes) -> np.ndarray:
-        asource = BufferAudioSource(
-            data_buffer=asegment,
-            sampling_rate=frame_rate,
-            sample_width=bytes_per_frame,
-            channels=1,
-        )
-        ads = ADSFactory.ads(audio_source=asource, block_dur=1.0 / sample_rate)
-        ads.open()
-        tokens = tokenizer.tokenize(ads)
+    def _detect(asegment) -> np.ndarray:
+        if isinstance(asegment, np.ndarray):
+            asegment = asegment.tobytes()
         length = (
             len(asegment) // bytes_per_frame + frames_per_window - 1
         ) // frames_per_window
-        media_bstring = np.zeros(length + 1)
-        for token in tokens:
-            media_bstring[token[1]] = 1.0
-            media_bstring[token[2] + 1] = non_speech_label - 1.0
-        return np.clip(np.cumsum(media_bstring)[:-1], 0.0, 1.0)
+        media_bstring = np.full(length, non_speech_label)
+        # auditok >= 0.5.1 yields no events when estimating on digitally
+        # silent input, but a *near*-silent chunk -- e.g. a dithered black
+        # leader or credits -- still has no usable energy distribution, and
+        # an estimated threshold can mark the whole chunk as speech. 25 dB
+        # on auditok's scale (peak ~ -65 dBFS) is far below any speech.
+        if estimates_threshold:
+            peak = np.abs(np.frombuffer(asegment, np.int16)).max(initial=1)
+            if 20 * np.log10(peak) < 25.0:
+                return media_bstring
+        events = auditok.split(
+            asegment,
+            sampling_rate=frame_rate,
+            sample_width=bytes_per_frame,
+            channels=1,
+            analysis_window=1.0 / sample_rate,
+            min_dur=0.2,
+            max_dur=5,
+            max_silence=0.25,
+            **threshold_kwargs,
+        )
+        for event in events:
+            start = int(event.start * sample_rate)
+            end = min(int(round(event.end * sample_rate)), length)
+            media_bstring[start:end] = 1.0
+        return media_bstring
 
     return _detect
 
@@ -273,32 +307,61 @@ def _is_deprioritized_sub_track(
     return any(tok in low for tok in ("forced", "commentary", "signs", "songs"))
 
 
-def _probe_embedded_subtitle_streams(
+def _is_sdh_sub_track(title: str = "", hearing_impaired: Any = 0) -> bool:
+    """Return True if a subtitle track is SDH / closed-captions (hearing impaired)."""
+    if str(hearing_impaired).strip() in ("1", "true", "True"):
+        return True
+    low = (title or "").lower()
+    return bool(
+        re.search(r"\b(sdh|cc|hi)\b", low)
+        or "hearing impaired" in low
+        or "closed caption" in low
+    )
+
+
+def _normalize_lang_code(lang: Any) -> str:
+    code = str(lang or "").strip().lower()
+    return "" if code in ("", "und", "unk", "unknown") else code
+
+
+def _primary_audio_language(streams: List[Dict[str, Any]]) -> str:
+    """Return the normalized language code of the primary audio stream, or ''."""
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    if not audio_streams:
+        return ""
+    for s in audio_streams:
+        disp = s.get("disposition") or {}
+        if disp.get("default") and not disp.get("comment"):
+            return _normalize_lang_code((s.get("tags") or {}).get("language"))
+    for s in audio_streams:
+        disp = s.get("disposition") or {}
+        title = str((s.get("tags") or {}).get("title") or "").lower()
+        if not disp.get("comment") and "commentary" not in title:
+            return _normalize_lang_code((s.get("tags") or {}).get("language"))
+    return _normalize_lang_code((audio_streams[0].get("tags") or {}).get("language"))
+
+
+def _probe_embedded_subtitle_streams_with_meta(
     fname: str,
     ffmpeg_path: Optional[str] = None,
     gui_mode: bool = False,
-) -> Optional[List[str]]:
-    """Enumerate text-based subtitle streams in ``fname`` via ffprobe.
+) -> Tuple[Optional[List[str]], str, Dict[str, Dict[str, Any]]]:
+    """Enumerate usable text subtitle streams and metadata in a single ffprobe pass.
 
-    Returns a list of ffmpeg ``-map`` specifiers (e.g. ``["0:2", "0:3"]``)
-    so that every subtitle stream can be extracted in a single ffmpeg pass.
-    Bitmap subtitle codecs (PGS, VobSub, DVB, ...) are skipped because they
-    cannot be muxed to SRT and would otherwise abort the whole extraction.
-    Forced / commentary tracks are deprioritized when full tracks exist.
-
-    Returns ``None`` when ffprobe is unavailable or fails, signaling the
-    caller to fall back to extracting streams one at a time.
+    Returns ``(streams, primary_audio_lang, meta_by_spec)`` where ``streams`` is:
+    - ``None`` when ffprobe is unavailable or fails (signal to degrade to blind
+      per-stream probing),
+    - ``[]`` when ffprobe worked and found no usable text subtitle streams, or
+    - a list of ``"0:<index>"`` specifiers for usable text subtitle streams.
     """
     ffprobe_args = [
         ffmpeg_bin_path("ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path),
         "-loglevel",
         "fatal",
-        "-select_streams",
-        "s",
         "-show_entries",
-        "stream=index,codec_name:stream_disposition=forced,comment:stream_tags=title",
+        "stream=index,codec_type,codec_name:stream_disposition=default,forced,comment,hearing_impaired:stream_tags=language,title",
         "-of",
-        "csv=p=0",
+        "json",
         fname,
     ]
     try:
@@ -306,12 +369,64 @@ def _probe_embedded_subtitle_streams(
         output = process.communicate()[0]
     except OSError as e:
         logger.warning("ffprobe unavailable while enumerating subtitles: %s", e)
-        return None
+        return None, "", {}
     if process.returncode != 0:
-        return None
-    preferred: List[str] = []
-    deprioritized: List[str] = []
-    for line in output.decode("utf-8", errors="replace").splitlines():
+        return None, "", {}
+
+    raw_text = output.decode("utf-8", errors="replace").strip()
+    if not raw_text:
+        return [], "", {}
+
+    # Real ffprobe emits JSON; test stubs may still emit legacy CSV lines.
+    try:
+        import json
+
+        data = json.loads(raw_text)
+        raw_streams = data.get("streams") if isinstance(data, dict) else None
+    except ValueError:
+        raw_streams = None
+
+    if isinstance(raw_streams, list):
+        audio_lang = _primary_audio_language(raw_streams)
+        streams: List[str] = []
+        meta: Dict[str, Dict[str, Any]] = {}
+        for s in raw_streams:
+            if s.get("codec_type") != "subtitle":
+                continue
+            idx = s.get("index")
+            if idx is None:
+                continue
+            codec_name = str(s.get("codec_name") or "").lower()
+            if codec_name in _BITMAP_SUBTITLE_CODECS:
+                continue
+            disp = s.get("disposition") or {}
+            tags = s.get("tags") or {}
+            title = str(tags.get("title") or "")
+            spec = "0:{}".format(idx)
+            if _is_deprioritized_sub_track(
+                title=title,
+                forced=disp.get("forced", 0),
+                comment=disp.get("comment", 0),
+            ):
+                logger.info(
+                    "skipping forced/commentary/signs embedded subtitle stream %s",
+                    spec,
+                )
+                continue
+            streams.append(spec)
+            meta[spec] = {
+                "is_sdh": _is_sdh_sub_track(
+                    title=title,
+                    hearing_impaired=disp.get("hearing_impaired", 0),
+                ),
+                "lang": _normalize_lang_code(tags.get("language")),
+                "is_default": bool(disp.get("default")),
+            }
+        return streams, audio_lang, meta
+
+    # Fallback parser for legacy CSV ffprobe output (used by unit-test mocks).
+    streams = []
+    for line in raw_text.splitlines():
         parts = [p.strip() for p in line.strip().split(",", 4)]
         if not parts or not parts[0].isdigit():
             continue
@@ -324,10 +439,24 @@ def _probe_embedded_subtitle_streams(
         title = ",".join(parts[2 + len(disp_flags) :])
         spec = "0:{}".format(index)
         if _is_deprioritized_sub_track(title=title, forced="1" if is_flagged else "0"):
-            deprioritized.append(spec)
-        else:
-            preferred.append(spec)
-    return (preferred or deprioritized) or None
+            logger.info(
+                "skipping forced/commentary/signs embedded subtitle stream %s", spec
+            )
+            continue
+        streams.append(spec)
+    return streams, "", {}
+
+
+def _probe_embedded_subtitle_streams(
+    fname: str,
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Optional[List[str]]:
+    """Enumerate usable text-based subtitle streams in ``fname`` via ffprobe."""
+    streams, _, _ = _probe_embedded_subtitle_streams_with_meta(
+        fname, ffmpeg_path=ffmpeg_path, gui_mode=gui_mode
+    )
+    return streams
 
 
 _FUSION_STRATEGIES: Tuple[str, ...] = ("weighted", "intersection", "union")
@@ -486,9 +615,11 @@ class VideoSpeechTransformer(TransformerMixin):
         max_duration_seconds: Optional[float] = None,
         extract_audio_first: bool = False,
         progress_handler: Optional[Callable[["ProgressInfo"], None]] = None,
+        min_embedded_subtitle_cues: int = DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
     ) -> None:
         super(VideoSpeechTransformer, self).__init__()
         self.vad: str = vad
+        self.min_embedded_subtitle_cues: int = min_embedded_subtitle_cues
         self.sample_rate: int = sample_rate
         self.frame_rate: int = frame_rate
         self._non_speech_label: float = non_speech_label
@@ -504,23 +635,34 @@ class VideoSpeechTransformer(TransformerMixin):
         ] = progress_handler
         self.video_speech_results_: Optional[np.ndarray] = None
         self.alt_video_speech_results_: List[Tuple[str, np.ndarray]] = []
+        self.used_embedded_subs_: bool = False
+        self.reference_source_: Optional[str] = None
+        self._last_ffmpeg_stderr_: str = ""
+
+    @property
+    def can_fallback_to_audio(self) -> bool:
+        """Return True when alignment used auto-selected embedded subs and can retry audio."""
+        return self.used_embedded_subs_ and self.ref_stream is None
 
     def _probe_embedded_subtitle_streams(self, fname: str) -> Optional[List[str]]:
-        return _probe_embedded_subtitle_streams(
+        streams, audio_lang, meta = _probe_embedded_subtitle_streams_with_meta(
             fname, ffmpeg_path=self.ffmpeg_path, gui_mode=self.gui_mode
         )
+        self._last_probe_audio_lang_ = audio_lang
+        self._last_probe_sub_meta_ = meta
+        return streams
 
     def _extract_embedded_subs_single_pass(
         self, fname: str, streams: List[str]
-    ) -> Optional[List[io.BytesIO]]:
+    ) -> Optional[List[Tuple[str, io.BytesIO]]]:
         """Extract several subtitle streams in one ffmpeg invocation.
 
         ffmpeg can only send a single output to stdout, so each stream is
         written to a temporary file (in the system temp dir -- never next to
         the source media), read back into memory, and then deleted along with
-        the temp dir. Returns one in-memory buffer per stream that produced
-        data, or ``None`` if the ffmpeg invocation failed wholesale (the caller
-        then falls back to per-stream extraction).
+        the temp dir. Returns one ``(stream, buffer)`` pair per stream that
+        produced data, or ``None`` if the ffmpeg invocation failed wholesale
+        (the caller then falls back to per-stream extraction).
         """
         with tempfile.TemporaryDirectory(prefix="ffsubsync_subs_") as tmpdir:
             ffmpeg_args = [
@@ -546,24 +688,25 @@ class VideoSpeechTransformer(TransformerMixin):
             process.communicate()
             if process.returncode != 0:
                 return None
-            buffers: List[io.BytesIO] = []
-            for out_path in out_paths:
+            buffers: List[Tuple[str, io.BytesIO]] = []
+            for stream, out_path in zip(streams, out_paths):
                 if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
                     continue
                 with open(out_path, "rb") as f:
-                    buffers.append(io.BytesIO(f.read()))
+                    buffers.append((stream, io.BytesIO(f.read())))
             return buffers
 
     def _extract_embedded_subs_per_stream(
         self, fname: str, streams: List[str]
-    ) -> List[io.BytesIO]:
+    ) -> List[Tuple[str, io.BytesIO]]:
         """Extract subtitle streams one ffmpeg invocation at a time (to stdout).
 
         This preserves the original extraction behavior and is used as a
         fallback whenever single-pass extraction is unavailable (no ffprobe) or
-        fails. Stops at the first stream ffmpeg cannot extract.
+        fails. Stops at the first stream ffmpeg cannot extract. Returns
+        ``(stream, buffer)`` pairs.
         """
-        buffers: List[io.BytesIO] = []
+        buffers: List[Tuple[str, io.BytesIO]] = []
         for stream in streams:
             ffmpeg_args = [
                 ffmpeg_bin_path(
@@ -586,7 +729,7 @@ class VideoSpeechTransformer(TransformerMixin):
             output = process.communicate()[0]
             if process.returncode != 0:
                 break
-            buffers.append(io.BytesIO(output))
+            buffers.append((stream, io.BytesIO(output)))
         return buffers
 
     def try_fit_using_embedded_subs(self, fname: str) -> None:
@@ -599,7 +742,21 @@ class VideoSpeechTransformer(TransformerMixin):
             # enumerate the subtitle streams so they can all be extracted in a
             # single ffmpeg pass (~5x faster than one invocation per stream)
             streams = self._probe_embedded_subtitle_streams(fname)
-            if streams:
+            if streams is None:
+                # ffprobe unavailable/failed: fall back to probing the first 5
+                # streams individually (should cover 99% of movies)
+                subtitle_buffers = self._extract_embedded_subs_per_stream(
+                    fname, list(map("0:s:{}".format, range(5)))
+                )
+            elif not streams:
+                # ffprobe worked and every subtitle stream is bitmap or forced;
+                # do not probe blindly, that would pick the skipped streams up
+                # again
+                raise ValueError(
+                    "Video file appears to lack a usable text subtitle stream "
+                    "(none, bitmap-only, or forced-only)"
+                )
+            else:
                 subtitle_buffers = self._extract_embedded_subs_single_pass(
                     fname, streams
                 )
@@ -609,34 +766,78 @@ class VideoSpeechTransformer(TransformerMixin):
                     subtitle_buffers = self._extract_embedded_subs_per_stream(
                         fname, streams
                     )
-            else:
-                # ffprobe unavailable/failed: fall back to probing the first 5
-                # streams individually (should cover 99% of movies)
-                subtitle_buffers = self._extract_embedded_subs_per_stream(
-                    fname, list(map("0:s:{}".format, range(5)))
-                )
-        embedded_subs = []
-        embedded_scores = []
-        for buffer in subtitle_buffers:
+        embedded_subs: List[
+            Tuple[str, int, float, float, SubtitleSpeechTransformer]
+        ] = []
+        for stream, buffer in subtitle_buffers:
             pipe = cast(
                 Pipeline,
                 make_subtitle_speech_pipeline(start_seconds=self.start_seconds),
             ).fit(buffer)
             speech_step = pipe.steps[-1][1]
-            embedded_subs.append(speech_step)
+            num_cues = len(pipe.named_steps["parse"].subs_)
             speech_samples = float(np.sum(speech_step.subtitle_speech_results_ > 0))
-            embedded_scores.append((speech_samples, float(speech_step.max_time_ or 0.0)))
+            embedded_subs.append(
+                (
+                    stream,
+                    num_cues,
+                    speech_samples,
+                    float(speech_step.max_time_ or 0.0),
+                    speech_step,
+                )
+            )
         if len(embedded_subs) == 0:
             if self.ref_stream is None:
                 error_msg = "Video file appears to lack subtitle stream"
             else:
                 error_msg = "Stream {} not found".format(self.ref_stream)
             raise ValueError(error_msg)
-        # Prefer the track with the most actual dialogue (tie-breaking on max_time_)
-        # so sparse Forced / Commentary tracks don't beat full dialogue tracks.
-        best_idx = max(range(len(embedded_subs)), key=lambda i: embedded_scores[i])
-        subs_to_use = embedded_subs[best_idx]
+        # Rank full dialogue tracks cleanly:
+        # 1. Full tracks beat sparse/stub tracks (e.g. unflagged forced tracks).
+        # 2. Clean non-SDH tracks beat SDH tracks (no [MUSIC]/[SFX] pollution).
+        # 3. Tracks matching the primary audio language beat foreign translations
+        #    (which often have different line segmentation and timing offsets).
+        # 4. Default track disposition, then higher cue count / speech / max time.
+        audio_lang = getattr(self, "_last_probe_audio_lang_", "")
+        stream_meta = getattr(self, "_last_probe_sub_meta_", None) or {}
+        max_cues = max(entry[1] for entry in embedded_subs)
+        full_cue_floor = max(200, int(0.4 * max_cues))
+
+        def _embedded_rank(
+            entry: Tuple[str, int, float, float, SubtitleSpeechTransformer]
+        ) -> Tuple[bool, bool, bool, bool, int, float, float]:
+            s_spec, s_cues, s_speech, s_max_t, _ = entry
+            info = stream_meta.get(s_spec) or {}
+            is_full = s_cues >= full_cue_floor
+            not_sdh = not info.get("is_sdh", False)
+            matches_audio = bool(audio_lang and info.get("lang") == audio_lang)
+            is_default = bool(info.get("is_default", False))
+            return (
+                is_full,
+                not_sdh,
+                matches_audio,
+                is_default,
+                s_cues,
+                s_speech,
+                s_max_t,
+            )
+
+        stream, num_cues, _, _, subs_to_use = max(embedded_subs, key=_embedded_rank)
+        if self.ref_stream is None and num_cues < self.min_embedded_subtitle_cues:
+            raise ValueError(
+                "best embedded subtitle stream {} has only {} cues "
+                "(< {}); falling back to bitmap/audio".format(
+                    stream, num_cues, self.min_embedded_subtitle_cues
+                )
+            )
+        logger.info(
+            "using embedded subtitle stream %s (%d cues) as reference",
+            stream,
+            num_cues,
+        )
         self.video_speech_results_ = subs_to_use.subtitle_speech_results_
+        self.used_embedded_subs_ = True
+        self.reference_source_ = "embedded_text"
 
     def _build_ffmpeg_args(
         self, fname: str, dual_center: bool = False
@@ -659,7 +860,7 @@ class VideoSpeechTransformer(TransformerMixin):
             ffmpeg_args.extend(
                 ["-t", str(timedelta(seconds=self.max_duration_seconds))]
             )
-        ffmpeg_args.extend(["-loglevel", "fatal", "-nostdin", "-i", fname])
+        ffmpeg_args.extend(["-loglevel", "error", "-nostdin", "-i", fname])
         if self.ref_stream is not None and self.ref_stream.startswith("0:a:"):
             ffmpeg_args.extend(["-map", self.ref_stream])
         if dual_center:
@@ -744,7 +945,34 @@ class VideoSpeechTransformer(TransformerMixin):
             return None
         return temp_path
 
+    def _run_audio_pipeline(self, fname: str) -> None:
+        temp_audio = None
+        if self.extract_audio_first and is_remote_url(fname):
+            temp_audio = self._extract_audio_to_temp(fname)
+            if temp_audio is not None:
+                fname = temp_audio
+        try:
+            self._fit_using_audio(fname)
+        finally:
+            if temp_audio is not None and os.path.exists(temp_audio):
+                try:
+                    os.remove(temp_audio)
+                except OSError:
+                    logger.warning("failed to remove temp audio file %s", temp_audio)
+        self.used_embedded_subs_ = False
+        self.reference_source_ = "audio"
+
+    def fallback_to_audio(
+        self, fname: str
+    ) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]]]:
+        """Re-extract reference speech from audio VAD after poor embedded-sub alignment."""
+        self._run_audio_pipeline(fname)
+        assert self.video_speech_results_ is not None
+        return self.video_speech_results_, list(self.alt_video_speech_results_)
+
     def fit(self, fname: str, *_) -> "VideoSpeechTransformer":
+        self.used_embedded_subs_ = False
+        self.reference_source_ = None
         if "subs" in self.vad and (
             self.ref_stream is None or self.ref_stream.startswith("0:s:")
         ):
@@ -778,11 +1006,12 @@ class VideoSpeechTransformer(TransformerMixin):
                             )
                             num_timings = getattr(pgs, "num_timings_", 0)
                             if active_sec >= 50.0 and num_timings >= 20:
-                                kind_label = (
-                                    "PGS"
-                                    if codec_name == "hdmv_pgs_subtitle"
-                                    else "VobSub"
-                                )
+                                if codec_name == "hdmv_pgs_subtitle":
+                                    kind_label = "PGS"
+                                elif codec_name == "dvb_subtitle":
+                                    kind_label = "DVB"
+                                else:
+                                    kind_label = "VobSub"
                                 logger.info(
                                     "using %s subtitle stream %s as reference "
                                     "(%d cues, %.1fs active captions)",
@@ -792,6 +1021,8 @@ class VideoSpeechTransformer(TransformerMixin):
                                     active_sec,
                                 )
                                 self.video_speech_results_ = pgs_res
+                                self.used_embedded_subs_ = True
+                                self.reference_source_ = kind_label.lower()
                                 return self
                             logger.info(
                                 "skipping bitmap stream %s (%d cues, %.1fs active captions)",
@@ -805,21 +1036,10 @@ class VideoSpeechTransformer(TransformerMixin):
                             )
                 except Exception as e:
                     logger.info(
-                        "PGS/VobSub fallback failed (%s); falling back to audio VAD", e
+                        "PGS/VobSub/DVB fallback failed (%s); falling back to audio VAD",
+                        e,
                     )
-        temp_audio = None
-        if self.extract_audio_first and is_remote_url(fname):
-            temp_audio = self._extract_audio_to_temp(fname)
-            if temp_audio is not None:
-                fname = temp_audio
-        try:
-            self._fit_using_audio(fname)
-        finally:
-            if temp_audio is not None and os.path.exists(temp_audio):
-                try:
-                    os.remove(temp_audio)
-                except OSError:
-                    logger.warning("failed to remove temp audio file %s", temp_audio)
+        self._run_audio_pipeline(fname)
         return self
 
     def _make_detector(self) -> Callable[[Any], np.ndarray]:
@@ -834,12 +1054,17 @@ class VideoSpeechTransformer(TransformerMixin):
                 self._non_speech_label,
                 fusion_strategy,
             )
+        elif "auditok" in self.vad:
+            # NB: checked before webrtc -- "auditok:webrtc:N" selects auditok's
+            # event segmentation over webrtc frame decisions, not plain webrtc
+            return _make_auditok_detector(
+                self.sample_rate,
+                self.frame_rate,
+                self._non_speech_label,
+                vad_spec=_parse_auditok_spec(self.vad),
+            )
         elif "webrtc" in self.vad:
             return _make_webrtcvad_detector(
-                self.sample_rate, self.frame_rate, self._non_speech_label
-            )
-        elif "auditok" in self.vad:
-            return _make_auditok_detector(
                 self.sample_rate, self.frame_rate, self._non_speech_label
             )
         elif "silero" in self.vad:
@@ -859,12 +1084,29 @@ class VideoSpeechTransformer(TransformerMixin):
         detector_fc = self._make_detector() if dual_center else None
         media_bstring: List[np.ndarray] = []
         fc_bstring: List[np.ndarray] = []
+        self._last_ffmpeg_stderr_ = ""
         ffmpeg_args = (
             self._build_ffmpeg_args(fname, dual_center=True)
             if dual_center
             else self._build_ffmpeg_args(fname)
         )
         process = subprocess.Popen(ffmpeg_args, **subprocess_args(include_stdout=True))
+        stderr_chunks: List[bytes] = []
+        stderr_thread: Optional[threading.Thread] = None
+        proc_stderr = getattr(process, "stderr", None)
+        if proc_stderr is not None:
+
+            def _drain_stderr() -> None:
+                try:
+                    data = proc_stderr.read()
+                    if data:
+                        stderr_chunks.append(data)
+                except Exception:
+                    pass
+
+            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            stderr_thread.start()
+
         out_channels = 2 if dual_center else 1
         bytes_per_frame = 2
         bytes_per_sample_step = bytes_per_frame * out_channels
@@ -952,6 +1194,12 @@ class VideoSpeechTransformer(TransformerMixin):
                             in_bytes = np.frombuffer(in_bytes, np.uint8)
                         media_bstring.append(detector(in_bytes))
         rc = process.wait()
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=2.0)
+        if stderr_chunks:
+            self._last_ffmpeg_stderr_ = (
+                b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+            )
         return media_bstring, fc_bstring, rc
 
     def _fit_using_audio(self, fname: str) -> None:
@@ -994,14 +1242,31 @@ class VideoSpeechTransformer(TransformerMixin):
                 "falling back to standard mono downmix",
                 rc,
             )
-            media_bstring, fc_bstring, _ = self._decode_audio_vad(
+            media_bstring, fc_bstring, rc = self._decode_audio_vad(
                 fname, total_duration, dual_center=False
             )
         if len(media_bstring) == 0:
-            raise ValueError(
+            msg = (
                 "Unable to detect speech. "
                 "Perhaps try specifying a different stream / track, or a different vad."
             )
+            stderr_tail = "\n".join(self._last_ffmpeg_stderr_.splitlines()[-5:]).strip()
+            if rc != 0 or stderr_tail:
+                details = []
+                if rc != 0:
+                    details.append("ffmpeg exited with code %d" % rc)
+                if stderr_tail:
+                    details.append("ffmpeg error: %s" % stderr_tail)
+                low_err = stderr_tail.lower()
+                if any(
+                    tok in low_err
+                    for tok in ("no such filter", "option not found", "unrecognized option")
+                ):
+                    details.append(
+                        "your ffmpeg build may be too old; try upgrading ffmpeg"
+                    )
+                msg = "%s (%s)" % (msg, "; ".join(details))
+            raise ValueError(msg)
         self.video_speech_results_ = np.concatenate(media_bstring)
         if fc_bstring:
             fc_results = np.concatenate(fc_bstring)
@@ -1178,19 +1443,83 @@ _PAIRED_NESTER: Dict[str, str] = {
     "「": "」",
 }
 
-# Markup tags (e.g. <i>, </i>, <font ...>) carry no speech. Stripping them
-# before classifying a line lets us recognize a wrapped cue like "<i>[music]</i>"
-# as non-dialogue while still treating "<i>Hello?</i>" as dialogue -- which is
-# why '<' is intentionally not a paired nester above.
+# Markup tags (e.g. <i>, </i>, <font ...>) and ASS override tags ({\an8},
+# {\pos(x,y)}, {\i1}) carry no speech. Stripping them before classifying a line
+# lets us recognize wrapped cues like "<i>[music]</i>" or "{\an8}(applause)" as
+# non-dialogue while still treating "<i>Hello?</i>" as dialogue -- which is why
+# '<' is intentionally not a paired nester above, and ASS stripping requires the
+# leading backslash so "{laughter}" stays intact.
 _MARKUP_TAG: "re.Pattern[str]" = re.compile(r"<[^>]+>")
+_ASS_OVERRIDE_TAG: "re.Pattern[str]" = re.compile(r"\{\\[^}]*\}")
+_ASS_NEWLINE: "re.Pattern[str]" = re.compile(r"\\[Nn]")
+_ASS_HARD_SPACE: "re.Pattern[str]" = re.compile(r"\\h")
+_LEADING_DIALOGUE_DASH: "re.Pattern[str]" = re.compile(r"^[\s\-–—•*]+")
+_SPEAKER_LABEL_RE: "re.Pattern[str]" = re.compile(r"^[A-Z0-9][A-Z0-9\s.'-]{0,28}:\s*")
+_PAIRED_BLOCK_RE: "re.Pattern[str]" = re.compile(
+    r"\([^()]*\)|\[[^\[\]]*\]|\{[^{}]*\}|（[^（）]*）|【[^【】]*】|「[^「」]*」"
+)
+_WATERMARK_RE: "re.Pattern[str]" = re.compile(
+    r"(?:opensubtitles\.org|subscene\.com|addic7ed\.com|yifysubtitles|"
+    r"subdl\.com|podnapisi\.net|advertise your product or brand here)",
+    re.IGNORECASE,
+)
+_BOUNDARY_CREDIT_RE: "re.Pattern[str]" = re.compile(
+    r"(?:https?://|www\.|\b(?:synced|sync|subtitles?|resync(?:ed)?|corrected|"
+    r"translated|ripped|encoded)\s+by\b|\bopensubtitles\b|\baddic7ed\b|\bsubscene\b)",
+    re.IGNORECASE,
+)
 
 # Symbols that, on their own, denote a musical / non-speech cue.
 _NON_DIALOGUE_SYMBOLS: frozenset = frozenset("♪♫♬♩🎵🎶")
 
+# Ultra-short duplicate-text transition cues (e.g. 10 ms YouTube rolling-caption
+# frames) add timing noise without representing separate speech.
+_ROLLING_TRANSITION_MAX_SECONDS: float = 0.05
 
-# TODO: need way better metadata detector
+
+def _strip_subtitle_formatting(content: str) -> str:
+    text = _ASS_OVERRIDE_TAG.sub("", content)
+    text = _MARKUP_TAG.sub("", text)
+    text = _ASS_NEWLINE.sub("\n", text)
+    text = _ASS_HARD_SPACE.sub(" ", text)
+    return text.strip()
+
+
+def _is_non_dialogue_line(line: str) -> bool:
+    cleaned = _LEADING_DIALOGUE_DASH.sub("", line).strip()
+    if not cleaned:
+        return True
+    if (
+        cleaned[0] in _PAIRED_NESTER
+        and cleaned[-1] == _PAIRED_NESTER[cleaned[0]]
+    ):
+        return True
+    # lines consisting only of music notes / sound symbols are cues, not speech
+    if all(ch.isspace() or ch in _NON_DIALOGUE_SYMBOLS for ch in cleaned):
+        return True
+    body = cleaned
+    m_speaker = _SPEAKER_LABEL_RE.match(body)
+    if m_speaker:
+        remainder = body[m_speaker.end() :].strip()
+        if remainder:
+            body = remainder
+    if body[0] in _PAIRED_NESTER and body[-1] == _PAIRED_NESTER[body[0]]:
+        return True
+    if all(ch.isspace() or ch in _NON_DIALOGUE_SYMBOLS for ch in body):
+        return True
+    residual = body
+    for _ in range(3):
+        updated = _PAIRED_BLOCK_RE.sub("", residual)
+        if updated == residual:
+            break
+        residual = updated
+    if residual != body and not any(ch.isalnum() for ch in residual):
+        return True
+    return False
+
+
 def _is_metadata(content: str, is_beginning_or_end: bool) -> bool:
-    content = _MARKUP_TAG.sub("", content).strip()
+    content = _strip_subtitle_formatting(content)
     if len(content) == 0:
         return True
     if (
@@ -1198,15 +1527,67 @@ def _is_metadata(content: str, is_beginning_or_end: bool) -> bool:
         and content[-1] == _PAIRED_NESTER[content[0]]
     ):
         return True
-    # lines consisting only of music notes / sound symbols are cues, not speech
-    if all(ch.isspace() or ch in _NON_DIALOGUE_SYMBOLS for ch in content):
+    if _WATERMARK_RE.search(content):
+        return True
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines or all(_is_non_dialogue_line(ln) for ln in lines):
         return True
     if is_beginning_or_end:
         if "english" in content.lower():
             return True
         if " - " in content:
             return True
+        if _BOUNDARY_CREDIT_RE.search(content):
+            return True
     return False
+
+
+def _classify_speech_cues(subs: List[GenericSubtitle]) -> np.ndarray:
+    """Return a boolean mask of cues that represent alignable speech.
+
+    Filters out SDH sound descriptions, release credits/watermarks, and
+    ultra-short YouTube rolling-caption duplicate transition frames without
+    ever removing cues from the output file. Includes a safety fallback so an
+    unusual subtitle file (e.g. mostly bracketed lines) never collapses to an
+    empty signal.
+    """
+    n = len(subs)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    is_speech = np.array(
+        [not _is_metadata(sub.content, i == 0 or i + 1 == n) for i, sub in enumerate(subs)],
+        dtype=bool,
+    )
+    if n >= 2:
+        norm_lines: List[frozenset] = [
+            frozenset(
+                ln.strip().lower()
+                for ln in _strip_subtitle_formatting(sub.content).splitlines()
+                if ln.strip()
+            )
+            for sub in subs
+        ]
+        for i, sub in enumerate(subs):
+            if not is_speech[i]:
+                continue
+            dur = (sub.end - sub.start).total_seconds()
+            if 0.0 <= dur <= _ROLLING_TRANSITION_MAX_SECONDS and norm_lines[i]:
+                if (i > 0 and norm_lines[i].issubset(norm_lines[i - 1])) or (
+                    i + 1 < n and norm_lines[i].issubset(norm_lines[i + 1])
+                ):
+                    is_speech[i] = False
+    if n >= 10 and int(np.sum(is_speech)) < max(1, int(0.15 * n)):
+        logger.info(
+            "metadata filtering excluded too many cues (%d/%d kept); "
+            "falling back to unfiltered cues for alignment",
+            int(np.sum(is_speech)),
+            n,
+        )
+        is_speech = np.array(
+            [bool(_strip_subtitle_formatting(sub.content)) for sub in subs],
+            dtype=bool,
+        )
+    return is_speech
 
 
 class SubtitleSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
@@ -1228,8 +1609,9 @@ class SubtitleSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMi
         samples = np.zeros(int(max_time * self.sample_rate) + 2, dtype=float)
         start_frame = float("inf")
         end_frame = 0
+        speech_mask = _classify_speech_cues(subs)
         for i, sub in enumerate(subs):
-            if _is_metadata(sub.content, i == 0 or i + 1 == len(subs)):
+            if not speech_mask[i]:
                 continue
             start = int(
                 round(
@@ -1255,17 +1637,31 @@ class DeserializeSpeechTransformer(TransformerMixin):
         super(DeserializeSpeechTransformer, self).__init__()
         self._non_speech_label: float = non_speech_label
         self.deserialized_speech_results_: Optional[np.ndarray] = None
+        self.alt_video_speech_results_: List[Tuple[str, np.ndarray]] = []
 
     def fit(self, fname, *_) -> "DeserializeSpeechTransformer":
-        speech = np.load(fname)
-        if hasattr(speech, "files"):
-            if "speech" in speech.files:
-                speech = speech["speech"]
+        loaded = np.load(fname)
+        self.alt_video_speech_results_ = []
+        try:
+            if hasattr(loaded, "files"):
+                if "speech" in loaded.files:
+                    speech = np.array(loaded["speech"], copy=True)
+                else:
+                    raise ValueError(
+                        'could not find "speech" array in '
+                        "serialized file; only contains: %s" % loaded.files
+                    )
+                if "alt_fc_speech" in loaded.files:
+                    fc_speech = np.array(loaded["alt_fc_speech"], copy=True)
+                    fc_speech[fc_speech < 1.0] = self._non_speech_label
+                    self.alt_video_speech_results_.append(
+                        ("center channel (FC)", fc_speech)
+                    )
             else:
-                raise ValueError(
-                    'could not find "speech" array in '
-                    "serialized file; only contains: %s" % speech.files
-                )
+                speech = loaded
+        finally:
+            if hasattr(loaded, "close"):
+                loaded.close()
         speech[speech < 1.0] = self._non_speech_label
         self.deserialized_speech_results_ = speech
         return self
@@ -1275,7 +1671,20 @@ class DeserializeSpeechTransformer(TransformerMixin):
         return self.deserialized_speech_results_
 
 
-_TIMING_BITMAP_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle"})
+_TIMING_BITMAP_SUBTITLE_CODECS = frozenset(
+    {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
+)
+
+
+def _number_of_frames(stream: Dict[str, Any]) -> int:
+    """Return the cue count mkvmerge records in a stream's statistics tags, or 0."""
+    for key, value in (stream.get("tags") or {}).items():
+        if str(key).upper().startswith("NUMBER_OF_FRAMES"):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def _find_bitmap_timing_streams(
@@ -1284,20 +1693,30 @@ def _find_bitmap_timing_streams(
     gui_mode: bool = False,
     include_deprioritized: bool = True,
 ) -> List[Tuple[str, Any, str]]:
-    """Return ``(specifier, stream_index, codec_name)`` tuples for PGS/VobSub tracks."""
+    """Return ``(specifier, stream_index, codec_name)`` tuples for PGS/VobSub/DVB tracks.
+
+    Non-forced, non-commentary tracks come first; within each tier, tracks are
+    ordered by mkvmerge's ``NUMBER_OF_FRAMES`` cue count descending (preserving
+    original stream order on ties).
+    """
     try:
         probe = ffmpeg.probe(
             fname,
             cmd=ffmpeg_bin_path("ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path),
         )
     except Exception as e:
-        logger.warning("ffprobe failed while searching for PGS/VobSub streams: %s", e)
+        logger.warning(
+            "ffprobe failed while searching for PGS/VobSub/DVB streams: %s", e
+        )
         return []
 
+    raw_streams = probe.get("streams", [])
+    audio_lang = _primary_audio_language(raw_streams)
+
     sub_index = 0
-    preferred: List[Tuple[str, Any, str]] = []
-    fallback: List[Tuple[str, Any, str]] = []
-    for stream in probe.get("streams", []):
+    preferred: List[Tuple[int, bool, bool, bool, Tuple[str, Any, str]]] = []
+    fallback: List[Tuple[int, bool, bool, bool, Tuple[str, Any, str]]] = []
+    for stream in raw_streams:
         if stream.get("codec_type") == "subtitle":
             codec_name = (stream.get("codec_name") or "").lower()
             if codec_name in _TIMING_BITMAP_SUBTITLE_CODECS:
@@ -1305,17 +1724,58 @@ def _find_bitmap_timing_streams(
                 disp = stream.get("disposition") or {}
                 tags = stream.get("tags") or {}
                 entry = (specifier, stream.get("index"), codec_name)
+                n_frames = _number_of_frames(stream)
+                is_sdh = _is_sdh_sub_track(
+                    title=tags.get("title", ""),
+                    hearing_impaired=disp.get("hearing_impaired", 0),
+                )
+                matches_audio = bool(
+                    audio_lang and _normalize_lang_code(tags.get("language")) == audio_lang
+                )
+                is_default = bool(disp.get("default"))
+                record = (n_frames, is_sdh, matches_audio, is_default, entry)
                 if not _is_deprioritized_sub_track(
                     title=tags.get("title", ""),
                     forced=disp.get("forced", 0),
                     comment=disp.get("comment", 0),
                 ):
-                    preferred.append(entry)
+                    preferred.append(record)
                 else:
-                    fallback.append(entry)
+                    fallback.append(record)
             sub_index += 1
 
-    return preferred + fallback if include_deprioritized else preferred
+    def _sort_bitmap_tier(
+        items: List[Tuple[int, bool, bool, bool, Tuple[str, Any, str]]]
+    ) -> List[Tuple[str, Any, str]]:
+        if not items:
+            return []
+        max_frames = max(item[0] for item in items)
+        full_floor = max(200, int(0.4 * max_frames)) if max_frames > 0 else 0
+
+        def _rank(
+            item: Tuple[int, bool, bool, bool, Tuple[str, Any, str]]
+        ) -> Tuple[bool, bool, bool, bool, int]:
+            n_frames, is_sdh, matches_audio, is_default, _ = item
+            # Treat tracks with unknown (0) frame count or >= full_floor as full so
+            # sparse unflagged forced stubs (e.g. 40 cues) lose to full tracks (1500),
+            # without letting a translated/SDH track (1861) beat the primary clean track (1500).
+            is_full = (max_frames == 0) or (n_frames == 0) or (n_frames >= full_floor)
+            return (
+                is_full,
+                not is_sdh,
+                matches_audio,
+                is_default,
+                0 if is_full else n_frames,
+            )
+
+        # Python's sort is stable, so ties preserve the container's stream order.
+        ordered = sorted(items, key=_rank, reverse=True)
+        return [item[4] for item in ordered]
+
+    pref_entries = _sort_bitmap_tier(preferred)
+    if not include_deprioritized:
+        return pref_entries
+    return pref_entries + _sort_bitmap_tier(fallback)
 
 
 def find_pgs_stream(
@@ -1323,11 +1783,11 @@ def find_pgs_stream(
     ffmpeg_path: Optional[str] = None,
     gui_mode: bool = False,
 ) -> Optional[str]:
-    """Return the ffmpeg stream specifier for the first PGS/VobSub subtitle track in *fname*.
+    """Return the ffmpeg stream specifier for the best image-based subtitle track in *fname*.
 
-    Uses ``ffprobe`` to inspect the file.  Returns a string like ``"0:s:0"`` on
-    success, or ``None`` if the file has no ``hdmv_pgs_subtitle`` or
-    ``dvd_subtitle`` streams.
+    Considers ``hdmv_pgs_subtitle``, ``dvd_subtitle``, and ``dvb_subtitle``.
+    Skips forced, commentary, and signs/songs tracks when a full track exists,
+    and prefers the track with the most cues when ``NUMBER_OF_FRAMES`` is present.
     """
     candidates = _find_bitmap_timing_streams(
         fname,
@@ -1347,6 +1807,87 @@ def find_pgs_stream(
     return None
 
 
+def _probe_stream_codec(
+    fname: str,
+    stream: str,
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Optional[str]:
+    """Return the codec name of *stream* in *fname*, or ``None`` if unknown."""
+    probe_stream = stream[2:] if stream.startswith("0:") else stream
+    try:
+        probe = ffmpeg.probe(
+            fname,
+            cmd=ffmpeg_bin_path("ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path),
+            select_streams=probe_stream,
+            show_entries="stream=codec_name",
+        )
+    except Exception:
+        return None
+    streams = probe.get("streams", [])
+    if not streams:
+        return None
+    codec = streams[0].get("codec_name")
+    return codec.lower() if isinstance(codec, str) else None
+
+
+def _get_dvd_timings_via_ffprobe(
+    fname: str,
+    stream: str,
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Optional[List[Tuple[float, float]]]:
+    """Read DVD (VobSub) subtitle timings by letting ffprobe decode the stream.
+
+    Unlike PGS/DVB, a DVD subtitle packet has no separate "clear" packet: its
+    stop-display timestamp lives inside the packet itself, and MKV muxers
+    commonly leave packet ``duration_time=N/A``. Decoding with ``-show_frames``
+    recovers ``start_display_time`` and ``end_display_time`` directly.
+    """
+    ffprobe_cmd = ffmpeg_bin_path(
+        "ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path
+    )
+    probe_stream = stream[2:] if stream.startswith("0:") else stream
+    try:
+        probe_data = ffmpeg.probe(
+            fname,
+            cmd=ffprobe_cmd,
+            show_frames=None,
+            select_streams=probe_stream,
+            show_entries=(
+                "subtitle=pts_time,start_display_time,end_display_time,num_rects"
+            ),
+        )
+    except Exception:
+        return None
+
+    captions: List[Tuple[float, float, float]] = []
+    for frame in probe_data.get("frames", []):
+        try:
+            pts_time = float(frame["pts_time"])
+            start_ms = int(frame.get("start_display_time", 0))
+            end_ms = int(frame["end_display_time"])
+            num_rects = int(frame.get("num_rects", 1))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if num_rects == 0:
+            # Empty frame clears the screen: ends the previous caption and shows nothing.
+            start_ms = end_ms = 0
+        captions.append((pts_time, start_ms / 1000.0, end_ms / 1000.0))
+    captions.sort()
+
+    results: List[Tuple[float, float]] = []
+    for i, (pts_time, start_offset, end_offset) in enumerate(captions):
+        start = pts_time + start_offset
+        end = pts_time + end_offset
+        if i + 1 < len(captions):
+            end = min(end, captions[i + 1][0])
+        if end > start:
+            results.append((start, end))
+
+    return results or None
+
+
 _PGS_CLEAR_MAX_BYTES = 50
 _PGS_FALLBACK_MAX_CUE_SECONDS = 15.0
 
@@ -1356,14 +1897,20 @@ def _parse_pgs_timings_from_packets(
 ) -> Optional[List[Tuple[float, float]]]:
     """Extract ``(start_s, end_s)`` intervals from ffprobe subtitle packets.
 
-    Prefers explicit packet ``duration_time`` values when present (e.g. VobSub
-    or containers storing per-block durations). When no packet carries an
-    explicit positive duration — common in Blu-ray HDMV PGS muxed into MKV —
-    falls back to pairing each large "show" packet (``size > 50``) with the
-    subsequent tiny "clear" packet (``size <= 50``) or next show packet.
+    Handles both numeric ``duration_time`` packets and durationless (``N/A`` or
+    omitted) PGS/DVB packets in a single forward pass, including streams that
+    mix both representations:
+
+    - Numeric SHOW packet (``size > 50`` and numeric ``duration_time``): emits
+      ``(pts_time, pts_time + duration_time)`` when ``duration_time > 0`` and
+      clears any pending durationless SHOW.
+    - Durationless SHOW packet (``size > 50`` and ``duration_time`` missing or
+      ``"N/A"``): closes any earlier pending durationless SHOW (capped at 15s)
+      and becomes the pending SHOW awaiting a CLEAR packet.
+    - Durationless CLEAR packet (``size <= 50`` and ``duration_time`` missing or
+      ``"N/A"``): closes a pending durationless SHOW at ``pts_time`` (capped at 15s).
     """
-    explicit_results: List[Tuple[float, float]] = []
-    parsed_packets: List[Tuple[float, int, bool]] = []
+    parsed_packets: List[Tuple[float, int, Optional[float]]] = []
 
     for packet in packets:
         pts_time_str = packet.get("pts_time")
@@ -1376,37 +1923,44 @@ def _parse_pgs_timings_from_packets(
         except ValueError:
             continue
 
-        duration_time_str = packet.get("duration_time")
-        has_explicit_dur = False
+        duration_time_str = packet.get("duration_time", "N/A")
+        duration_time: Optional[float] = None
         if duration_time_str is not None and duration_time_str != "N/A":
             try:
                 duration_time = float(duration_time_str)
-                has_explicit_dur = True
-                if size > _PGS_CLEAR_MAX_BYTES and duration_time > 0:
-                    explicit_results.append((pts_time, pts_time + duration_time))
             except ValueError:
-                pass
-        parsed_packets.append((pts_time, size, has_explicit_dur))
+                continue
+        parsed_packets.append((pts_time, size, duration_time))
 
-    if explicit_results:
-        return explicit_results
+    parsed_packets.sort(key=lambda x: x[0])
 
-    inferred_results: List[Tuple[float, float]] = []
-    open_start: Optional[float] = None
-    for pts_time, size, has_explicit_dur in sorted(parsed_packets, key=lambda x: x[0]):
-        if has_explicit_dur:
+    results: List[Tuple[float, float]] = []
+    pending_show_pts: Optional[float] = None
+
+    for pts_time, size, duration_time in parsed_packets:
+        if size <= _PGS_CLEAR_MAX_BYTES:
+            if (
+                pending_show_pts is not None
+                and duration_time is None
+                and pts_time > pending_show_pts
+            ):
+                end_time = min(pts_time, pending_show_pts + _PGS_FALLBACK_MAX_CUE_SECONDS)
+                results.append((pending_show_pts, end_time))
+                pending_show_pts = None
             continue
-        if size > _PGS_CLEAR_MAX_BYTES:
-            if open_start is not None and pts_time > open_start:
-                end_time = min(pts_time, open_start + _PGS_FALLBACK_MAX_CUE_SECONDS)
-                inferred_results.append((open_start, end_time))
-            open_start = pts_time
-        elif open_start is not None and pts_time > open_start:
-            end_time = min(pts_time, open_start + _PGS_FALLBACK_MAX_CUE_SECONDS)
-            inferred_results.append((open_start, end_time))
-            open_start = None
 
-    return inferred_results or None
+        if duration_time is None:
+            if pending_show_pts is not None and pts_time > pending_show_pts:
+                end_time = min(pts_time, pending_show_pts + _PGS_FALLBACK_MAX_CUE_SECONDS)
+                results.append((pending_show_pts, end_time))
+            pending_show_pts = pts_time
+            continue
+
+        pending_show_pts = None
+        if duration_time > 0:
+            results.append((pts_time, pts_time + duration_time))
+
+    return results or None
 
 
 def _get_pgs_timings_via_ffprobe(
@@ -1496,7 +2050,7 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
             stream = find_pgs_stream(fname, self.ffmpeg_path, self.gui_mode)
             if stream is None:
                 raise ValueError(
-                    "No hdmv_pgs_subtitle / dvd_subtitle (PGS/VobSub) stream found in {}. "
+                    "No image-based (PGS, VobSub, or DVB) subtitle stream found in {}. "
                     "Specify one explicitly with --pgs-ref-stream.".format(fname)
                 )
         else:
@@ -1504,20 +2058,36 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
             if not stream.startswith("0:"):
                 stream = "0:" + stream
 
-        logger.info("reading PGS/VobSub timings for stream %s from %s...", stream, fname)
-        timings = _get_pgs_timings_via_ffprobe(
-            fname, stream, self.ffmpeg_path, self.gui_mode
+        codec = _probe_stream_codec(fname, stream, self.ffmpeg_path, self.gui_mode)
+        logger.info(
+            "reading %s timings for stream %s from %s...",
+            codec or "PGS/VobSub/DVB",
+            stream,
+            fname,
         )
+        if codec == "dvd_subtitle":
+            timings = _get_dvd_timings_via_ffprobe(
+                fname, stream, self.ffmpeg_path, self.gui_mode
+            )
+            if timings is None:
+                timings = _get_pgs_timings_via_ffprobe(
+                    fname, stream, self.ffmpeg_path, self.gui_mode
+                )
+        else:
+            timings = _get_pgs_timings_via_ffprobe(
+                fname, stream, self.ffmpeg_path, self.gui_mode
+            )
         if timings is None:
             raise ValueError(
-                "Failed to get PGS/VobSub timings via ffprobe for stream {} from {}. "
-                "Make sure the stream exists and is an hdmv_pgs_subtitle / dvd_subtitle track "
-                "(check with: ffprobe -show_streams {}).".format(stream, fname, fname)
+                "Failed to get image subtitle timings via ffprobe for stream {} from {}. "
+                "Make sure the stream exists and is an image-based subtitle track "
+                "(hdmv_pgs_subtitle, dvd_subtitle, or dvb_subtitle; check with: "
+                "ffprobe -show_streams {}).".format(stream, fname, fname)
             )
 
         if not timings:
             raise ValueError(
-                "No subtitle timings found in PGS/VobSub stream {}.".format(stream)
+                "No subtitle timings found in image subtitle stream {}.".format(stream)
             )
 
         self.num_timings_ = len(timings)

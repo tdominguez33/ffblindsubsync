@@ -8,15 +8,99 @@
 let _ffmpegPromise = null;
 let _opQueue = Promise.resolve();
 
-const BITMAP_CODECS = new Set(["dvb_subtitle", "dvb_teletext", "xsub"]);
-const PGS_CODECS = new Set(["hdmv_pgs_subtitle", "dvd_subtitle"]);
+const BITMAP_CODECS = new Set(["dvb_teletext", "xsub"]);
+const PGS_CODECS = new Set(["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"]);
 const DEPRIORITIZED_TOKENS = ["forced", "commentary", "signs", "songs"];
+const CENTER_LAYOUT_PREFIXES = [
+  "3.0",
+  "3.1",
+  "4.0",
+  "4.1",
+  "5.0",
+  "5.1",
+  "6.0",
+  "6.1",
+  "7.0",
+  "7.1",
+];
+const CENTER_LAYOUT_NAMES = new Set(["hexagonal", "octagonal"]);
+const NO_CENTER_LAYOUTS = new Set([
+  "mono",
+  "stereo",
+  "2.1",
+  "2.2",
+  "quad",
+  "quad(side)",
+  "2.1.2",
+]);
 const textDecoder = new TextDecoder("utf-8");
+
+export function layoutHasCenterChannel(channelLayout) {
+  const low = String(channelLayout || "").trim().toLowerCase();
+  if (!low || low === "unknown" || NO_CENTER_LAYOUTS.has(low)) return false;
+  if (CENTER_LAYOUT_NAMES.has(low)) return true;
+  if (CENTER_LAYOUT_PREFIXES.some((p) => low.startsWith(p))) return true;
+  return low.split(/[^a-z0-9]+/).includes("fc");
+}
+
+function parseFpsFraction(val) {
+  const s = String(val || "").trim();
+  if (!s || s === "0/0" || s === "N/A") return null;
+  let fps;
+  if (s.includes("/")) {
+    const [numStr, denStr] = s.split("/", 2);
+    const num = Number(numStr);
+    const den = Number(denStr);
+    if (!Number.isFinite(num) || !Number.isFinite(den) || den <= 0) return null;
+    fps = num / den;
+  } else {
+    fps = Number(s);
+  }
+  return Number.isFinite(fps) && fps >= 1.0 && fps <= 240.0 ? fps : null;
+}
+
+function numberOfFramesFromTags(tags = {}) {
+  for (const [k, v] of Object.entries(tags || {})) {
+    if (String(k).toUpperCase().startsWith("NUMBER_OF_FRAMES")) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return Math.trunc(n);
+    }
+  }
+  return 0;
+}
 
 function isDeprioritized(title = "", disp = {}) {
   if (disp && (disp.forced || disp.comment)) return true;
   const low = String(title || "").toLowerCase();
   return DEPRIORITIZED_TOKENS.some((tok) => low.includes(tok));
+}
+
+function isSdhTrack(title = "", disp = {}) {
+  if (disp && disp.hearing_impaired) return true;
+  const low = String(title || "").toLowerCase();
+  return /\b(sdh|cc|hi)\b/.test(low) || low.includes("hearing impaired") || low.includes("closed caption");
+}
+
+function normalizeLang(lang) {
+  const code = String(lang || "").trim().toLowerCase();
+  return !code || code === "und" || code === "unk" || code === "unknown" ? "" : code;
+}
+
+function primaryAudioLanguage(rawStreams) {
+  const audio = rawStreams.filter((s) => s.codec_type === "audio");
+  if (!audio.length) return "";
+  for (const s of audio) {
+    const disp = s.disposition || {};
+    if (disp.default && !disp.comment) return normalizeLang((s.tags || {}).language);
+  }
+  for (const s of audio) {
+    const disp = s.disposition || {};
+    const title = String((s.tags || {}).title || "").toLowerCase();
+    if (!disp.comment && !title.includes("commentary")) {
+      return normalizeLang((s.tags || {}).language);
+    }
+  }
+  return normalizeLang((audio[0].tags || {}).language);
 }
 
 function normalizeMapSpec(stream) {
@@ -94,7 +178,7 @@ async function safeDelete(ffmpeg, filePath) {
 }
 
 export async function probeStreams(cfg, file, { status } = {}) {
-  const empty = { streams: [], has_text_subs: false, has_pgs_subs: false };
+  const empty = { streams: [], has_text_subs: false, has_pgs_subs: false, video_fps: null };
   if (!cfg || !file) return empty;
   return withMountedFile(cfg, file, status, async (ffmpeg, mounted) => {
     const outPath = "/probe_streams.json";
@@ -105,7 +189,7 @@ export async function probeStreams(cfg, file, { status } = {}) {
       await ffmpeg.ffprobe([
         "-v", "error",
         "-show_entries",
-        "stream=index,codec_type,codec_name:stream_disposition=forced,comment:stream_tags=language,title",
+        "stream=index,codec_type,codec_name,channels,channel_layout,r_frame_rate,avg_frame_rate:stream_disposition=default,forced,comment,hearing_impaired,attached_pic:stream_tags",
         "-of", "json",
         mounted,
         "-o", outPath,
@@ -114,12 +198,14 @@ export async function probeStreams(cfg, file, { status } = {}) {
       if (!raw || !raw.byteLength) return empty;
       const data = JSON.parse(textDecoder.decode(raw));
       const rawStreams = Array.isArray(data && data.streams) ? data.streams : [];
+      const audioLang = primaryAudioLanguage(rawStreams);
 
       let audioIdx = 0;
       let subIdx = 0;
       const items = [];
       let hasTextSubs = false;
       let hasPgsSubs = false;
+      let videoFps = null;
 
       for (const s of rawStreams) {
         const ctype = s.codec_type;
@@ -134,8 +220,15 @@ export async function probeStreams(cfg, file, { status } = {}) {
         if (disp.comment) flags.push("commentary");
         const flagNote = flags.length ? ` (${flags.join(", ")})` : "";
 
-        if (ctype === "audio") {
+        if (ctype === "video") {
+          if (videoFps === null && !disp.attached_pic) {
+            videoFps = parseFpsFraction(s.avg_frame_rate) || parseFpsFraction(s.r_frame_rate);
+          }
+        } else if (ctype === "audio") {
           const spec = `a:${audioIdx}`;
+          const channels = Number(s.channels) || 0;
+          const channelLayout = String(s.channel_layout || "");
+          const hasCenterChannel = channels >= 3 && layoutHasCenterChannel(channelLayout);
           const label = `Audio #${audioIdx + 1} (${spec}): ${meta || "default"}${flagNote} [${codec}]`;
           items.push({
             value: spec,
@@ -148,6 +241,10 @@ export async function probeStreams(cfg, file, { status } = {}) {
             title,
             forced: Boolean(disp.forced),
             comment: Boolean(disp.comment),
+            is_default: Boolean(disp.default),
+            channels,
+            channel_layout: channelLayout,
+            has_center_channel: hasCenterChannel,
           });
           audioIdx += 1;
         } else if (ctype === "subtitle") {
@@ -161,8 +258,16 @@ export async function probeStreams(cfg, file, { status } = {}) {
             kind = "pgs";
             isBitmap = false;
             hasPgsSubs = true;
-            noteKind = codec === "hdmv_pgs_subtitle" ? "pgs" : "vobsub";
-            note = noteKind === "pgs" ? "PGS timings" : "VobSub timings";
+            if (codec === "hdmv_pgs_subtitle") {
+              noteKind = "pgs";
+              note = "PGS timings";
+            } else if (codec === "dvb_subtitle") {
+              noteKind = "dvb";
+              note = "DVB timings";
+            } else {
+              noteKind = "vobsub";
+              note = "VobSub timings";
+            }
           } else if (BITMAP_CODECS.has(codec)) {
             kind = "subtitle";
             isBitmap = true;
@@ -190,6 +295,10 @@ export async function probeStreams(cfg, file, { status } = {}) {
             note_kind: noteKind,
             is_bitmap: isBitmap,
             is_pgs: isPgs,
+            is_sdh: isSdhTrack(title, disp),
+            is_default: Boolean(disp.default),
+            matches_audio_lang: Boolean(audioLang && normalizeLang(lang) === audioLang),
+            num_frames: numberOfFramesFromTags(tags),
             deprioritized: isDeprioritized(title, disp),
           });
           subIdx += 1;
@@ -200,6 +309,7 @@ export async function probeStreams(cfg, file, { status } = {}) {
         streams: items,
         has_text_subs: hasTextSubs,
         has_pgs_subs: hasPgsSubs,
+        video_fps: videoFps,
       };
     } catch {
       return empty;
@@ -243,13 +353,68 @@ export async function extractSubtitleStream(
   });
 }
 
-export async function probePgsTimings(cfg, file, streamSpec, { status } = {}) {
+async function probeDvdFramesInSession(ffmpeg, mounted, probeStream) {
+  const outPath = "/dvd_frames.json";
+  await safeDelete(ffmpeg, outPath);
+  try {
+    await ffmpeg.ffprobe([
+      "-v", "error",
+      "-show_frames",
+      "-select_streams", probeStream,
+      "-show_entries", "subtitle=pts_time,start_display_time,end_display_time,num_rects",
+      "-of", "json",
+      mounted,
+      "-o", outPath,
+    ]);
+    const raw = await ffmpeg.readFile(outPath);
+    if (!raw || !raw.byteLength) return null;
+    const data = JSON.parse(textDecoder.decode(raw));
+    const frames = Array.isArray(data && data.frames) ? data.frames : [];
+    const captions = [];
+    for (const frame of frames) {
+      const pts = Number(frame.pts_time);
+      let startMs = frame.start_display_time != null ? Number(frame.start_display_time) : 0;
+      let endMs = Number(frame.end_display_time);
+      const numRects = frame.num_rects != null ? Number(frame.num_rects) : 1;
+      if (!Number.isFinite(pts) || !Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        continue;
+      }
+      if (numRects === 0) {
+        startMs = 0;
+        endMs = 0;
+      }
+      captions.push([pts, startMs / 1000.0, endMs / 1000.0]);
+    }
+    captions.sort((a, b) => a[0] - b[0]);
+    const results = [];
+    for (let i = 0; i < captions.length; i += 1) {
+      const [pts, startOff, endOff] = captions[i];
+      const start = pts + startOff;
+      let end = pts + endOff;
+      if (i + 1 < captions.length) {
+        end = Math.min(end, captions[i + 1][0]);
+      }
+      if (end > start) results.push([start, end]);
+    }
+    return results.length ? results : null;
+  } catch {
+    return null;
+  } finally {
+    await safeDelete(ffmpeg, outPath);
+  }
+}
+
+export async function probePgsTimings(cfg, file, streamSpec, { status, codec } = {}) {
   const probeStream = normalizeProbeStream(streamSpec);
   if (!probeStream) return null;
   return withMountedFile(cfg, file, status, async (ffmpeg, mounted) => {
+    status && status(`reading PGS/VobSub/DVB timings (${streamSpec})…`);
+    if (codec === "dvd_subtitle") {
+      const dvdTimings = await probeDvdFramesInSession(ffmpeg, mounted, probeStream);
+      if (dvdTimings && dvdTimings.length) return dvdTimings;
+    }
     const outPath = "/pgs_packets.json";
     await safeDelete(ffmpeg, outPath);
-    status && status(`reading PGS/VobSub timings (${streamSpec})…`);
     try {
       // @ffmpeg/core@0.12.x leaves Module.ret at -1 for ffprobe even on success.
       await ffmpeg.ffprobe([
@@ -265,46 +430,48 @@ export async function probePgsTimings(cfg, file, streamSpec, { status } = {}) {
       if (!raw || !raw.byteLength) return null;
       const data = JSON.parse(textDecoder.decode(raw));
       const packets = Array.isArray(data && data.packets) ? data.packets : [];
-      const explicitTimings = [];
       const parsed = [];
       for (const pkt of packets) {
         if (pkt.pts_time == null || pkt.size == null) continue;
         const pts = Number(pkt.pts_time);
         const size = Number(pkt.size);
         if (!Number.isFinite(pts) || !Number.isFinite(size)) continue;
-        let hasExplicitDur = false;
+        let dur = null;
         if (pkt.duration_time != null && pkt.duration_time !== "N/A") {
-          const dur = Number(pkt.duration_time);
-          if (Number.isFinite(dur)) {
-            hasExplicitDur = true;
-            if (size > 50 && dur > 0) {
-              explicitTimings.push([pts, pts + dur]);
-            }
-          }
+          const parsedDur = Number(pkt.duration_time);
+          if (!Number.isFinite(parsedDur)) continue;
+          dur = parsedDur;
         }
-        parsed.push({ pts, size, hasExplicitDur });
+        parsed.push({ pts, size, dur });
       }
-      if (explicitTimings.length) return explicitTimings;
-
-      // Fallback for MKV Blu-ray PGS streams where duration_time is omitted:
-      // pair each large "show" packet (>50 B) with the next tiny "clear" packet.
-      const MAX_CUE_S = 15.0;
       parsed.sort((a, b) => a.pts - b.pts);
-      const inferred = [];
-      let openStart = null;
-      for (const { pts, size, hasExplicitDur } of parsed) {
-        if (hasExplicitDur) continue;
-        if (size > 50) {
-          if (openStart !== null && pts > openStart) {
-            inferred.push([openStart, Math.min(pts, openStart + MAX_CUE_S)]);
+
+      // Single-pass extraction supporting numeric durations, durationless
+      // show/clear pairs, and streams mixing both.
+      const MAX_CUE_S = 15.0;
+      const results = [];
+      let pendingShowPts = null;
+      for (const { pts, size, dur } of parsed) {
+        if (size <= 50) {
+          if (pendingShowPts !== null && dur === null && pts > pendingShowPts) {
+            results.push([pendingShowPts, Math.min(pts, pendingShowPts + MAX_CUE_S)]);
+            pendingShowPts = null;
           }
-          openStart = pts;
-        } else if (openStart !== null && pts > openStart) {
-          inferred.push([openStart, Math.min(pts, openStart + MAX_CUE_S)]);
-          openStart = null;
+          continue;
+        }
+        if (dur === null) {
+          if (pendingShowPts !== null && pts > pendingShowPts) {
+            results.push([pendingShowPts, Math.min(pts, pendingShowPts + MAX_CUE_S)]);
+          }
+          pendingShowPts = pts;
+          continue;
+        }
+        pendingShowPts = null;
+        if (dur > 0) {
+          results.push([pts, pts + dur]);
         }
       }
-      return inferred.length ? inferred : null;
+      return results.length ? results : null;
     } catch {
       return null;
     } finally {
@@ -313,7 +480,11 @@ export async function probePgsTimings(cfg, file, streamSpec, { status } = {}) {
   });
 }
 
-export async function decodeAudioToPcm(cfg, file, { status, stream, onProgress } = {}) {
+export async function decodeAudioToPcm(
+  cfg,
+  file,
+  { status, stream, dualCenter = false, onProgress } = {},
+) {
   return withMountedFile(cfg, file, status, async (ffmpeg, mounted) => {
     const frameRate = cfg.frameRate || 16000;
     const outPath = "/audio.pcm";
@@ -324,14 +495,21 @@ export async function decodeAudioToPcm(cfg, file, { status, stream, onProgress }
     // getFfmpeg, so the listener MUST be removed after this decode.
     const onP = onProgress ? ({ progress }) => onProgress(progress) : null;
     if (onP) ffmpeg.on("progress", onP);
-    try {
+
+    const runDecode = async (useDualCenter) => {
+      await safeDelete(ffmpeg, outPath);
       const args = ["-nostdin", "-i", mounted];
       const mapSpec = normalizeMapSpec(stream);
       if (mapSpec) args.push("-map", mapSpec);
+      const afExpr = useDualCenter
+        ? "aresample=async=1,asplit=2[a][b];[a]aresample=ochl=mono[m];[b]pan=mono|c0=FC[c];[m][c]amerge=inputs=2"
+        : "aresample=async=1";
       args.push(
         "-vn",
-        "-ac", "1",
-        "-af", "aresample=async=1",
+        "-sn",
+        "-dn",
+        "-ac", useDualCenter ? "2" : "1",
+        "-af", afExpr,
         "-ar", String(frameRate),
         "-f", "s16le",
         "-acodec", "pcm_s16le",
@@ -339,7 +517,22 @@ export async function decodeAudioToPcm(cfg, file, { status, stream, onProgress }
       );
       const code = await ffmpeg.exec(args);
       if (code !== 0) throw new Error(`ffmpeg exited with code ${code}`);
-      return await ffmpeg.readFile(outPath); // Uint8Array
+      const data = await ffmpeg.readFile(outPath);
+      if (!data || data.byteLength < (useDualCenter ? 4 : 2)) {
+        throw new Error("ffmpeg produced empty audio output");
+      }
+      return { pcm: data, channels: useDualCenter ? 2 : 1 };
+    };
+
+    try {
+      if (dualCenter) {
+        try {
+          return await runDecode(true);
+        } catch (err) {
+          console.warn("dual-channel (mix + FC) decode failed; falling back to mono:", err);
+        }
+      }
+      return await runDecode(false);
     } finally {
       if (onP) ffmpeg.off("progress", onP);
       await safeDelete(ffmpeg, outPath);

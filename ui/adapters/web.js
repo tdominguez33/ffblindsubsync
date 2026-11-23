@@ -44,10 +44,46 @@ function activeSecondsForTimings(timings) {
   return total;
 }
 
-function sortByPriority(streams) {
-  const preferred = streams.filter((s) => !s.deprioritized);
-  const deprioritized = streams.filter((s) => s.deprioritized);
-  return [...preferred, ...deprioritized];
+function subtitleMimeType(filename) {
+  const low = String(filename || "").toLowerCase();
+  if (low.endsWith(".vtt")) return "text/vtt;charset=utf-8";
+  if (low.endsWith(".ass") || low.endsWith(".ssa")) return "text/plain;charset=utf-8";
+  return "application/x-subrip;charset=utf-8";
+}
+
+function filterAndRankAutoTracks(streams) {
+  const usable = streams.filter((s) => !s.deprioritized);
+  if (usable.length <= 1) return usable;
+  const maxFrames = usable.reduce((m, s) => Math.max(m, Number(s.num_frames) || 0), 0);
+  const fullFloor = maxFrames > 0 ? Math.max(200, Math.floor(0.4 * maxFrames)) : 0;
+
+  const isFull = (s) => {
+    const n = Number(s.num_frames) || 0;
+    return maxFrames === 0 || n === 0 || n >= fullFloor;
+  };
+
+  return usable
+    .map((s, idx) => ({ s, idx }))
+    .sort((a, b) => {
+      const af = isFull(a.s) ? 1 : 0;
+      const bf = isFull(b.s) ? 1 : 0;
+      if (bf !== af) return bf - af;
+      const aClean = a.s.is_sdh ? 0 : 1;
+      const bClean = b.s.is_sdh ? 0 : 1;
+      if (bClean !== aClean) return bClean - aClean;
+      const aLang = a.s.matches_audio_lang ? 1 : 0;
+      const bLang = b.s.matches_audio_lang ? 1 : 0;
+      if (bLang !== aLang) return bLang - aLang;
+      const aDef = a.s.is_default ? 1 : 0;
+      const bDef = b.s.is_default ? 1 : 0;
+      if (bDef !== aDef) return bDef - aDef;
+      if (!af && !bf) {
+        const diff = (Number(b.s.num_frames) || 0) - (Number(a.s.num_frames) || 0);
+        if (diff !== 0) return diff;
+      }
+      return a.idx - b.idx;
+    })
+    .map((x) => x.s);
 }
 
 const WORKER_STATUS_KEY_MAP = new Map([
@@ -87,7 +123,7 @@ function mapWorkerMessage(raw) {
       message: capitalize(s),
     };
   }
-  const mPgs = /^reading pgs\/vobsub timings \(([^)]+)\)/i.exec(s);
+  const mPgs = /^reading pgs\/vobsub(?:\/dvb)? timings \(([^)]+)\)/i.exec(s);
   if (mPgs) {
     return {
       messageKey: "progress.readingPgsStream",
@@ -171,7 +207,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
   }
 
   async function probeStreamsCached(file, onStatus) {
-    const empty = { streams: [], has_text_subs: false, has_pgs_subs: false };
+    const empty = { streams: [], has_text_subs: false, has_pgs_subs: false, video_fps: null };
     if (!(file instanceof File) || isSubtitleFile(file.name)) {
       return empty;
     }
@@ -316,17 +352,18 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             URL.revokeObjectURL(lastBlobUrl);
             lastBlobUrl = null;
           }
+          const outName = raw.output_name || "synced.srt";
           const blob = new Blob([raw.output_text || ""], {
-            type: "application/x-subrip;charset=utf-8",
+            type: subtitleMimeType(outName),
           });
           lastBlobUrl = URL.createObjectURL(blob);
-          const outName = raw.output_name || "synced.srt";
           finishPending({
             ok: true,
             offset_seconds: raw.offset_seconds,
             framerate_scale_factor: raw.framerate_scale_factor,
             split_segments: raw.split_segments,
             dropped_cues: raw.dropped_cues || 0,
+            clipped_cues: raw.clipped_cues || 0,
             elapsed_seconds: elapsed,
             output_label: outName,
             download_url: lastBlobUrl,
@@ -483,14 +520,21 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           String(refStream).startsWith("a:") ||
           String(refStream).startsWith("0:a:"));
 
-      // 2a. Explicit PGS / VobSub timing stream selected
+      // 2a. Explicit PGS / VobSub / DVB timing stream selected
       if (isExplicitPgs) {
         onProgress({
           messageKey: "progress.readingPgsStream",
           messageParams: { stream: refStream },
           fraction: 0.05,
         });
-        const timings = await mod.probePgsTimings(ff, refFile, refStream, { status: reportStatus });
+        const probed = await probeStreamsCached(refFile, reportStatus);
+        const matchedStream = ((probed && probed.streams) || []).find(
+          (s) => s.value === refStream || `0:${s.value}` === refStream,
+        );
+        const timings = await mod.probePgsTimings(ff, refFile, refStream, {
+          status: reportStatus,
+          codec: matchedStream && matchedStream.codec,
+        });
         if (!timings || !timings.length) {
           return {
             ok: false,
@@ -501,10 +545,14 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           };
         }
         onProgress({ messageKey: "progress.aligningPgs", fraction: 0.35 });
+        const pgsOptions =
+          probed && probed.video_fps
+            ? { ...options, inferred_sub_fps: probed.video_fps }
+            : options;
         return postWorkerSync(
           {
             type: "syncTimings",
-            payload: { timings, inName: inFile.name, inBytes: inBytesRaw, options },
+            payload: { timings, inName: inFile.name, inBytes: inBytesRaw, options: pgsOptions },
           },
           [inBytesRaw.buffer],
           onProgress,
@@ -543,6 +591,15 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           };
         }
         onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
+        let subOptions = options;
+        try {
+          const probed = await probeStreamsCached(refFile, reportStatus);
+          if (probed && probed.video_fps) {
+            subOptions = { ...options, inferred_sub_fps: probed.video_fps };
+          }
+        } catch {
+          /* ignore */
+        }
         return postWorkerSync(
           {
             type: "sync",
@@ -551,7 +608,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
               inName: inFile.name,
               refBytes: subBytes,
               inBytes: inBytesRaw,
-              options,
+              options: subOptions,
             },
           },
           [subBytes.buffer, inBytesRaw.buffer],
@@ -561,15 +618,20 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         );
       }
 
-      // 2c. Auto embedded subtitles -> PGS/VobSub timings fallback (subs_then_webrtc)
+      // 2c. Auto embedded subtitles -> PGS/VobSub/DVB timings fallback (subs_then_webrtc)
       const useEmbeddedFirst = !isExplicitAudio && String(request.vad || "").includes("subs");
       if (useEmbeddedFirst) {
         onProgress({ messageKey: "progress.checkingVideoSubs", fraction: 0.04 });
         const probed = await probeStreamsCached(refFile, reportStatus);
         const streams = (probed && probed.streams) || [];
+        const probedOptions =
+          probed && probed.video_fps
+            ? { ...options, inferred_sub_fps: probed.video_fps }
+            : options;
 
-        // Try embedded text subtitle tracks (full dialogue first, forced/commentary last).
-        const textTracks = sortByPriority(
+        // Try full embedded text subtitle tracks (skip forced/commentary/signs/songs
+        // and sparse stubs with <50 cues so they fall through to bitmap/audio VAD).
+        const textTracks = filterAndRankAutoTracks(
           streams.filter((s) => s.kind === "subtitle" && !s.is_bitmap),
         );
         for (const track of textTracks) {
@@ -597,7 +659,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
                   inName: inFile.name,
                   refBytes: subBytes,
                   inBytes: inCopy,
-                  options,
+                  options: { ...probedOptions, min_ref_cues: 50 },
                 },
               },
               [subBytes.buffer, inCopy.buffer],
@@ -609,8 +671,10 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           }
         }
 
-        // Fall back to PGS / VobSub packet timings (up to 3 tracks, matching CLI/desktop).
-        const pgsTracks = sortByPriority(streams.filter((s) => s.kind === "pgs")).slice(0, 3);
+        // Fall back to PGS / VobSub / DVB timings (non-forced/commentary, ranked by cue count).
+        const pgsTracks = filterAndRankAutoTracks(
+          streams.filter((s) => s.kind === "pgs"),
+        ).slice(0, 3);
         for (const track of pgsTracks) {
           onProgress({
             messageKey: "progress.readingPgsStream",
@@ -619,10 +683,15 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           });
           const timings = await mod.probePgsTimings(ff, refFile, track.value, {
             status: reportStatus,
+            codec: track.codec,
           });
-          if (timings && timings.length >= 10 && activeSecondsForTimings(timings) >= 5.0) {
+          if (timings && timings.length >= 20 && activeSecondsForTimings(timings) >= 50.0) {
             const kindLabel =
-              track.codec === "hdmv_pgs_subtitle" ? "PGS" : "VobSub";
+              track.codec === "hdmv_pgs_subtitle"
+                ? "PGS"
+                : track.codec === "dvb_subtitle"
+                  ? "DVB"
+                  : "VobSub";
             onProgress({
               messageKey: "progress.usingStreamKind",
               messageParams: { kind: kindLabel, stream: track.value },
@@ -632,7 +701,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             const res = await postWorkerSync(
               {
                 type: "syncTimings",
-                payload: { timings, inName: inFile.name, inBytes: inCopy, options },
+                payload: { timings, inName: inFile.name, inBytes: inCopy, options: probedOptions },
               },
               [inCopy.buffer],
               onProgress,
@@ -654,11 +723,37 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         };
       }
 
+      let probedForAudio = null;
+      try {
+        probedForAudio = await probeStreamsCached(refFile, reportStatus);
+      } catch {
+        probedForAudio = null;
+      }
+      const audioStreams = ((probedForAudio && probedForAudio.streams) || []).filter(
+        (s) => s.kind === "audio",
+      );
+      let targetAudio = null;
+      if (isExplicitAudio && refStream) {
+        targetAudio =
+          audioStreams.find(
+            (s) => s.value === refStream || `0:${s.value}` === refStream,
+          ) || null;
+      } else if (audioStreams.length) {
+        targetAudio = audioStreams.find((s) => s.is_default) || audioStreams[0];
+      }
+      const dualCenter = Boolean(targetAudio && targetAudio.has_center_channel);
+      const audioOptions =
+        probedForAudio && probedForAudio.video_fps
+          ? { ...options, inferred_sub_fps: probedForAudio.video_fps }
+          : options;
+
       let pcm;
+      let channels = 1;
       try {
         onProgress({ messageKey: "progress.loadingFfmpegWasm", fraction: 0.05 });
-        pcm = await mod.decodeAudioToPcm(ff, refFile, {
+        const decoded = await mod.decodeAudioToPcm(ff, refFile, {
           stream: isExplicitAudio ? refStream : undefined,
+          dualCenter,
           status: reportStatus,
           onProgress: (p) => {
             if (Number.isFinite(p) && p > 0 && p <= 1) {
@@ -671,6 +766,13 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             }
           },
         });
+        if (decoded && decoded.pcm) {
+          pcm = decoded.pcm;
+          channels = decoded.channels || 1;
+        } else {
+          pcm = decoded;
+          channels = 1;
+        }
       } catch (e) {
         console.error(e);
         const errDetail = (e && e.message) || e;
@@ -689,11 +791,12 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           type: "syncAudioPcm",
           payload: {
             pcm,
+            channels,
             frameRate: ff.frameRate,
             inName: inFile.name,
             inBytes: inBytesRaw,
             vad: "webrtc",
-            options,
+            options: audioOptions,
           },
         },
         [pcm.buffer, inBytesRaw.buffer],

@@ -23,11 +23,17 @@ from ffsubsync.ffsubsync import make_parser, run
 from ffsubsync.speech_transformers import (
     _make_auditok_detector,
     _make_webrtcvad_detector,
+    _parse_auditok_spec,
+)
+from ffsubsync.subtitle_parser import (
+    _detect_microdvd_fps,
+    make_subtitle_parser,
 )
 
 _WORK_DIR = "/work"
 _ALIGN_STEP_RE = re.compile(r"computing alignment (\d+)/(\d+)")
 _GSS_STEP_RE = re.compile(r"got score .* for ratio ([0-9.]+)")
+_PRESERVED_OUT_EXTS = (".srt", ".ass", ".ssa", ".vtt")
 
 
 def _ensure_workdir() -> None:
@@ -51,9 +57,16 @@ def _write(name: str, data) -> str:
     return path
 
 
+def _output_ext(in_name: str) -> str:
+    """Preserve .srt/.ass/.ssa/.vtt output format; convert other inputs (e.g. .sub) to .srt."""
+    _stem, ext = os.path.splitext(os.path.basename(in_name))
+    low = ext.lower()
+    return low if low in _PRESERVED_OUT_EXTS else ".srt"
+
+
 def _synced_name(in_name: str) -> str:
     stem, _ext = os.path.splitext(os.path.basename(in_name))
-    return "{}.synced.srt".format(stem)
+    return "{}.synced{}".format(stem, _output_ext(in_name))
 
 
 class _ProgressLogHandler(logging.Handler):
@@ -99,7 +112,7 @@ class _ProgressLogHandler(logging.Handler):
 
 
 def _common_argv(in_path, out_path, *, output_encoding, no_fix_framerate, gss,
-                 max_offset_seconds, split_sync=False, auto_split=False):
+                 max_offset_seconds, split_sync=False, auto_split=False, sub_fps=None):
     argv = ["-i", in_path, "-o", out_path]
     if output_encoding:
         argv += ["--output-encoding", output_encoding]
@@ -113,7 +126,23 @@ def _common_argv(in_path, out_path, *, output_encoding, no_fix_framerate, gss,
         argv += ["--auto-split"]
     if max_offset_seconds is not None:
         argv += ["--max-offset-seconds", str(max_offset_seconds)]
+    if sub_fps is not None:
+        argv += ["--sub-fps", str(sub_fps)]
     return argv
+
+
+def _resolve_fallback_sub_fps(in_name: str, in_bytes, inferred_sub_fps):
+    """Return ``inferred_sub_fps`` only for MicroDVD ``.sub`` inputs lacking an FPS header."""
+    if inferred_sub_fps is None or not str(in_name or "").lower().endswith(".sub"):
+        return None
+    try:
+        raw = _as_bytes(in_bytes)
+        sample = raw[:4096].decode("utf-8", errors="ignore")
+        if _detect_microdvd_fps(sample) is not None:
+            return None
+    except Exception:
+        pass
+    return float(inferred_sub_fps)
 
 
 def _run_and_collect(
@@ -164,6 +193,7 @@ def _run_and_collect(
         "framerate_scale_factor": result.get("framerate_scale_factor"),
         "split_segments": result.get("split_segments"),
         "dropped_cues": result.get("dropped_cues", 0),
+        "clipped_cues": result.get("clipped_cues", 0),
         "output_name": _synced_name(in_name),
         "output_text": output_text,
         "error": None if ok else "sync did not succeed (see console logs)",
@@ -183,6 +213,8 @@ def sync_subtitles(
     split_sync: bool = False,
     auto_split: bool = False,
     max_offset_seconds=None,
+    min_ref_cues: int = 0,
+    inferred_sub_fps=None,
     progress_cb=None,
 ):
     """Sync ``in_bytes`` against subtitle reference ``ref_bytes``."""
@@ -191,12 +223,39 @@ def sync_subtitles(
         progress_cb(0.02, "Preparing subtitles…")
     ref_path = _write("reference_" + os.path.basename(ref_name), ref_bytes)
     in_path = _write("input_" + os.path.basename(in_name), in_bytes)
-    out_path = os.path.join(_WORK_DIR, "output.srt")
+    out_path = os.path.join(_WORK_DIR, "output" + _output_ext(in_name))
+
+    if min_ref_cues and int(min_ref_cues) > 0:
+        try:
+            ref_fmt = os.path.splitext(ref_path)[-1].lstrip(".").lower() or "srt"
+            ref_parser = make_subtitle_parser(
+                fmt=ref_fmt,
+                encoding=reference_encoding or "infer",
+            ).fit(ref_path)
+            ref_cue_count = len(ref_parser.subs_ or [])
+            if ref_cue_count < int(min_ref_cues):
+                return {
+                    "ok": False,
+                    "offset_seconds": None,
+                    "framerate_scale_factor": None,
+                    "split_segments": None,
+                    "dropped_cues": 0,
+                    "clipped_cues": 0,
+                    "output_name": _synced_name(in_name),
+                    "output_text": "",
+                    "error": (
+                        "reference subtitle has only %d cues (< %d)"
+                        % (ref_cue_count, int(min_ref_cues))
+                    ),
+                }
+        except Exception:
+            pass
 
     argv = [ref_path] + _common_argv(
         in_path, out_path, output_encoding=output_encoding,
         no_fix_framerate=no_fix_framerate, gss=gss, split_sync=split_sync,
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
+        sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
     )
     if reference_encoding:
         argv += ["--reference-encoding", reference_encoding]
@@ -211,41 +270,110 @@ _DETECTOR_MAKERS = {
 }
 
 
-def _pcm_to_speech_signal(
-    pcm: bytes,
-    frame_rate: int,
-    vad: str,
-    non_speech_label: float,
-    progress_cb=None,
-) -> np.ndarray:
-    """Turn mono s16le PCM into ffsubsync's speech signal via the chosen VAD."""
+def _make_browser_detector(vad: str, frame_rate: int, non_speech_label: float):
+    if vad.startswith("auditok"):
+        return _make_auditok_detector(
+            SAMPLE_RATE,
+            frame_rate,
+            non_speech_label,
+            vad_spec=_parse_auditok_spec(vad),
+        )
     maker = _DETECTOR_MAKERS.get(vad)
     if maker is None:
         raise ValueError(
             "unsupported browser vad %r; expected one of %s"
             % (vad, ", ".join(sorted(_DETECTOR_MAKERS)))
         )
-    detector = maker(SAMPLE_RATE, frame_rate, non_speech_label)
+    return maker(SAMPLE_RATE, frame_rate, non_speech_label)
 
-    bytes_per_frame = 2
-    frames_per_window = bytes_per_frame * frame_rate // SAMPLE_RATE
-    windows_per_buffer = 10000
-    step = frames_per_window * windows_per_buffer  # bytes per chunk (window-aligned)
 
-    total_bytes = len(pcm)
-    parts = []
-    for start in range(0, total_bytes, step):
-        chunk = pcm[start:start + step]
-        if not chunk:
-            break
-        parts.append(detector(np.frombuffer(chunk, np.uint8)))
+def _iter_pcm_chunks(ref_pcm, step: int):
+    """Yield ``(chunk_u8, bytes_done, total_bytes)`` without copying the whole buffer.
+
+    In Pyodide, ``ref_pcm`` is a JS ``Uint8Array`` proxy (often 500 MB–1.5 GB
+    for a 2-hour 48 kHz movie). Slicing via ``subarray(start, end).to_py()``
+    keeps only one ~10 MB chunk inside the 32-bit WASM heap at a time instead
+    of duplicating the entire audio buffer into WASM linear memory.
+    """
+    is_js_typed_array = (
+        hasattr(ref_pcm, "subarray")
+        and hasattr(ref_pcm, "byteLength")
+        and hasattr(ref_pcm, "to_py")
+    )
+    if is_js_typed_array:
+        total_bytes = int(ref_pcm.byteLength)
+        for start in range(0, total_bytes, step):
+            end = min(total_bytes, start + step)
+            sub_proxy = ref_pcm.subarray(start, end)
+            try:
+                chunk_py = sub_proxy.to_py()
+            finally:
+                if hasattr(sub_proxy, "destroy"):
+                    sub_proxy.destroy()
+            yield np.frombuffer(chunk_py, dtype=np.uint8), end, total_bytes
+            chunk_py = None
+    else:
+        raw = (
+            memoryview(ref_pcm)
+            if isinstance(ref_pcm, (bytes, bytearray, memoryview))
+            else memoryview(_as_bytes(ref_pcm))
+        )
+        total_bytes = raw.nbytes
+        for start in range(0, total_bytes, step):
+            end = min(total_bytes, start + step)
+            yield np.frombuffer(raw[start:end], dtype=np.uint8), end, total_bytes
+
+
+def _pcm_to_speech_signals(
+    ref_pcm,
+    frame_rate: int,
+    vad: str,
+    non_speech_label: float,
+    channels: int = 1,
+    progress_cb=None,
+):
+    """Stream mono or interleaved 2-ch (mix + FC) s16le PCM through VAD.
+
+    Returns ``(mix_signal, fc_signal_or_None)``. Processes window-aligned chunks
+    directly from the source buffer so 2-hour 48 kHz surround tracks stay well
+    within Pyodide's 32-bit WASM memory ceiling.
+    """
+    n_ch = 2 if int(channels or 1) == 2 else 1
+    mix_detector = _make_browser_detector(vad, frame_rate, non_speech_label)
+    fc_detector = (
+        _make_browser_detector(vad, frame_rate, non_speech_label) if n_ch == 2 else None
+    )
+
+    bytes_per_sample_frame = 2 * n_ch
+    bytes_per_window = bytes_per_sample_frame * frame_rate // SAMPLE_RATE
+    # 5000 windows = 50 s of audio per chunk (~1.6–19.2 MB depending on rate & channels).
+    windows_per_buffer = 5000
+    step = bytes_per_window * windows_per_buffer
+
+    mix_parts = []
+    fc_parts = []
+    for chunk_u8, bytes_done, total_bytes in _iter_pcm_chunks(ref_pcm, step):
+        usable = len(chunk_u8) - (len(chunk_u8) % bytes_per_sample_frame)
+        if usable < bytes_per_sample_frame:
+            continue
+        if n_ch == 2:
+            stereo = np.frombuffer(chunk_u8[:usable], dtype="<i2").reshape(-1, 2)
+            mix_chunk = np.ascontiguousarray(stereo[:, 0]).view(np.uint8)
+            fc_chunk = np.ascontiguousarray(stereo[:, 1]).view(np.uint8)
+            mix_parts.append(mix_detector(mix_chunk))
+            fc_parts.append(fc_detector(fc_chunk))
+        else:
+            mix_parts.append(mix_detector(chunk_u8[:usable]))
         if progress_cb is not None and total_bytes > 0:
-            done_frac = min(1.0, (start + len(chunk)) / float(total_bytes))
+            done_frac = min(1.0, bytes_done / float(total_bytes))
             pct = int(round(done_frac * 100))
             progress_cb(done_frac * 0.50, "Detecting speech (%d%%)…" % pct)
-    if not parts:
+
+    if not mix_parts:
         raise ValueError("no audio samples to analyze")
-    return np.concatenate(parts)
+    mix_signal = np.concatenate(mix_parts)
+    fc_signal = np.concatenate(fc_parts) if (n_ch == 2 and fc_parts) else None
+    return mix_signal, fc_signal
 
 
 def sync_with_audio(
@@ -255,6 +383,7 @@ def sync_with_audio(
     in_bytes,
     *,
     vad: str = "webrtc",
+    channels: int = 1,
     non_speech_label: float = 0.0,
     output_encoding: str = "utf-8",
     no_fix_framerate: bool = False,
@@ -262,18 +391,27 @@ def sync_with_audio(
     split_sync: bool = False,
     auto_split: bool = False,
     max_offset_seconds=None,
+    inferred_sub_fps=None,
     progress_cb=None,
 ):
-    """Sync ``in_bytes`` against decoded audio PCM from a video/audio reference."""
+    """Sync ``in_bytes`` against decoded audio PCM from a video/audio reference.
+
+    When ``channels == 2`` (interleaved s16le downmix + surround center FC),
+    runs VAD on both channels and serializes ``alt_fc_speech`` alongside
+    ``speech`` so ffsubsync picks the higher peak-SNR alignment identically to
+    the CLI and desktop builds.
+    """
     _ensure_workdir()
+    fc_signal = None
     try:
         if progress_cb is not None:
             progress_cb(0.0, "Detecting speech (0%)…")
-        signal = _pcm_to_speech_signal(
-            _as_bytes(ref_pcm),
+        signal, fc_signal = _pcm_to_speech_signals(
+            ref_pcm,
             int(frame_rate),
             vad,
             non_speech_label,
+            channels=int(channels or 1),
             progress_cb=progress_cb,
         )
     except Exception:
@@ -287,14 +425,18 @@ def sync_with_audio(
         }
 
     npz_path = os.path.join(_WORK_DIR, "reference.npz")
-    np.savez_compressed(npz_path, speech=signal)
+    if fc_signal is not None:
+        np.savez_compressed(npz_path, speech=signal, alt_fc_speech=fc_signal)
+    else:
+        np.savez_compressed(npz_path, speech=signal)
     in_path = _write("input_" + os.path.basename(in_name), in_bytes)
-    out_path = os.path.join(_WORK_DIR, "output.srt")
+    out_path = os.path.join(_WORK_DIR, "output" + _output_ext(in_name))
 
     argv = [npz_path] + _common_argv(
         in_path, out_path, output_encoding=output_encoding,
         no_fix_framerate=no_fix_framerate, gss=gss, split_sync=split_sync,
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
+        sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
     )
     argv += ["--non-speech-label", str(non_speech_label)]
     return _run_and_collect(
@@ -318,9 +460,10 @@ def sync_with_timings(
     split_sync: bool = False,
     auto_split: bool = False,
     max_offset_seconds=None,
+    inferred_sub_fps=None,
     progress_cb=None,
 ):
-    """Sync ``in_bytes`` against ``(start_s, end_s)`` timing intervals (PGS/VobSub)."""
+    """Sync ``in_bytes`` against ``(start_s, end_s)`` timing intervals (PGS/VobSub/DVB)."""
     _ensure_workdir()
     try:
         if progress_cb is not None:
@@ -354,11 +497,12 @@ def sync_with_timings(
     npz_path = os.path.join(_WORK_DIR, "reference.npz")
     np.savez_compressed(npz_path, speech=signal)
     in_path = _write("input_" + os.path.basename(in_name), in_bytes)
-    out_path = os.path.join(_WORK_DIR, "output.srt")
+    out_path = os.path.join(_WORK_DIR, "output" + _output_ext(in_name))
 
     argv = [npz_path] + _common_argv(
         in_path, out_path, output_encoding=output_encoding,
         no_fix_framerate=no_fix_framerate, gss=gss, split_sync=split_sync,
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
+        sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
     )
     return _run_and_collect(argv, out_path, in_name, progress_cb=progress_cb)

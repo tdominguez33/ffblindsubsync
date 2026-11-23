@@ -67,6 +67,12 @@ Requires Python 3.8+ and `ffmpeg` / `ffprobe` on `PATH`:
 pip install git+https://github.com/tdominguez33/ffblindsubsync
 ```
 
+On Linux distributions with externally-managed Python environments (e.g. Debian / Ubuntu), use `pipx` instead:
+
+```bash
+pipx install git+https://github.com/tdominguez33/ffblindsubsync
+```
+
 Examples (`ffblindsubsync`, `ffs`, `ffsubsync`, and `subsync` all work):
 
 ```bash

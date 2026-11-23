@@ -177,3 +177,32 @@ def test_fallback_clamps_long_orphan_duration(mock_probe, mock_bin):
     }
     result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
     assert result == [(10.0, 25.0)]
+
+
+@patch("ffsubsync.speech_transformers.ffmpeg_bin_path", return_value="ffprobe")
+@patch("ffsubsync.speech_transformers.ffmpeg.probe")
+def test_mixed_numeric_and_na_duration_packets(mock_probe, mock_bin):
+    """Streams mixing numeric duration_time and durationless show/clear pairs both work."""
+    mock_probe.return_value = {
+        "packets": [
+            _make_packet(1.0, 2.5, 1000),
+            {"pts_time": "8.008000", "size": "28162"},  # missing duration_time key
+            {"pts_time": "12.804000", "size": "30"},
+            _make_packet(20.0, 1.5, 900),
+        ]
+    }
+    result = _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0")
+    assert result == [(1.0, 3.5), (8.008, 12.804), (20.0, 21.5)]
+
+
+@patch("ffsubsync.speech_transformers.ffmpeg_bin_path", return_value="ffprobe")
+@patch("ffsubsync.speech_transformers.ffmpeg.probe")
+def test_unmatched_trailing_na_show_is_dropped(mock_probe, mock_bin):
+    mock_probe.return_value = {
+        "packets": [
+            _make_packet(8.008, None, 28162),
+            _make_packet(12.804, None, 30),
+            _make_packet(14.723, None, 9212),
+        ]
+    }
+    assert _get_pgs_timings_via_ffprobe("test.mkv", "0:s:0") == [(8.008, 12.804)]

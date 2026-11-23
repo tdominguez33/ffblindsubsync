@@ -3,7 +3,9 @@ import copy
 from datetime import timedelta
 import logging
 import os
-from typing import cast, Any, Dict, Iterator, List, Optional
+import shutil
+import tempfile
+from typing import cast, Any, Dict, Iterator, List, Optional, Tuple
 
 import pysubs2
 import srt
@@ -12,6 +14,9 @@ import sys
 
 logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
+
+SUPPORTED_OUTPUT_FORMATS = frozenset({"srt", "ssa", "ass", "vtt", "sub"})
+DEFAULT_MICRODVD_FPS: float = 23.976
 
 
 class GenericSubtitle:
@@ -94,6 +99,7 @@ class GenericSubtitlesFile:
         self._styles: Optional[Dict[str, pysubs2.SSAStyle]] = kwargs.pop("styles", None)
         self._fonts_opaque: Optional[Dict[str, Any]] = kwargs.pop("fonts_opaque", None)
         self._info: Optional[Dict[str, str]] = kwargs.pop("info", None)
+        self._fps: Optional[float] = kwargs.pop("fps", None)
 
     def set_encoding(self, encoding: str) -> "GenericSubtitlesFile":
         if encoding != "same":
@@ -119,6 +125,7 @@ class GenericSubtitlesFile:
             styles=self._styles,
             fonts_opaque=self._fonts_opaque,
             info=self._info,
+            fps=self._fps,
         )
 
     def gen_raw_resolved_subs(self):
@@ -131,7 +138,26 @@ class GenericSubtitlesFile:
             offset_subs.append(GenericSubtitle(sub.start + td, sub.end + td, sub.inner))
         return self.clone_props_for_subs(offset_subs)
 
-    def write_file(self, fname: str) -> None:
+    def sanitize_negative_timestamps(self) -> Tuple["GenericSubtitlesFile", int]:
+        """Clamp partially-negative cues to 00:00:00 and drop fully-negative ones.
+
+        ``srt.compose`` silently drops any cue with ``start < 0`` even if ``end > 0``.
+        Clamping ``start`` to 0 preserves cues that cross ``t=0``; cues whose
+        ``end <= 0`` are omitted and counted so callers can surface a clear warning.
+        """
+        zero = timedelta(0)
+        cleaned: List[GenericSubtitle] = []
+        clipped = 0
+        for sub in self.subs_:
+            if sub.start >= zero:
+                cleaned.append(sub)
+            elif sub.end > zero:
+                cleaned.append(GenericSubtitle(zero, sub.end, sub.inner))
+            else:
+                clipped += 1
+        return self.clone_props_for_subs(cleaned), clipped
+
+    def write_file(self, fname: Optional[str]) -> None:
         # TODO: converter to go between self.subs_format and out_format
         if fname is None:
             out_format = self._sub_format
@@ -143,6 +169,7 @@ class GenericSubtitlesFile:
             "ass",
             "vtt",
             "srt",
+            "sub",
         ):
             ssaf = pysubs2.SSAFile()
             ssaf.events = subs
@@ -152,18 +179,56 @@ class GenericSubtitlesFile:
                 ssaf.info = self._info
             if self._fonts_opaque is not None:
                 ssaf.fonts_opaque = self._fonts_opaque
-            to_write = ssaf.to_string(out_format)
-        elif self._sub_format == "srt" and out_format in ("ssa", "ass", "vtt"):
-            to_write = pysubs2.SSAFile.from_string(srt.compose(subs)).to_string(
-                out_format
-            )
+            if out_format == "sub":
+                out_fps = self._fps or DEFAULT_MICRODVD_FPS
+                if self._fps is None:
+                    logger.warning(
+                        "writing MicroDVD .sub with default FPS %.3f (specify --sub-fps to override)",
+                        out_fps,
+                    )
+                to_write = ssaf.to_string("microdvd", fps=out_fps)
+            else:
+                to_write = ssaf.to_string(out_format)
+        elif self._sub_format == "srt" and out_format in ("ssa", "ass", "vtt", "sub"):
+            ssaf = pysubs2.SSAFile.from_string(srt.compose(subs))
+            if out_format == "sub":
+                out_fps = self._fps or DEFAULT_MICRODVD_FPS
+                if self._fps is None:
+                    logger.warning(
+                        "writing MicroDVD .sub with default FPS %.3f (specify --sub-fps to override)",
+                        out_fps,
+                    )
+                to_write = ssaf.to_string("microdvd", fps=out_fps)
+            else:
+                to_write = ssaf.to_string(out_format)
         elif out_format == "srt":
             to_write = srt.compose(subs)
         else:
             raise NotImplementedError("unsupported output format: %s" % out_format)
 
-        with open(fname or sys.stdout.fileno(), "wb") as f:
-            f.write(to_write.encode(self._encoding))
+        encoded = to_write.encode(self._encoding)
+        if fname is not None and os.path.isfile(fname):
+            # Preserve the original until the complete replacement is written
+            # and closed. Resolve symlinks to keep writing to their target.
+            destination = os.path.realpath(fname)
+            # Check the original's write permissions without truncating it.
+            with open(destination, "ab"):
+                pass
+            temporary_file = tempfile.NamedTemporaryFile(
+                mode="wb", dir=os.path.dirname(destination), delete=False
+            )
+            temporary_name = temporary_file.name
+            try:
+                with temporary_file as f:
+                    f.write(encoded)
+                shutil.copymode(destination, temporary_name)
+                os.replace(temporary_name, destination)
+            finally:
+                if os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
+        else:
+            with open(fname or sys.stdout.fileno(), "wb") as f:
+                f.write(encoded)
 
 
 class SubsMixin:

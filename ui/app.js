@@ -204,7 +204,9 @@ function formatResultSummary(res) {
   const scale = Number(res.framerate_scale_factor);
   const segs = Array.isArray(res.split_segments) ? res.split_segments : null;
   const dropped = Number(res.dropped_cues || 0);
+  const clipped = Number(res.clipped_cues || 0);
   const dropNote = dropped > 0 ? i18n.t("result.orphanCues", { count: dropped }) : "";
+  const clipNote = clipped > 0 ? i18n.t("result.clippedCues", { count: clipped }) : "";
   let splitNote = "";
   if (segs) {
     if (segs.length <= 1) {
@@ -227,7 +229,8 @@ function formatResultSummary(res) {
   return (
     i18n.t("result.offset", { offset: offsetStr }) +
     (Math.abs(scale - 1) > 1e-6 ? i18n.t("result.framerate", { scale: scale.toFixed(3) }) : "") +
-    splitNote
+    splitNote +
+    clipNote
   );
 }
 
@@ -399,6 +402,8 @@ function formatStreamLabel(item) {
     note = i18n.t("form.streamNotePgs");
   } else if (item.note_kind === "vobsub") {
     note = i18n.t("form.streamNoteVobSub");
+  } else if (item.note_kind === "dvb") {
+    note = i18n.t("form.streamNoteDvb");
   } else if (item.note_kind === "image" || item.is_bitmap) {
     note = i18n.t("form.streamNoteImage", { codec: item.codec || "unknown" });
   } else {

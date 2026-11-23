@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from datetime import timedelta
 import logging
+import re
 from typing import Any, cast, List, Optional
 
 try:
@@ -29,6 +30,39 @@ from ffsubsync.generic_subtitles import GenericSubtitle, GenericSubtitlesFile, S
 
 logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
+
+_MICRODVD_FPS_LINE_RE = re.compile(
+    r"^\{\s*(\d+)\s*\}\{\s*(\d+)\s*\}\s*(\d+(?:[.,]\d+)?)\s*$"
+)
+
+
+def _detect_microdvd_fps(decoded_subs: str) -> Optional[float]:
+    """Scan the opening lines of a MicroDVD ``.sub`` file for an FPS cue.
+
+    Standard MicroDVD puts ``{1}{1}23.976`` on line 1, which ``pysubs2`` parses
+    automatically; some files place a site ad/watermark ahead of it (e.g.
+    OpenSubtitles banners), causing ``pysubs2`` to raise ``UnknownFPSError``.
+    Scanning the first 10 non-empty lines recovers the FPS in both cases.
+    """
+    seen = 0
+    for raw_line in decoded_subs.splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line:
+            continue
+        seen += 1
+        m = _MICRODVD_FPS_LINE_RE.match(line)
+        if m:
+            start_f, end_f = int(m.group(1)), int(m.group(2))
+            if abs(end_f - start_f) <= 1:
+                try:
+                    val = float(m.group(3).replace(",", "."))
+                except ValueError:
+                    val = 0.0
+                if 10.0 <= val <= 120.0:
+                    return val
+        if seen >= 10:
+            break
+    return None
 
 
 def _preprocess_subs(
@@ -74,6 +108,8 @@ class GenericSubtitleParser(SubsMixin, TransformerMixin):
         start_seconds: int = 0,
         skip_ssa_info: bool = False,
         strict: bool = False,
+        fps: Optional[float] = None,
+        fallback_fps: Optional[float] = None,
     ) -> None:
         super(self.__class__, self).__init__()
         self.sub_format: str = fmt.lower()
@@ -86,6 +122,8 @@ class GenericSubtitleParser(SubsMixin, TransformerMixin):
         # FIXME: hack to get tests to pass; remove
         self._skip_ssa_info: bool = skip_ssa_info
         self._strict: bool = strict
+        self.fps: Optional[float] = fps
+        self.fallback_fps: Optional[float] = fallback_fps
 
     def fit(self, fname: str, *_) -> "GenericSubtitleParser":
         if self.caching and self.fit_fname == ("<stdin>" if fname is None else fname):
@@ -112,17 +150,58 @@ class GenericSubtitleParser(SubsMixin, TransformerMixin):
         for encoding in encodings_to_try:
             try:
                 decoded_subs = subs.decode(encoding, errors="replace").strip()
+                resolved_fps: Optional[float] = self.fps
                 if self.sub_format == "srt":
                     parsed_subs = srt.parse(
                         decoded_subs, ignore_errors=not self._strict
                     )
-                elif self.sub_format in ("ass", "ssa", "sub", "vtt"):
+                elif self.sub_format == "sub":
+                    if self.fps is not None:
+                        parsed_subs = pysubs2.SSAFile.from_string(
+                            decoded_subs, fps=self.fps
+                        )
+                    else:
+                        try:
+                            parsed_subs = pysubs2.SSAFile.from_string(decoded_subs)
+                        except pysubs2.exceptions.UnknownFPSError:
+                            detected_fps = _detect_microdvd_fps(decoded_subs)
+                            if detected_fps is not None:
+                                logger.info(
+                                    "detected MicroDVD FPS %.3f from subtitle header",
+                                    detected_fps,
+                                )
+                                resolved_fps = detected_fps
+                                parsed_subs = pysubs2.SSAFile.from_string(
+                                    decoded_subs, fps=detected_fps
+                                )
+                            elif self.fallback_fps is not None:
+                                logger.info(
+                                    "MicroDVD .sub has no FPS header; using reference video FPS %.3f",
+                                    self.fallback_fps,
+                                )
+                                resolved_fps = self.fallback_fps
+                                parsed_subs = pysubs2.SSAFile.from_string(
+                                    decoded_subs, fps=self.fallback_fps
+                                )
+                            else:
+                                raise pysubs2.exceptions.UnknownFPSError(
+                                    "Framerate was not specified and cannot be read from the "
+                                    "MicroDVD .sub file. Specify it with --sub-fps "
+                                    "(e.g. --sub-fps 23.976 or --sub-fps 25)."
+                                )
+                    if resolved_fps is None:
+                        resolved_fps = getattr(parsed_subs, "fps", None)
+                elif self.sub_format in ("ass", "ssa", "vtt"):
                     parsed_subs = pysubs2.SSAFile.from_string(decoded_subs)
                 else:
                     raise NotImplementedError(
                         "unsupported format: %s" % self.sub_format
                     )
-                extra_generic_subtitle_file_kwargs = {}
+                if resolved_fps is None and self.fallback_fps is not None:
+                    resolved_fps = self.fallback_fps
+                extra_generic_subtitle_file_kwargs: dict = {}
+                if resolved_fps is not None:
+                    extra_generic_subtitle_file_kwargs["fps"] = resolved_fps
                 if isinstance(parsed_subs, pysubs2.SSAFile):
                     extra_generic_subtitle_file_kwargs.update(
                         dict(
@@ -172,4 +251,6 @@ def make_subtitle_parser(
         start_seconds=start_seconds,
         skip_ssa_info=kwargs.get("skip_ssa_info", False),
         strict=kwargs.get("strict", False),
+        fps=kwargs.get("fps", kwargs.get("sub_fps", None)),
+        fallback_fps=kwargs.get("fallback_fps", None),
     )

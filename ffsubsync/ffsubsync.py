@@ -9,6 +9,7 @@ import subprocess
 import sys
 from typing import cast, Any, Callable, Dict, List, Optional, Tuple, Union
 
+import ffmpeg
 import numpy as np
 
 from ffsubsync.aligners import FFTAligner, MaxScoreAligner
@@ -19,6 +20,7 @@ from ffsubsync.constants import (
     DEFAULT_FRAME_RATE,
     DEFAULT_MAX_OFFSET_SECONDS,
     DEFAULT_MAX_SUBTITLE_SECONDS,
+    DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
     DEFAULT_NON_SPEECH_LABEL,
     DEFAULT_SPLIT_PENALTY,
     DEFAULT_SPLIT_LENGTH_PENALTY,
@@ -35,8 +37,10 @@ from ffsubsync.constants import (
     DEFAULT_MAX_FRAMERATE_DEVIATION,
     VAD_CHOICES,
     is_remote_url,
+    is_valid_vad,
 )
 from ffsubsync.ffmpeg_utils import ffmpeg_bin_path, subprocess_args
+from ffsubsync.generic_subtitles import SUPPORTED_OUTPUT_FORMATS
 from ffsubsync.sklearn_shim import Pipeline, TransformerMixin
 from ffsubsync.speech_transformers import (
     VideoSpeechTransformer,
@@ -94,16 +98,20 @@ def make_test_case(
         log_path = "ffsubsync.log"
         if args.log_dir_path is not None and os.path.isdir(args.log_dir_path):
             log_path = os.path.join(args.log_dir_path, log_path)
-        shutil.copy(log_path, tar_dir)
-        shutil.copy(args.srtin[0], tar_dir)
-        if sync_was_successful:
+        if os.path.exists(log_path):
+            shutil.copy(log_path, tar_dir)
+        if args.srtin and args.srtin[0] and os.path.exists(args.srtin[0]):
+            shutil.copy(args.srtin[0], tar_dir)
+        if sync_was_successful and args.srtout and os.path.exists(args.srtout):
             shutil.move(args.srtout, tar_dir)
         if _ref_format(args.reference) in SUBTITLE_EXTENSIONS:
-            shutil.copy(args.reference, tar_dir)
-        elif args.serialize_speech or args.reference == npy_savename:
-            shutil.copy(npy_savename, tar_dir)
-        else:
-            shutil.move(npy_savename, tar_dir)
+            if args.reference and os.path.exists(args.reference):
+                shutil.copy(args.reference, tar_dir)
+        elif os.path.exists(npy_savename):
+            if args.serialize_speech or args.reference == npy_savename:
+                shutil.copy(npy_savename, tar_dir)
+            else:
+                shutil.move(npy_savename, tar_dir)
         supported_formats = set(list(zip(*shutil.get_archive_formats()))[0])
         preferred_formats = ["gztar", "bztar", "xztar", "zip", "tar"]
         for archive_format in preferred_formats:
@@ -136,6 +144,58 @@ def _resolve_srtout(args: argparse.Namespace, srtin: Optional[str]) -> Optional[
     return args.srtout
 
 
+def _parse_fps_fraction(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s in ("0/0", "N/A"):
+        return None
+    try:
+        if "/" in s:
+            num_s, den_s = s.split("/", 1)
+            den = float(den_s)
+            if den <= 0:
+                return None
+            fps = float(num_s) / den
+        else:
+            fps = float(s)
+    except (TypeError, ValueError):
+        return None
+    return fps if 1.0 <= fps <= 240.0 else None
+
+
+def _probe_video_fps(
+    fname: Optional[str],
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Optional[float]:
+    """Infer primary video stream FPS from ``fname`` via ffprobe (for MicroDVD .sub)."""
+    if not fname:
+        return None
+    ref_fmt = _ref_format(fname)
+    if ref_fmt in SUBTITLE_EXTENSIONS or ref_fmt in ("npy", "npz"):
+        return None
+    try:
+        probe = ffmpeg.probe(
+            fname,
+            cmd=ffmpeg_bin_path("ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path),
+        )
+    except Exception as e:
+        logger.debug("ffprobe failed while inferring video FPS: %s", e)
+        return None
+    for stream in probe.get("streams") or []:
+        if stream.get("codec_type") != "video":
+            continue
+        if (stream.get("disposition") or {}).get("attached_pic"):
+            continue
+        fps = _parse_fps_fraction(stream.get("avg_frame_rate")) or _parse_fps_fraction(
+            stream.get("r_frame_rate")
+        )
+        if fps is not None:
+            return fps
+    return None
+
+
 def get_srt_pipe_maker(
     args: argparse.Namespace, srtin: Optional[str]
 ) -> Callable[[Optional[float]], Union[Pipeline, Callable[[float], Pipeline]]]:
@@ -143,7 +203,24 @@ def get_srt_pipe_maker(
         srtin_format = "srt"
     else:
         srtin_format = os.path.splitext(srtin)[-1][1:].lower()
-    parser = make_subtitle_parser(fmt=srtin_format, caching=True, **args.__dict__)
+    fallback_fps: Optional[float] = None
+    explicit_sub_fps = getattr(args, "sub_fps", None)
+    srtout = _resolve_srtout(args, srtin)
+    srtout_format = (
+        os.path.splitext(srtout)[-1][1:].lower() if srtout is not None else srtin_format
+    )
+    if explicit_sub_fps is None and (srtin_format == "sub" or srtout_format == "sub"):
+        fallback_fps = _probe_video_fps(
+            args.reference,
+            ffmpeg_path=getattr(args, "ffmpeg_path", None),
+            gui_mode=getattr(args, "gui_mode", False),
+        )
+    parser = make_subtitle_parser(
+        fmt=srtin_format,
+        caching=True,
+        fallback_fps=fallback_fps,
+        **args.__dict__,
+    )
     return lambda scale_factor: make_subtitle_speech_pipeline(
         **override(args, scale_factor=scale_factor, parser=parser)
     )
@@ -281,9 +358,38 @@ def try_sync(
                     if hasattr(reference_pipe, "__getitem__")
                     else reference_pipe
                 )
-                alt_candidates = (
+                alt_candidates = list(
                     getattr(ref_step, "alt_video_speech_results_", None) or []
                 )
+                embedded_peak_weak = (
+                    best_peak_snr is not None
+                    and best_peak_snr < DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+                )
+                poor_embedded_alignment = (
+                    (
+                        (best_score < 0 and (best_peak_snr is None or embedded_peak_weak))
+                        or embedded_peak_weak
+                    )
+                    and bool(getattr(ref_step, "can_fallback_to_audio", False))
+                )
+                if poor_embedded_alignment:
+                    logger.warning(
+                        "embedded subtitle alignment looked unreliable "
+                        "(score=%.1f, peak SNR=%s); falling back to audio VAD",
+                        best_score,
+                        "%.2f" % best_peak_snr if best_peak_snr is not None else "n/a",
+                    )
+                    try:
+                        audio_speech, audio_alts = ref_step.fallback_to_audio(
+                            args.reference
+                        )
+                        alt_candidates.append(("audio VAD fallback", audio_speech))
+                        alt_candidates.extend(audio_alts)
+                    except Exception as e:
+                        logger.warning(
+                            "audio VAD fallback failed (%s); keeping embedded alignment",
+                            e,
+                        )
                 for cand_label, cand_speech in alt_candidates:
                     logger.info("comparing alignment with %s...", cand_label)
                     cand_aligner = MaxScoreAligner(
@@ -294,13 +400,25 @@ def try_sync(
                         srt_pipes,
                     )
                     cand_snr = getattr(cand_aligner, "best_peak_snr_", None)
-                    prefer_cand = (
+                    cand_is_valid = cand_score >= 0 or (
                         cand_snr is not None
-                        and (best_peak_snr is None or cand_snr > best_peak_snr)
-                    ) or (
-                        cand_snr is None
-                        and best_peak_snr is None
-                        and cand_score > best_score
+                        and cand_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+                    )
+                    best_is_valid = best_score >= 0 or (
+                        best_peak_snr is not None
+                        and best_peak_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+                    )
+                    prefer_cand = (
+                        (cand_is_valid and not best_is_valid)
+                        or (
+                            cand_snr is not None
+                            and (best_peak_snr is None or cand_snr > best_peak_snr)
+                        )
+                        or (
+                            cand_snr is None
+                            and best_peak_snr is None
+                            and cand_score > best_score
+                        )
                     )
                     if prefer_cand:
                         logger.info(
@@ -321,7 +439,7 @@ def try_sync(
                         best_peak_snr = cand_snr
                     else:
                         logger.info(
-                            "keeping full mix over %s (peak SNR %.2f vs %.2f)",
+                            "keeping primary alignment over %s (peak SNR %.2f vs %.2f)",
                             cand_label,
                             best_peak_snr or 0.0,
                             cand_snr or 0.0,
@@ -536,6 +654,12 @@ def try_sync(
                 )
             output_pipe = Pipeline(output_steps)
             out_subs = output_pipe.fit_transform(scale_step.subs_)
+            out_subs, clipped_cues = out_subs.sanitize_negative_timestamps()
+            if clipped_cues > 0:
+                logger.warning(
+                    "%d subtitle cue(s) shifted before 00:00:00 and were omitted",
+                    clipped_cues,
+                )
             if args.output_encoding != "same":
                 out_subs = out_subs.set_encoding(args.output_encoding)
             suppress_output_thresh = args.suppress_output_if_offset_less_than
@@ -556,6 +680,7 @@ def try_sync(
             result["framerate_scale_factor"] = scale_step.scale_factor
             result["split_segments"] = split_segments
             result["dropped_cues"] = dropped_cues
+            result["clipped_cues"] = clipped_cues
     result["sync_was_successful"] = sync_was_successful
     return sync_was_successful
 
@@ -677,6 +802,11 @@ def make_reference_pipe(
                         extract_audio_first=getattr(
                             args, "extract_audio_first", False
                         ),
+                        min_embedded_subtitle_cues=getattr(
+                            args,
+                            "min_embedded_subtitle_cues",
+                            DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
+                        ),
                         progress_handler=progress_handler,
                     ),
                 ),
@@ -767,9 +897,11 @@ def validate_args(args: argparse.Namespace) -> None:
     # --vad no longer uses argparse `choices` (in whisper mode it carries a model
     # path), so enforce the named-detector choices here when not in whisper mode.
     if getattr(args, "whisper_weights", None) is None and args.vad is not None:
-        if args.vad not in VAD_CHOICES:
+        if not is_valid_vad(args.vad):
             raise ValueError(
-                "invalid --vad {!r}; choose one of: {}".format(
+                "invalid --vad {!r}; choose one of: {} (auditok also accepts "
+                "a parameter, e.g. auditok:75, auditok:p20 or "
+                "auditok:webrtc:2 -- see --help)".format(
                     args.vad, ", ".join(VAD_CHOICES)
                 )
             )
@@ -854,6 +986,30 @@ def validate_args(args: argparse.Namespace) -> None:
                 "stream specified for reference subtitle extraction; "
                 "-i flag for sync input not allowed"
             )
+    sub_fps = getattr(args, "sub_fps", None)
+    if sub_fps is not None and sub_fps <= 0:
+        raise ValueError("--sub-fps must be positive (got %r)" % (sub_fps,))
+    if args.extract_subs_from_stream is None:
+        if args.srtout is not None:
+            out_ext = os.path.splitext(args.srtout)[-1][1:].lower()
+            if out_ext not in SUPPORTED_OUTPUT_FORMATS:
+                raise ValueError(
+                    "unsupported output subtitle format: {!r} (supported: {})".format(
+                        out_ext or args.srtout,
+                        ", ".join(sorted(SUPPORTED_OUTPUT_FORMATS)),
+                    )
+                )
+        elif args.overwrite_input and args.srtin:
+            for srtin_path in args.srtin:
+                if srtin_path is not None:
+                    in_ext = os.path.splitext(srtin_path)[-1][1:].lower()
+                    if in_ext not in SUPPORTED_OUTPUT_FORMATS:
+                        raise ValueError(
+                            "unsupported output subtitle format: {!r} (supported: {})".format(
+                                in_ext or srtin_path,
+                                ", ".join(sorted(SUPPORTED_OUTPUT_FORMATS)),
+                            )
+                        )
 
 
 def validate_file_permissions(args: argparse.Namespace) -> None:
@@ -999,6 +1155,7 @@ def run(
         "framerate_scale_factor": None,
         "split_segments": None,
         "dropped_cues": 0,
+        "clipped_cues": 0,
     }
     args = validate_and_transform_args(parser_or_args)
     if args is None:
@@ -1082,10 +1239,11 @@ def add_main_args_for_cli(parser: argparse.ArgumentParser) -> None:
         const="auto",
         default=None,
         help=(
-            "Use a PGS (Presentation Graphic Stream) image-based subtitle track from "
-            "the reference MKV as the sync reference instead of audio VAD. "
+            "Use an image-based subtitle track (PGS, VobSub, or DVB) from "
+            "the reference video as the sync reference instead of audio VAD. "
             "Optionally specify the stream (leading `0:` is optional, e.g. `s:0` or `3`). "
-            "Omit the value to auto-detect the first hdmv_pgs_subtitle track. "
+            "Omit the value to auto-detect one, skipping commentary and forced tracks "
+            "when a full track exists. "
             "Example: `ffs ref.mkv -i in.srt -o out.srt --pgs-ref-stream` (auto) "
             "or `ffs ref.mkv -i in.srt -o out.srt --pgs-ref-stream s:2` (explicit)."
         ),
@@ -1272,6 +1430,13 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         help="Frame rate for audio extraction (default=%d)." % DEFAULT_FRAME_RATE,
     )
     parser.add_argument(
+        "--sub-fps",
+        type=float,
+        default=None,
+        help="Framerate for MicroDVD .sub subtitle files (e.g. 23.976 or 25). "
+        "When omitted, inferred from the .sub header or the reference video.",
+    )
+    parser.add_argument(
         "--skip-infer-framerate-ratio",
         action="store_true",
         help="If set, do not try to infer framerate ratio based on duration ratio.",
@@ -1304,11 +1469,24 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         help="Which voice activity detector to use for speech extraction "
         "(if using video / audio as a reference, default={default}). Choices: "
         "{choices}. The `fused` options combine webrtc and silero and require the "
-        "optional silero dependency (torch). With --whisper-weights this instead "
-        "takes a path to a ggml VAD model for whisper's optional audio "
-        "fragmentation.".format(
+        "optional silero dependency (torch). `auditok` can use energy (auto "
+        "threshold with otsu, `auditok:pXX` for the XXth percentile with XX in "
+        "1-99, `auditok:50` for the historical fixed threshold) or a speech model "
+        "(`auditok:webrtc[:N]`, N = aggressiveness 0-3). With --whisper-weights "
+        "this instead takes a path to a ggml VAD model for whisper's optional "
+        "audio fragmentation.".format(
             default=DEFAULT_VAD, choices=", ".join(VAD_CHOICES)
         ),
+    )
+    parser.add_argument(
+        "--min-embedded-subtitle-cues",
+        type=int,
+        default=DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
+        help="With a subs_then_* VAD, ignore embedded text subtitle streams that "
+        "have fewer cues than this and fall back to bitmap subs or audio instead "
+        "(default=%d). Forced-only tracks (signs, foreign lines) are usually far "
+        "below this and produce spurious offsets when used as the reference. Set "
+        "to 0 to disable the minimum." % DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
     )
     parser.add_argument(
         "--whisper-weights",

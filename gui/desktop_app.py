@@ -269,6 +269,12 @@ class _PhaseLogHandler(logging.Handler):
         if "using VobSub subtitle stream" in msg:
             self._on_message("Using VobSub subtitle timings…", None, "progress.usingVobSubTimings")
             return
+        if "using DVB subtitle stream" in msg:
+            self._on_message("Using DVB subtitle timings…", None, "progress.usingDvbTimings")
+            return
+        if "falling back to audio VAD" in msg:
+            self._on_message("Falling back to audio VAD…", None, "progress.fallingBackAudio")
+            return
         if "extracting speech segments from subtitles" in msg:
             self._on_message("Extracting subtitle timings…", None, "progress.extractingSubTimings")
             return
@@ -416,7 +422,6 @@ class DesktopApi:
         has_text_subs = False
         has_pgs_subs = False
         bitmap_codecs = {
-            "dvb_subtitle",
             "dvb_teletext",
             "xsub",
         }
@@ -460,13 +465,20 @@ class DesktopApi:
                 audio_idx += 1
             elif ctype == "subtitle":
                 spec = "s:%d" % sub_idx
-                is_pgs = codec in ("hdmv_pgs_subtitle", "dvd_subtitle")
+                is_pgs = codec in ("hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle")
                 if is_pgs:
                     kind = "pgs"
                     is_bitmap = False
                     has_pgs_subs = True
-                    note_kind = "pgs" if codec == "hdmv_pgs_subtitle" else "vobsub"
-                    note = "PGS timings" if note_kind == "pgs" else "VobSub timings"
+                    if codec == "hdmv_pgs_subtitle":
+                        note_kind = "pgs"
+                        note = "PGS timings"
+                    elif codec == "dvb_subtitle":
+                        note_kind = "dvb"
+                        note = "DVB timings"
+                    else:
+                        note_kind = "vobsub"
+                        note = "VobSub timings"
                 elif codec in bitmap_codecs:
                     kind = "subtitle"
                     is_bitmap = True
@@ -855,6 +867,7 @@ class DesktopApi:
                         "framerate_scale_factor": result.get("framerate_scale_factor"),
                         "split_segments": result.get("split_segments"),
                         "dropped_cues": result.get("dropped_cues", 0),
+                        "clipped_cues": result.get("clipped_cues", 0),
                         "output_path": out_path,
                         "elapsed_seconds": elapsed,
                         "ffmpeg_info": ff_info,

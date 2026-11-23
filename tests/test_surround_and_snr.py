@@ -362,3 +362,31 @@ def test_try_sync_accepts_negative_raw_score_with_high_peak_snr(tmp_path):
     assert ok is True
     assert result["sync_was_successful"] is True
     assert result["offset_seconds"] == pytest.approx(true_offset_s, abs=0.1)
+
+
+def test_deserialize_speech_transformer_loads_alt_fc_channel(tmp_path):
+    true_offset_s = 14.0
+    true_offset = int(true_offset_s * SAMPLE_RATE)
+    _, _, cues = _make_sparse_vad_and_dense_subs(seed=17, true_offset=true_offset)
+    srtin = tmp_path / "in.srt"
+    srtin.write_text(srt.compose([c.inner for c in cues]), encoding="utf-8")
+    srtout = tmp_path / "out.srt"
+
+    rng = np.random.default_rng(123)
+    total_len = int(cues[-1].end.total_seconds() * SAMPLE_RATE) + true_offset + 500
+    noisy_mix = (rng.random(total_len) < 0.1).astype(float)
+    clean_fc = np.zeros(total_len, dtype=float)
+    for c in cues:
+        a = int(round(c.start.total_seconds() * SAMPLE_RATE)) + true_offset
+        b = int(round(c.end.total_seconds() * SAMPLE_RATE)) + true_offset
+        clean_fc[a:b] = 1.0
+
+    npz_path = tmp_path / "ref.npz"
+    np.savez_compressed(npz_path, speech=noisy_mix, alt_fc_speech=clean_fc)
+
+    args = ffsubsync.make_parser().parse_args(
+        [str(npz_path), "-i", str(srtin), "-o", str(srtout), "--no-fix-framerate"]
+    )
+    res = ffsubsync.run(args)
+    assert res["sync_was_successful"] is True
+    assert res["offset_seconds"] == pytest.approx(true_offset_s, abs=0.05)

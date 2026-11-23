@@ -155,7 +155,7 @@ def main() -> int:
     assert len(auto_break["split_segments"]) == 2
     print("PASS: auto_split leaves clean files unbroken and fixes mid-file break (Δ %.3fs)" % auto_err)
 
-    # --- PGS/VobSub timings path --------------------------------------------
+    # --- PGS/VobSub/DVB timings path ----------------------------------------
     timings = [(i * 2.0, i * 2.0 + 1.0) for i in range(40)]
     pgs_res = bridge.sync_with_timings(timings, "input.srt", delayed)
     assert pgs_res["ok"], "sync_with_timings should succeed"
@@ -163,6 +163,32 @@ def main() -> int:
         "expected timings offset ~%.2f, got %.3f" % (expected_offset, pgs_res["offset_seconds"])
     )
     print("PASS: sync_with_timings recovered offset %.3fs" % pgs_res["offset_seconds"])
+
+    # --- Preserve .ass and .vtt output formats in Web -----------------------
+    import pysubs2
+
+    ass_in = pysubs2.SSAFile.from_string(delayed.decode("utf-8")).to_string("ass").encode("utf-8")
+    ass_res = bridge.sync_subtitles("reference.srt", reference, "anime.ass", ass_in)
+    assert ass_res["ok"], "ASS sync should succeed"
+    assert ass_res["output_name"] == "anime.synced.ass"
+    assert "[Script Info]" in ass_res["output_text"]
+    assert "[V4+ Styles]" in ass_res["output_text"]
+
+    vtt_in = pysubs2.SSAFile.from_string(delayed.decode("utf-8")).to_string("vtt").encode("utf-8")
+    vtt_res = bridge.sync_subtitles("reference.srt", reference, "episode.vtt", vtt_in)
+    assert vtt_res["ok"], "VTT sync should succeed"
+    assert vtt_res["output_name"] == "episode.synced.vtt"
+    assert vtt_res["output_text"].startswith("WEBVTT")
+    print("PASS: web bridge preserves .ass and .vtt formats")
+
+    # --- min_ref_cues rejects sparse embedded text refs ---------------------
+    sparse_ref = make_srt(0.0, n=10)
+    sparse_res = bridge.sync_subtitles(
+        "embedded.srt", sparse_ref, "input.srt", delayed, min_ref_cues=50
+    )
+    assert not sparse_res["ok"], "sparse reference (<50 cues) should be rejected"
+    assert "only 10 cues" in (sparse_res["error"] or "")
+    print("PASS: min_ref_cues rejects sparse embedded text references")
     return 0
 
 

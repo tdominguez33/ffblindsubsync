@@ -28,7 +28,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 
 from ffsubsync.generic_subtitles import GenericSubtitle
-from ffsubsync.speech_transformers import _is_metadata
+from ffsubsync.speech_transformers import _classify_speech_cues
 
 logging.basicConfig(level=logging.INFO)
 logger: logging.Logger = logging.getLogger(__name__)
@@ -56,13 +56,12 @@ def _cue_sample_bounds(
     n = len(cues)
     starts = np.zeros(n, dtype=np.float64)
     ends = np.zeros(n, dtype=np.float64)
-    is_speech = np.zeros(n, dtype=bool)
     for i, sub in enumerate(cues):
         start = (sub.start.total_seconds() - start_seconds) * sample_rate
         duration = (sub.end.total_seconds() - sub.start.total_seconds()) * sample_rate
         starts[i] = start
         ends[i] = start + duration
-        is_speech[i] = not _is_metadata(sub.content, i == 0 or i + 1 == n)
+    is_speech = _classify_speech_cues(cues)
     return starts, ends, is_speech
 
 

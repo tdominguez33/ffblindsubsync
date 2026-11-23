@@ -33,9 +33,10 @@ self.onmessage = async (event) => {
     } else if (msg.type === "syncAudioPcm") {
       if (!engine) throw new Error("engine not initialized");
       post({ type: "progress", fraction: 0.0, message: "Detecting speech + aligning…" });
-      const { pcm, frameRate, inName, inBytes, vad, options } = msg.payload;
+      const { pcm, channels = 1, frameRate, inName, inBytes, vad, options } = msg.payload;
       const result = eng.syncAudioWithEngine(engine, {
         pcm,
+        channels,
         frameRate,
         inName,
         inBytes,
@@ -60,9 +61,19 @@ self.onmessage = async (event) => {
       throw new Error("unknown worker message type: " + msg.type);
     }
   } catch (err) {
-    post({ type: "error", error: String((err && err.stack) || err) });
+    post({ type: "error", error: formatError(err) });
   }
 };
+
+function formatError(err) {
+  if (!err) return "Unknown error";
+  const msg = err.message ? String(err.message) : "";
+  const stack = err.stack ? String(err.stack) : "";
+  if (msg && stack && !stack.includes(msg)) {
+    return `${msg}\n${stack}`;
+  }
+  return stack || msg || String(err);
+}
 
 function post(message) {
   self.postMessage(message);

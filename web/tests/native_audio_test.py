@@ -98,6 +98,55 @@ def main() -> int:
         print("  NOTE: webrtc did not sync synthetic audio (expected for non-speech "
               "test tones); detector integration ran without error.")
 
+    # Dual-channel (mix + FC) parity test: channel 0 (downmix) is continuous
+    # music/noise that overwhelms VAD, while channel 1 (center channel FC) has
+    # the clean speech schedule. Verify sync_with_audio(..., channels=2) selects
+    # FC and recovers the -5.0s offset.
+    clean_i16 = np.frombuffer(pcm, dtype="<i2")
+    rng = np.random.default_rng(42)
+    noisy_mix = (rng.standard_normal(len(clean_i16)) * 12000).clip(-32767, 32767).astype("<i2")
+    dual = np.empty((len(clean_i16), 2), dtype="<i2")
+    dual[:, 0] = noisy_mix
+    dual[:, 1] = clean_i16
+    r_dual = bridge.sync_with_audio(
+        dual.tobytes(), FRAME_RATE, "input.srt", make_srt(5.0), vad="auditok", channels=2
+    )
+    print("[auditok dual mix+FC] ok=%s offset=%s" % (r_dual["ok"], r_dual["offset_seconds"]))
+    assert r_dual["ok"], "dual-channel mix+FC sync should succeed"
+    assert abs(r_dual["offset_seconds"] - (-5.0)) < 0.3, \
+        "dual-channel offset %.3f != -5.0" % r_dual["offset_seconds"]
+    print("  PASS: dual-channel mix+FC recovered offset %.3fs" % r_dual["offset_seconds"])
+
+    # Simulate a Pyodide JsTypedArray proxy to verify chunked subarray().to_py() streaming
+    # never calls to_py() on the full buffer and releases sub-proxies cleanly.
+    dual_bytes = dual.tobytes()
+    destroyed = []
+
+    class _FakeJsUint8Array:
+        def __init__(self, buf: bytes, root: bool = True):
+            self._buf = buf
+            self._root = root
+            self.byteLength = len(buf)
+
+        def subarray(self, start: int, end: int):
+            return _FakeJsUint8Array(self._buf[start:end], root=False)
+
+        def to_py(self):
+            if self._root:
+                raise AssertionError("should stream via subarray(), not copy whole buffer")
+            return memoryview(self._buf)
+
+        def destroy(self):
+            destroyed.append(self.byteLength)
+
+    r_js = bridge.sync_with_audio(
+        _FakeJsUint8Array(dual_bytes), FRAME_RATE, "input.srt", make_srt(5.0), vad="auditok", channels=2
+    )
+    assert r_js["ok"], "JsProxy streamed dual-channel sync should succeed: %s" % r_js.get("error")
+    assert abs(r_js["offset_seconds"] - (-5.0)) < 0.3
+    assert len(destroyed) >= 1 and sum(destroyed) == len(dual_bytes)
+    print("  PASS: JsTypedArray chunked streaming recovered offset %.3fs (%d chunks)" % (r_js["offset_seconds"], len(destroyed)))
+
     print("\nPASS: Phase 2 audio path works")
     return 0
 

@@ -122,20 +122,24 @@ ffsubsync_bridge.sync_subtitles(
     return proxy.toJs({ dict_converter: Object.fromEntries });
   } finally {
     pyodide.globals.set("_on_progress", null);
+    pyodide.globals.set("_ref_bytes", null);
+    pyodide.globals.set("_in_bytes", null);
+    pyodide.globals.set("_opts", null);
     if (proxy) proxy.destroy();
     if (opts && opts.destroy) opts.destroy();
   }
 }
 
-// Sync against decoded audio PCM (mono s16le at frameRate) from a video/audio
-// reference. `vad` is "webrtc" or "auditok".
+// Sync against decoded audio PCM (mono or dual-channel mix+FC s16le at frameRate)
+// from a video/audio reference. `vad` is "webrtc" or "auditok".
 export function syncAudioWithEngine(
   engine,
-  { pcm, frameRate, inName, inBytes, vad, options = {}, onProgress = null },
+  { pcm, channels = 1, frameRate, inName, inBytes, vad, options = {}, onProgress = null },
 ) {
   const { pyodide } = engine;
   const opts = pyodide.toPy(options);
   pyodide.globals.set("_pcm", pcm);
+  pyodide.globals.set("_channels", Number(channels) || 1);
   pyodide.globals.set("_frame_rate", frameRate);
   pyodide.globals.set("_in_name", inName);
   pyodide.globals.set("_in_bytes", inBytes);
@@ -148,6 +152,7 @@ export function syncAudioWithEngine(
 import ffsubsync_bridge
 ffsubsync_bridge.sync_with_audio(
     _pcm, _frame_rate, _in_name, _in_bytes, vad=_vad,
+    channels=_channels,
     progress_cb=_on_progress,
     **dict(_opts),
 )
@@ -155,6 +160,9 @@ ffsubsync_bridge.sync_with_audio(
     return proxy.toJs({ dict_converter: Object.fromEntries });
   } finally {
     pyodide.globals.set("_on_progress", null);
+    pyodide.globals.set("_pcm", null);
+    pyodide.globals.set("_in_bytes", null);
+    pyodide.globals.set("_opts", null);
     if (proxy) proxy.destroy();
     if (opts && opts.destroy) opts.destroy();
   }
@@ -186,6 +194,9 @@ ffsubsync_bridge.sync_with_timings(
     return proxy.toJs({ dict_converter: Object.fromEntries });
   } finally {
     pyodide.globals.set("_on_progress", null);
+    pyodide.globals.set("_timings", null);
+    pyodide.globals.set("_in_bytes", null);
+    pyodide.globals.set("_opts", null);
     if (proxy) proxy.destroy();
     if (pyTimings && pyTimings.destroy) pyTimings.destroy();
     if (opts && opts.destroy) opts.destroy();

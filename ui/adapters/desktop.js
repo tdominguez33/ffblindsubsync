@@ -200,6 +200,7 @@ export function createAdapter({ i18n, callbacks }) {
           framerate_scale_factor: sy.framerate_scale_factor,
           split_segments: sy.split_segments,
           dropped_cues: sy.dropped_cues || 0,
+          clipped_cues: sy.clipped_cues || 0,
           elapsed_seconds: sy.elapsed_seconds,
           output_path: sy.output_path,
           output_label: sy.output_path || "",

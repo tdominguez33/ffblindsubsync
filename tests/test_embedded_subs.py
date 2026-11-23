@@ -46,6 +46,9 @@ def _transformer(**overrides):
         sample_rate=SAMPLE_RATE,
         frame_rate=DEFAULT_FRAME_RATE,
         non_speech_label=0.0,
+        # the fixtures here are a few cues long; the sparse-stream threshold
+        # has its own dedicated tests below
+        min_embedded_subtitle_cues=0,
     )
     kwargs.update(overrides)
     return VideoSpeechTransformer(**kwargs)
@@ -217,11 +220,11 @@ def test_explicit_ref_stream_uses_per_stream(monkeypatch):
 def test_raises_when_no_subtitle_streams(monkeypatch):
     _install_fake_popen(
         monkeypatch,
-        probe_lines=[],  # ffprobe finds nothing -> fall back -> per-stream all fail
+        probe_lines=[],  # ffprobe finds nothing -> no usable stream, no ffmpeg
         srt_by_stream={},
     )
     t = _transformer()
-    with pytest.raises(ValueError, match="lack subtitle stream"):
+    with pytest.raises(ValueError, match="lack a usable text subtitle stream"):
         t.try_fit_using_embedded_subs("movie.mkv")
 
 
@@ -407,3 +410,175 @@ def test_find_bitmap_timing_streams_excludes_only_commentary_when_requested(monk
     )
     assert st._find_bitmap_timing_streams("movie.mkv", include_deprioritized=False) == []
     assert st.find_pgs_stream("movie.mkv") == "0:s:0"
+
+
+def test_sparse_streams_fall_back_to_audio(monkeypatch):
+    _install_fake_popen(
+        monkeypatch,
+        probe_lines=["2,subrip,0,0,English"],
+        srt_by_stream={"0:2": _srt(40)},
+    )
+    t = _transformer(min_embedded_subtitle_cues=st.DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES)
+    with pytest.raises(ValueError, match="only 40 cues"):
+        t.try_fit_using_embedded_subs("movie.mkv")
+    assert t.video_speech_results_ is None
+
+
+def test_explicit_ref_stream_bypasses_sparse_threshold(monkeypatch):
+    _install_fake_popen(
+        monkeypatch,
+        probe_lines=[],
+        srt_by_stream={"0:s:1": _srt(5)},
+    )
+    t = _transformer(
+        ref_stream="0:s:1",
+        min_embedded_subtitle_cues=st.DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES,
+    )
+    t.try_fit_using_embedded_subs("movie.mkv")
+    assert np.array_equal(t.video_speech_results_, _parse_speech_results(_srt(5)))
+
+
+def test_only_forced_streams_means_no_usable_stream(monkeypatch):
+    calls = _install_fake_popen(
+        monkeypatch,
+        probe_lines=["2,subrip,1,0,Forced", "3,hdmv_pgs_subtitle,0,0,English"],
+        srt_by_stream={"0:2": _srt(5), "0:s:0": _srt(5)},
+    )
+    t = _transformer()
+    with pytest.raises(ValueError, match="lack a usable text subtitle stream"):
+        t.try_fit_using_embedded_subs("movie.mkv")
+    assert _count_ffmpeg_invocations(calls) == 0
+
+
+def test_try_sync_falls_back_to_audio_when_embedded_alignment_unreliable(tmp_path):
+    from ffsubsync import ffsubsync
+
+    # Build 60-cue input subtitle with irregular spacing so only the true offset aligns.
+    timestamps = []
+    pos = 5.0
+    for i in range(60):
+        timestamps.append(pos)
+        pos += 2.0 + ((i * 7) % 5) * 0.7
+    srtin = tmp_path / "in.srt"
+    srtin.write_bytes(_srt_at(timestamps))
+    srtout = tmp_path / "out.srt"
+
+    total_len = int((pos + 40.0) * SAMPLE_RATE)
+    # Embedded reference is uncorrelated/anti-correlated noise -> negative score & low SNR.
+    rng = np.random.default_rng(123)
+    bad_embedded = (rng.random(total_len) < 0.03).astype(float)
+
+    # Audio fallback reference matches the input shifted by +8.0s.
+    true_offset_s = 8.0
+    good_audio = np.zeros(total_len, dtype=float)
+    for ts in timestamps:
+        a = int(round((ts + true_offset_s) * SAMPLE_RATE))
+        b = int(round((ts + true_offset_s + 0.8) * SAMPLE_RATE))
+        good_audio[a:b] = 1.0
+
+    fallback_called = []
+
+    class _FakeEmbeddedStep:
+        can_fallback_to_audio = True
+        alt_video_speech_results_ = []
+
+        def transform(self, _x):
+            return bad_embedded
+
+        def fallback_to_audio(self, fname):
+            fallback_called.append(fname)
+            return good_audio, []
+
+    step = _FakeEmbeddedStep()
+
+    class _FakePipe:
+        def __getitem__(self, idx):
+            return [step][idx]
+
+        def transform(self, x):
+            return step.transform(x)
+
+    args = ffsubsync.make_parser().parse_args(
+        ["movie.mkv", "-i", str(srtin), "-o", str(srtout), "--no-fix-framerate"]
+    )
+    result = {"retval": 0}
+    ok = ffsubsync.try_sync(args, _FakePipe(), result)
+    assert fallback_called == ["movie.mkv"]
+    assert ok is True
+    assert result["sync_was_successful"] is True
+    assert result["offset_seconds"] == pytest.approx(true_offset_s, abs=0.05)
+
+
+def test_embedded_text_prefers_clean_audio_lang_over_sdh_with_more_cues(monkeypatch):
+    import json
+
+    # 0:6 = clean English (220 cues), 0:8 = English SDH (260 cues), 0:10 = French (240 cues).
+    # Clean English matching primary audio language must beat SDH even though SDH has more cues,
+    # using a single ffprobe JSON pass.
+    clean_eng = _srt_at([2.0 + i * 2.0 for i in range(220)])
+    sdh_eng = _srt_at([1.0 + i * 2.0 for i in range(260)])
+    french = _srt_at([1.5 + i * 2.0 for i in range(240)])
+    probe_json = json.dumps(
+        {
+            "streams": [
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "codec_name": "eac3",
+                    "disposition": {"default": 1},
+                    "tags": {"language": "eng"},
+                },
+                {
+                    "index": 6,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "disposition": {"hearing_impaired": 0},
+                    "tags": {"language": "eng", "title": "English"},
+                },
+                {
+                    "index": 8,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "disposition": {"hearing_impaired": 1},
+                    "tags": {"language": "eng", "title": "English (SDH)"},
+                },
+                {
+                    "index": 10,
+                    "codec_type": "subtitle",
+                    "codec_name": "subrip",
+                    "disposition": {"hearing_impaired": 0},
+                    "tags": {"language": "fre", "title": "French"},
+                },
+            ]
+        }
+    )
+    calls = _install_fake_popen(
+        monkeypatch,
+        probe_lines=[probe_json],
+        srt_by_stream={"0:6": clean_eng, "0:8": sdh_eng, "0:10": french},
+    )
+    t = _transformer(min_embedded_subtitle_cues=50)
+    t.try_fit_using_embedded_subs("dogma.mkv")
+    assert sum(1 for c in calls if "ffprobe" in os.path.basename(c[0]).lower()) == 1
+    assert np.array_equal(t.video_speech_results_, _parse_speech_results(clean_eng))
+
+
+def test_audio_decode_error_includes_ffmpeg_stderr_and_rc(monkeypatch):
+    class _ErrProc:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"No such filter: 'aresample'\n")
+
+        def wait(self):
+            return 1
+
+    monkeypatch.setattr(st.ffmpeg, "probe", lambda *a, **k: {"format": {"duration": "10"}})
+    monkeypatch.setattr(st.subprocess, "Popen", lambda *a, **k: _ErrProc())
+
+    t = _transformer(vad="webrtc")
+    with pytest.raises(ValueError) as excinfo:
+        t._fit_using_audio("movie.mkv")
+    msg = str(excinfo.value)
+    assert "ffmpeg exited with code 1" in msg
+    assert "No such filter" in msg
+    assert "too old" in msg
