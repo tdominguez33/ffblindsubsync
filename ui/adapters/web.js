@@ -364,6 +364,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             split_segments: raw.split_segments,
             dropped_cues: raw.dropped_cues || 0,
             clipped_cues: raw.clipped_cues || 0,
+            quality: raw.quality || null,
             elapsed_seconds: elapsed,
             output_label: outName,
             download_url: lastBlobUrl,

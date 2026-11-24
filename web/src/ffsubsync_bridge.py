@@ -152,6 +152,7 @@ def _run_and_collect(
     progress_cb=None,
     start_frac: float = 0.0,
     end_frac: float = 1.0,
+    reference_kind=None,
 ):
     """Run ffsubsync with ``argv`` and package a JS-friendly result dict."""
     ff_logger = logging.getLogger("ffsubsync")
@@ -187,6 +188,11 @@ def _run_and_collect(
         except Exception:
             pass
 
+    quality = result.get("quality")
+    if isinstance(quality, dict) and reference_kind in ("audio", "subtitles"):
+        quality = dict(quality)
+        quality["reference_kind"] = reference_kind
+
     return {
         "ok": ok,
         "offset_seconds": result.get("offset_seconds"),
@@ -194,6 +200,7 @@ def _run_and_collect(
         "split_segments": result.get("split_segments"),
         "dropped_cues": result.get("dropped_cues", 0),
         "clipped_cues": result.get("clipped_cues", 0),
+        "quality": quality,
         "output_name": _synced_name(in_name),
         "output_text": output_text,
         "error": None if ok else "sync did not succeed (see console logs)",
@@ -259,7 +266,9 @@ def sync_subtitles(
     )
     if reference_encoding:
         argv += ["--reference-encoding", reference_encoding]
-    return _run_and_collect(argv, out_path, in_name, progress_cb=progress_cb)
+    return _run_and_collect(
+        argv, out_path, in_name, progress_cb=progress_cb, reference_kind="subtitles"
+    )
 
 
 # ---- Phase 2: video/audio reference -----------------------------------------
@@ -446,6 +455,7 @@ def sync_with_audio(
         progress_cb=progress_cb,
         start_frac=0.50,
         end_frac=1.0,
+        reference_kind="audio",
     )
 
 
@@ -505,4 +515,6 @@ def sync_with_timings(
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
         sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
     )
-    return _run_and_collect(argv, out_path, in_name, progress_cb=progress_cb)
+    return _run_and_collect(
+        argv, out_path, in_name, progress_cb=progress_cb, reference_kind="subtitles"
+    )

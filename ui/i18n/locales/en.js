@@ -109,6 +109,36 @@ export default {
     "result.completed": "Completed",
     "result.syncFailed": "Sync failed.",
 
+    "quality.syncLabel": "Sync",
+    "quality.subtitleLabel": "Quality",
+    "quality.metric.temporal_consistency": "Temporal stability",
+    "quality.help.temporal_consistency":
+      "Measures whether the offset stays consistent across the entire video. A low score indicates progressive drift or sections that remain ahead or behind the rest.",
+    "quality.metric.overlap_lift": "Speech match",
+    "quality.help.overlap_lift":
+      "Measures how much better than chance the subtitles line up with detected speech and whether pauses around each line match.",
+    "quality.metric.overlap_lift_subtitles": "Subtitle match",
+    "quality.help.overlap_lift_subtitles":
+      "Measures how much better than chance your subtitles line up with the reference subtitles and whether pauses around each line match.",
+    "quality.metric.peak_confidence": "Signal clarity",
+    "quality.help.peak_confidence":
+      "Shows how sharp and unambiguous the winning sync match was compared to background noise and alternative offsets.",
+    "quality.metric.sync_integrity": "Sync integrity",
+    "quality.help.sync_integrity":
+      "Checks that alignment stays healthy across most of the video without losing too many lines to clipping or mid-file split adjustments.",
+    "quality.metric.timeline_coverage": "Video coverage",
+    "quality.help.timeline_coverage":
+      "Checks whether the subtitles span the full dialogue of the video from start to end without cutting short or running past the end.",
+    "quality.metric.reading_speed": "Reading speed",
+    "quality.help.reading_speed":
+      "Evaluates whether characters per second stay in a comfortable reading range, avoiding rushed flashes or overly slow lines.",
+    "quality.metric.timing_hygiene": "Timing hygiene",
+    "quality.help.timing_hygiene":
+      "Detects abnormal durations (too brief or stuck on screen), invalid timestamps, and overlapping consecutive cues.",
+    "quality.metric.text_integrity": "Text integrity",
+    "quality.help.text_integrity":
+      "Checks for corrupted characters, encoding errors (mojibake), empty lines, and consecutive duplicate cues.",
+
     "progress.syncing": "Syncing…",
     "progress.preparing": "Preparing…",
     "progress.waitingFfmpeg": "Waiting for FFmpeg download…",

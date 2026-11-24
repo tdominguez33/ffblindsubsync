@@ -868,6 +868,7 @@ class DesktopApi:
                         "split_segments": result.get("split_segments"),
                         "dropped_cues": result.get("dropped_cues", 0),
                         "clipped_cues": result.get("clipped_cues", 0),
+                        "quality": result.get("quality"),
                         "output_path": out_path,
                         "elapsed_seconds": elapsed,
                         "ffmpeg_info": ff_info,

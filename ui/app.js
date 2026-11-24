@@ -75,6 +75,7 @@ const els = {
   result: document.getElementById("result"),
   offset: document.getElementById("offset"),
   resultMeta: document.getElementById("result-meta"),
+  resultQuality: document.getElementById("result-quality"),
   resultActionBtn: document.getElementById("result-action-btn"),
   downloadLink: document.getElementById("download"),
   footer: document.getElementById("app-footer"),
@@ -95,6 +96,7 @@ let lastSyncProgress = null;
 let streamProbeSeq = 0;
 let themeTransitionTimer = null;
 let settingsOpen = false;
+let openQualityPanel = null; // null | "sync" | "subtitle"
 
 function setSettingsOpen(open) {
   if (!adapter || !adapter.capabilities.settings) return;
@@ -581,10 +583,317 @@ function scrollToResultTop() {
   }
 }
 
+const QUALITY_BADGE_SPECS = [
+  {
+    key: "sync",
+    labelKey: "quality.syncLabel",
+    metricKeys: [
+      "temporal_consistency",
+      "overlap_lift",
+      "peak_confidence",
+      "sync_integrity",
+    ],
+  },
+  {
+    key: "subtitle",
+    labelKey: "quality.subtitleLabel",
+    metricKeys: [
+      "timeline_coverage",
+      "reading_speed",
+      "timing_hygiene",
+      "text_integrity",
+    ],
+  },
+];
+
+function scoreTierClass(score) {
+  const n = Number(score);
+  if (!Number.isFinite(n)) return "tier-warn";
+  if (n >= 75) return "tier-ok";
+  if (n >= 45) return "tier-warn";
+  return "tier-err";
+}
+
+function clampScore(value) {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, n));
+}
+
+function createHelpTip(text) {
+  const tip = document.createElement("span");
+  tip.className = "help-tip tip-align-start";
+  tip.tabIndex = 0;
+  tip.setAttribute("role", "note");
+  tip.setAttribute("aria-label", text);
+
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+
+  const circle = document.createElementNS(ns, "circle");
+  circle.setAttribute("cx", "12");
+  circle.setAttribute("cy", "12");
+  circle.setAttribute("r", "10");
+  svg.appendChild(circle);
+
+  const qPath = document.createElementNS(ns, "path");
+  qPath.setAttribute("d", "M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3");
+  svg.appendChild(qPath);
+
+  const dotPath = document.createElementNS(ns, "path");
+  dotPath.setAttribute("d", "M12 17h.01");
+  svg.appendChild(dotPath);
+
+  const bubble = document.createElement("span");
+  bubble.className = "help-tip-bubble";
+  bubble.setAttribute("role", "tooltip");
+  bubble.textContent = text;
+
+  tip.appendChild(svg);
+  tip.appendChild(bubble);
+  return tip;
+}
+
+function createChevronSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("class", "quality-badge-chevron");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2.2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", "m6 9 6 6 6-6");
+  svg.appendChild(path);
+  return svg;
+}
+
+function groupHasLowMetric(spec, group) {
+  const metricsObj = (group && group.metrics && typeof group.metrics === "object") ? group.metrics : {};
+  for (const mKey of spec.metricKeys) {
+    if (metricsObj[mKey] !== undefined && metricsObj[mKey] !== null) {
+      if (clampScore(metricsObj[mKey]) < 50) return true;
+    }
+  }
+  return false;
+}
+
+function hasQualityWarning(quality) {
+  if (!quality || typeof quality !== "object") return false;
+  for (const spec of QUALITY_BADGE_SPECS) {
+    const group = quality[spec.key];
+    if (!group || typeof group !== "object") continue;
+    if (Number.isFinite(Number(group.score)) && clampScore(group.score) < 75) {
+      return true;
+    }
+    if (groupHasLowMetric(spec, group)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function renderQualityBadges(quality, { resetOpen = false } = {}) {
+  const container = els.resultQuality;
+  if (!container) return;
+  if (resetOpen) {
+    openQualityPanel = null;
+  }
+  if (!quality || typeof quality !== "object" || (!quality.sync && !quality.subtitle)) {
+    container.innerHTML = "";
+    container.hidden = true;
+    return;
+  }
+
+  container.innerHTML = "";
+  const badgesRow = document.createElement("div");
+  badgesRow.className = "quality-badges";
+  const panelsWrap = document.createElement("div");
+  panelsWrap.className = "quality-panels";
+
+  const items = [];
+
+  function syncAccordionState() {
+    let anyOpen = false;
+    for (const item of items) {
+      const active = openQualityPanel === item.key;
+      item.btn.setAttribute("aria-expanded", String(active));
+      item.panel.hidden = !active;
+      if (active) anyOpen = true;
+    }
+    panelsWrap.hidden = !anyOpen;
+  }
+
+  for (const spec of QUALITY_BADGE_SPECS) {
+    const group = quality[spec.key];
+    if (!group || typeof group !== "object" || !Number.isFinite(Number(group.score))) {
+      continue;
+    }
+    const score = clampScore(group.score);
+    const hasLowMetric = groupHasLowMetric(spec, group);
+    const tier = hasLowMetric && score >= 75 ? "tier-warn" : scoreTierClass(score);
+    const isOpen = openQualityPanel === spec.key;
+    const panelId = `quality-panel-${spec.key}`;
+
+    // Badge toggle button
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `quality-badge-btn ${tier}`;
+    btn.setAttribute("aria-expanded", String(isOpen));
+    btn.setAttribute("aria-controls", panelId);
+
+    const dot = document.createElement("span");
+    dot.className = "quality-badge-dot";
+    dot.setAttribute("aria-hidden", "true");
+
+    const label = document.createElement("span");
+    label.textContent = i18n.t(spec.labelKey);
+
+    const scoreEl = document.createElement("span");
+    scoreEl.className = "quality-badge-score";
+    scoreEl.textContent = `${score}/100`;
+
+    btn.appendChild(dot);
+    btn.appendChild(label);
+    btn.appendChild(scoreEl);
+    btn.appendChild(createChevronSvg());
+
+    // Collapsible horizontal-axis breakdown panel
+    const panel = document.createElement("div");
+    panel.id = panelId;
+    panel.className = "quality-panel";
+    panel.hidden = !isOpen;
+
+    const head = document.createElement("div");
+    head.className = "quality-panel-head";
+
+    const headLeadSpacer = document.createElement("span");
+    headLeadSpacer.setAttribute("aria-hidden", "true");
+
+    const ruler = document.createElement("div");
+    ruler.className = "quality-ruler";
+    ruler.setAttribute("aria-hidden", "true");
+    for (const mark of ["0", "25", "50", "75", "100"]) {
+      const m = document.createElement("span");
+      m.className = `m${mark}`;
+      m.textContent = mark;
+      ruler.appendChild(m);
+    }
+
+    const headSpacer = document.createElement("span");
+    headSpacer.setAttribute("aria-hidden", "true");
+
+    head.appendChild(headLeadSpacer);
+    head.appendChild(ruler);
+    head.appendChild(headSpacer);
+    panel.appendChild(head);
+
+    const list = document.createElement("div");
+    list.className = "quality-metric-list";
+
+    const isSubRef = quality.reference_kind === "subtitles";
+    const metricsObj = (group.metrics && typeof group.metrics === "object") ? group.metrics : {};
+    for (const mKey of spec.metricKeys) {
+      if (metricsObj[mKey] === undefined || metricsObj[mKey] === null) continue;
+      const mScore = clampScore(metricsObj[mKey]);
+      const mTier = scoreTierClass(mScore);
+      const i18nMetricKey =
+        mKey === "overlap_lift" && isSubRef ? "overlap_lift_subtitles" : mKey;
+
+      const row = document.createElement("div");
+      row.className = "quality-metric-row";
+
+      const labelWrap = document.createElement("div");
+      labelWrap.className = "quality-metric-label";
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "quality-metric-name";
+      const metricName = i18n.t(`quality.metric.${i18nMetricKey}`);
+      nameSpan.textContent = metricName;
+      nameSpan.title = metricName;
+
+      labelWrap.appendChild(nameSpan);
+      labelWrap.appendChild(createHelpTip(i18n.t(`quality.help.${i18nMetricKey}`)));
+
+      const axis = document.createElement("div");
+      axis.className = `quality-axis ${mTier}`;
+      axis.setAttribute("role", "meter");
+      axis.setAttribute("aria-label", metricName);
+      axis.setAttribute("aria-valuemin", "0");
+      axis.setAttribute("aria-valuemax", "100");
+      axis.setAttribute("aria-valuenow", String(mScore));
+
+      const track = document.createElement("div");
+      track.className = "quality-axis-track";
+
+      for (const tickCls of ["t25", "t50", "t75"]) {
+        const tick = document.createElement("span");
+        tick.className = `quality-axis-tick ${tickCls}`;
+        track.appendChild(tick);
+      }
+
+      const fill = document.createElement("div");
+      fill.className = "quality-axis-fill";
+      fill.style.width = `${mScore}%`;
+      track.appendChild(fill);
+
+      const node = document.createElement("span");
+      node.className = "quality-axis-node";
+      node.style.left = `${mScore}%`;
+      track.appendChild(node);
+
+      axis.appendChild(track);
+
+      const val = document.createElement("span");
+      val.className = `quality-metric-val ${mTier}`;
+      val.textContent = String(mScore);
+
+      row.appendChild(labelWrap);
+      row.appendChild(axis);
+      row.appendChild(val);
+      list.appendChild(row);
+    }
+
+    panel.appendChild(list);
+
+    btn.addEventListener("click", () => {
+      openQualityPanel = openQualityPanel === spec.key ? null : spec.key;
+      syncAccordionState();
+    });
+
+    items.push({ key: spec.key, btn, panel });
+    badgesRow.appendChild(btn);
+    panelsWrap.appendChild(panel);
+  }
+
+  if (items.length === 0) {
+    container.hidden = true;
+    return;
+  }
+
+  syncAccordionState();
+  container.appendChild(badgesRow);
+  container.appendChild(panelsWrap);
+  container.hidden = false;
+}
+
 function renderResult(res, { scroll = true } = {}) {
+  const isNewResult = res !== lastResult;
   lastResult = res;
   if (!res || !res.ok) {
     els.result.classList.add("error");
+    els.result.classList.remove("warning");
     const errText =
       (res && res.error_key ? i18n.t(res.error_key, res.error_params) : null) ||
       (res && res.error) ||
@@ -593,12 +902,14 @@ function renderResult(res, { scroll = true } = {}) {
     els.resultMeta.textContent = "";
     els.resultActionBtn.hidden = true;
     els.downloadLink.hidden = true;
+    renderQualityBadges(null, { resetOpen: true });
     els.result.hidden = false;
     if (scroll) scrollToResultTop();
     return;
   }
 
   els.result.classList.remove("error");
+  els.result.classList.toggle("warning", hasQualityWarning(res.quality));
   els.offset.textContent = formatResultSummary(res);
 
   const elapsed =
@@ -621,6 +932,7 @@ function renderResult(res, { scroll = true } = {}) {
       els.downloadLink.hidden = true;
     }
   }
+  renderQualityBadges(res.quality, { resetOpen: isNewResult });
   els.result.hidden = false;
   if (scroll) scrollToResultTop();
 }

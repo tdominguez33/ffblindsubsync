@@ -109,6 +109,36 @@ export default {
     "result.completed": "Completado",
     "result.syncFailed": "Error al sincronizar.",
 
+    "quality.syncLabel": "Sincronización",
+    "quality.subtitleLabel": "Calidad",
+    "quality.metric.temporal_consistency": "Estabilidad temporal",
+    "quality.help.temporal_consistency":
+      "Mide si el desfase se mantiene constante a lo largo de todo el video. Un valor bajo indica deriva progresiva o tramos que quedaron adelantados o atrasados respecto al resto.",
+    "quality.metric.overlap_lift": "Coincidencia con voz",
+    "quality.help.overlap_lift":
+      "Evalúa cuánto mejor que el azar coinciden los subtítulos con la voz detectada y si respetan las pausas alrededor de cada línea.",
+    "quality.metric.overlap_lift_subtitles": "Coincidencia con subtítulos",
+    "quality.help.overlap_lift_subtitles":
+      "Evalúa cuánto mejor que el azar coinciden tus subtítulos con los de referencia y si respetan las pausas alrededor de cada línea.",
+    "quality.metric.peak_confidence": "Claridad de señal",
+    "quality.help.peak_confidence":
+      "Indica qué tan nítido e inequívoco fue el punto de sincronización frente al ruido de fondo y a otros desfases alternativos.",
+    "quality.metric.sync_integrity": "Integridad del ajuste",
+    "quality.help.sync_integrity":
+      "Comprueba que la señal se mantenga sana en la mayoría del video y que no se hayan perdido demasiadas líneas al recortar o ajustar cortes intermedios.",
+    "quality.metric.timeline_coverage": "Cobertura del video",
+    "quality.help.timeline_coverage":
+      "Verifica si los subtítulos abarcan todo el diálogo del video de principio a fin, sin cortarse antes ni extenderse fuera de duración.",
+    "quality.metric.reading_speed": "Velocidad de lectura",
+    "quality.help.reading_speed":
+      "Evalúa si el ritmo de caracteres por segundo permite leer las líneas cómodamente, sin textos demasiado rápidos ni congelados.",
+    "quality.metric.timing_hygiene": "Higiene de tiempos",
+    "quality.help.timing_hygiene":
+      "Detecta duraciones anómalas (líneas demasiado breves o largas), tiempos inválidos y solapamientos entre subtítulos consecutivos.",
+    "quality.metric.text_integrity": "Integridad de texto",
+    "quality.help.text_integrity":
+      "Revisa que no haya caracteres corruptos, errores de codificación (mojibake), líneas vacías ni subtítulos duplicados.",
+
     "progress.syncing": "Sincronizando…",
     "progress.preparing": "Preparando…",
     "progress.waitingFfmpeg": "Esperando la descarga de FFmpeg…",

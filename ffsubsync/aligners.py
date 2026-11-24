@@ -27,6 +27,7 @@ class FFTAligner(TransformerMixin):
         self.best_offset_: Optional[int] = None
         self.best_score_: Optional[float] = None
         self.best_peak_snr_: Optional[float] = None
+        self.best_peak_margin_: Optional[float] = None
         self.get_score_: bool = False
 
     def _eliminate_extreme_offsets_from_solutions(
@@ -47,32 +48,46 @@ class FFTAligner(TransformerMixin):
         best_idx = int(np.argmax(convolve))
         self.best_offset_ = len(convolve) - 1 - best_idx - len(substring)
         self.best_score_ = convolve[best_idx]
-        self.best_peak_snr_ = self._compute_peak_snr(convolve, best_idx)
+        snr, margin = self._compute_peak_stats(convolve, best_idx)
+        self.best_peak_snr_ = snr
+        self.best_peak_margin_ = margin
 
     @staticmethod
-    def _compute_peak_snr(convolve: np.ndarray, best_idx: int) -> Optional[float]:
-        """Compute peak z-score relative to the valid offset search window.
+    def _compute_peak_stats(
+        convolve: np.ndarray, best_idx: int
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Compute peak z-score and runner-up margin relative to valid offsets.
 
-        Measures how many standard deviations the winning cross-correlation peak
-        stands above the background offsets (excluding a small lobe around the
-        peak). Invariant to speech-density mismatch between reference and
-        subtitles, so it remains meaningful even when the raw dot-product score
-        is negative.
+        ``peak_snr`` measures how many standard deviations the winning
+        cross-correlation peak stands above the background offsets (excluding a
+        small lobe around the peak). ``peak_margin`` measures how many standard
+        deviations the winning peak exceeds the strongest competing offset
+        outside that lobe, detecting ambiguous multi-peak matches.
         """
         finite_idx = np.flatnonzero(np.isfinite(convolve))
         n_finite = len(finite_idx)
         if n_finite < 8:
-            return None
+            return None, None
         guard = min(200, max(1, n_finite // 10))
         bg_idx = finite_idx[np.abs(finite_idx - best_idx) > guard]
         if len(bg_idx) < 4:
-            return None
+            return None, None
         bg = convolve[bg_idx]
         bg_std = float(np.std(bg))
         if bg_std <= 0.0:
-            return None
+            return None, None
         bg_mean = float(np.mean(bg))
-        return float((convolve[best_idx] - bg_mean) / bg_std)
+        peak_val = float(convolve[best_idx])
+        snr = float((peak_val - bg_mean) / bg_std)
+        runner_up = float(np.max(bg))
+        margin = float((peak_val - runner_up) / bg_std)
+        return snr, margin
+
+    @staticmethod
+    def _compute_peak_snr(convolve: np.ndarray, best_idx: int) -> Optional[float]:
+        """Compute peak z-score relative to the valid offset search window."""
+        snr, _ = FFTAligner._compute_peak_stats(convolve, best_idx)
+        return snr
 
     def fit(self, refstring, substring, get_score: bool = False) -> "FFTAligner":
         refstring, substring = [
@@ -135,7 +150,9 @@ class MaxScoreAligner(TransformerMixin):
         self.max_offset_seconds: Optional[int] = max_offset_seconds
         self._scores: List[Tuple[Tuple[float, int], Pipeline]] = []
         self._snrs: List[Optional[float]] = []
+        self._margins: List[Optional[float]] = []
         self.best_peak_snr_: Optional[float] = None
+        self.best_peak_margin_: Optional[float] = None
 
     def fit_gss(self, refstring, subpipe_maker):
         def opt_func(framerate_ratio, is_last_iter):
@@ -153,6 +170,9 @@ class MaxScoreAligner(TransformerMixin):
             if is_last_iter:
                 self._scores.append((score, subpipe))
                 self._snrs.append(getattr(self.base_aligner, "best_peak_snr_", None))
+                self._margins.append(
+                    getattr(self.base_aligner, "best_peak_margin_", None)
+                )
             return -score[0]
 
         gss(opt_func, MIN_FRAMERATE_RATIO, MAX_FRAMERATE_RATIO)
@@ -182,6 +202,7 @@ class MaxScoreAligner(TransformerMixin):
                 )
             )
             self._snrs.append(getattr(self.base_aligner, "best_peak_snr_", None))
+            self._margins.append(getattr(self.base_aligner, "best_peak_margin_", None))
         return self
 
     def transform(self, *_) -> Tuple[Tuple[float, float], Pipeline]:
@@ -200,4 +221,7 @@ class MaxScoreAligner(TransformerMixin):
             )
         best_i, ((score, offset), subpipe) = max(indexed, key=lambda x: x[1][0][0])
         self.best_peak_snr_ = self._snrs[best_i] if best_i < len(self._snrs) else None
+        self.best_peak_margin_ = (
+            self._margins[best_i] if best_i < len(self._margins) else None
+        )
         return (score, offset), subpipe

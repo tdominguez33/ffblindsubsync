@@ -41,12 +41,14 @@ from ffsubsync.constants import (
 )
 from ffsubsync.ffmpeg_utils import ffmpeg_bin_path, subprocess_args
 from ffsubsync.generic_subtitles import SUPPORTED_OUTPUT_FORMATS
+from ffsubsync.quality import compute_quality_metrics
 from ffsubsync.sklearn_shim import Pipeline, TransformerMixin
 from ffsubsync.speech_transformers import (
     VideoSpeechTransformer,
     MultiSegmentVideoSpeechTransformer,
     DeserializeSpeechTransformer,
     PGSSpeechTransformer,
+    SubtitleSpeechTransformer,
     WhisperSpeechTransformer,
     ProgressInfo,
     make_subtitle_speech_pipeline,
@@ -338,6 +340,8 @@ def try_sync(
             )
             aligner: Optional[MaxScoreAligner] = None
             best_peak_snr: Optional[float] = None
+            best_peak_margin: Optional[float] = None
+            reference_kind: str = "audio"
             if skip_sync:
                 best_score = 0.0
                 best_srt_pipe = cast(Pipeline, srt_pipes[0])
@@ -352,12 +356,19 @@ def try_sync(
                     srt_pipes,
                 )
                 best_peak_snr = getattr(aligner, "best_peak_snr_", None)
+                best_peak_margin = getattr(aligner, "best_peak_margin_", None)
 
                 ref_step = (
                     reference_pipe[-1]
                     if hasattr(reference_pipe, "__getitem__")
                     else reference_pipe
                 )
+                if isinstance(
+                    ref_step, (SubtitleSpeechTransformer, PGSSpeechTransformer)
+                ) or bool(getattr(ref_step, "used_embedded_subs_", False)):
+                    reference_kind = "subtitles"
+                else:
+                    reference_kind = "audio"
                 alt_candidates = list(
                     getattr(ref_step, "alt_video_speech_results_", None) or []
                 )
@@ -437,6 +448,11 @@ def try_sync(
                         offset_samples = cand_offset
                         best_srt_pipe = cand_pipe
                         best_peak_snr = cand_snr
+                        best_peak_margin = getattr(
+                            cand_aligner, "best_peak_margin_", None
+                        )
+                        if "audio" in cand_label.lower() or "center channel" in cand_label.lower():
+                            reference_kind = "audio"
                     else:
                         logger.info(
                             "keeping primary alignment over %s (peak SNR %.2f vs %.2f)",
@@ -660,6 +676,44 @@ def try_sync(
                     "%d subtitle cue(s) shifted before 00:00:00 and were omitted",
                     clipped_cues,
                 )
+            quality: Optional[Dict[str, Any]] = None
+            if not skip_sync:
+                try:
+                    quality = compute_quality_metrics(
+                        reference_speech,
+                        list(out_subs),
+                        sample_rate=SAMPLE_RATE,
+                        start_seconds=args.start_seconds,
+                        best_peak_snr=best_peak_snr,
+                        best_peak_margin=best_peak_margin,
+                        sync_was_successful=sync_was_successful,
+                        total_input_cues=len(scale_step.subs_),
+                        dropped_cues=dropped_cues,
+                        clipped_cues=clipped_cues,
+                        n_split_segments=len(split_segments) if split_segments else 1,
+                        sub_format=getattr(out_subs, "_sub_format", "srt"),
+                        reference_kind=reference_kind,
+                    )
+                    s_q = quality["sync"]
+                    sub_q = quality["subtitle"]
+                    logger.info(
+                        "sync confidence: %d/100 (consistency=%d, overlap=%d, peak=%d, integrity=%d)",
+                        s_q["score"],
+                        s_q["metrics"]["temporal_consistency"],
+                        s_q["metrics"]["overlap_lift"],
+                        s_q["metrics"]["peak_confidence"],
+                        s_q["metrics"]["sync_integrity"],
+                    )
+                    logger.info(
+                        "subtitle quality: %d/100 (coverage=%d, speed=%d, timing=%d, text=%d)",
+                        sub_q["score"],
+                        sub_q["metrics"]["timeline_coverage"],
+                        sub_q["metrics"]["reading_speed"],
+                        sub_q["metrics"]["timing_hygiene"],
+                        sub_q["metrics"]["text_integrity"],
+                    )
+                except Exception:
+                    logger.debug("failed to compute quality metrics", exc_info=True)
             if args.output_encoding != "same":
                 out_subs = out_subs.set_encoding(args.output_encoding)
             suppress_output_thresh = args.suppress_output_if_offset_less_than
@@ -681,6 +735,7 @@ def try_sync(
             result["split_segments"] = split_segments
             result["dropped_cues"] = dropped_cues
             result["clipped_cues"] = clipped_cues
+            result["quality"] = quality
     result["sync_was_successful"] = sync_was_successful
     return sync_was_successful
 
