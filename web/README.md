@@ -42,21 +42,43 @@ Version pins (Pyodide, pip packages) live in one place: `build.config.json`.
 
 ## Build & run
 
+Requires **Node.js** and **Python 3.8+** (commands work on Windows PowerShell, macOS, and Linux from the repository root):
+
 ```sh
-make site     # bundle sources + assemble dist/site
-make serve    # build, then serve dist/site at http://localhost:8000
+# 1. (First time on a fresh clone) Download the pure-Python wheels into web/vendor/wheels
+python -m pip download --only-binary=:all: --implementation py --abi none --platform any pysubs2 ffmpeg-python -d web/vendor/wheels
+
+# 2. Bundle local ffsubsync + bridge + ffmpeg.wasm glue -> web/vendor/
+node web/scripts/vendor.mjs
+
+# 3. Assemble the static site -> web/dist/site/
+node web/scripts/build_site.mjs
+
+# 4. Serve locally at http://localhost:8000
+python -m http.server 8000 --directory web/dist/site
 ```
 
-Open http://localhost:8000, pick a correctly-timed reference subtitle and an out-of-sync
-subtitle, and download the synced result. First load pulls the Pyodide runtime (a few MB)
-from the CDN and the pure-Python wheels from PyPI; after that it is cached.
+> **Tip:** If you only edited UI assets in `ui/` (HTML, CSS, JS, or locales) and didn't change Python code, you only need step 3 (`node web/scripts/build_site.mjs`).  
+> On Windows with the project virtualenv, replace `python` with `.venv\Scripts\python.exe`. On Linux/macOS, `make site` and `make serve` inside `web/` remain available as shorthand.
+
+Open http://localhost:8000, pick a reference video or subtitle and an out-of-sync subtitle, and download the synced result. First load pulls the Pyodide runtime (a few MB) from the CDN; after that it is cached.
 
 ## Test
 
+Run from the repository root (with the project dependencies installed, e.g. `pip install -e ".[dev]"`):
+
 ```sh
-make test          # native gate: sub-vs-sub alignment (uv, offline)
-make test-audio    # native gate: audio path PCM -> real VAD -> align (uv, offline)
-make test-browser  # full Pyodide path in headless Chromium (Playwright; needs network)
+# Native bridge test: sub-vs-sub, auto-split, PGS timings, and alignment profiles
+python web/tests/native_bridge_test.py
+
+# Native audio path test: PCM -> real WebRTC VAD -> align
+python web/tests/native_audio_test.py
+
+# UI i18n locale parity and matching tests
+node web/tests/i18n_test.mjs
+
+# Full headless Chromium Pyodide test (requires `npm install` in web/ + network)
+npm --prefix web run test:browser
 ```
 
 CI (`.github/workflows/build-site.yml`) runs the native + browser tests, cross-compiles
