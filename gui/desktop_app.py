@@ -24,7 +24,12 @@ if not getattr(sys, "frozen", False):
 import webview
 from webview.dom import DOMEventHandler
 
-from ffsubsync.constants import SUBTITLE_EXTENSIONS, SUBSYNC_RESOURCES_ENV_MAGIC
+from ffsubsync.alignment_profile import normalize_alignment_profile
+from ffsubsync.constants import (
+    DEFAULT_ALIGNMENT_PROFILE,
+    SUBTITLE_EXTENSIONS,
+    SUBSYNC_RESOURCES_ENV_MAGIC,
+)
 
 if SUBSYNC_RESOURCES_ENV_MAGIC not in os.environ:
     os.environ[SUBSYNC_RESOURCES_ENV_MAGIC] = getattr(sys, "_MEIPASS", "")
@@ -301,6 +306,9 @@ class DesktopApi:
         self._config: Dict[str, Any] = _load_desktop_config()
         self._custom_ffmpeg_path: str = str(self._config.get("ffmpeg_path") or "").strip()
         self._language: str = str(self._config.get("language") or "system").strip() or "system"
+        self._alignment_profile: str = normalize_alignment_profile(
+            self._config.get("alignment_profile")
+        )
         geom = initial_geom or _resolve_initial_window_geometry(self._config)
         self._win_state: Dict[str, Any] = {
             "width": geom["width"],
@@ -331,6 +339,7 @@ class DesktopApi:
             "portable_dir": str(get_portable_dir()),
             "custom_ffmpeg_path": self._custom_ffmpeg_path,
             "language": self._language,
+            "alignment_profile": self._alignment_profile,
             "system_languages": _get_system_languages(),
         }
 
@@ -341,6 +350,16 @@ class DesktopApi:
             self._config["language"] = cleaned
             _save_desktop_config(self._config)
         return {"language": cleaned}
+
+    def set_alignment_profile(
+        self, profile: str = DEFAULT_ALIGNMENT_PROFILE
+    ) -> Dict[str, Any]:
+        cleaned = normalize_alignment_profile(profile)
+        with self._lock:
+            self._alignment_profile = cleaned
+            self._config["alignment_profile"] = cleaned
+            _save_desktop_config(self._config)
+        return {"alignment_profile": cleaned}
 
     def pick_ffmpeg_dir(self) -> Optional[str]:
         assert self._window is not None
@@ -799,6 +818,13 @@ class DesktopApi:
                 elif split_mode == "auto":
                     argv += ["--auto-split"]
 
+                with self._lock:
+                    default_profile = self._alignment_profile
+                alignment_profile = normalize_alignment_profile(
+                    params.get("alignment_profile") or default_profile
+                )
+                argv += ["--alignment-profile", alignment_profile]
+
                 args = make_parser().parse_args(argv)
                 args.gui_mode = True
 
@@ -868,6 +894,12 @@ class DesktopApi:
                         "split_segments": result.get("split_segments"),
                         "dropped_cues": result.get("dropped_cues", 0),
                         "clipped_cues": result.get("clipped_cues", 0),
+                        "alignment_profile": result.get(
+                            "alignment_profile", alignment_profile
+                        ),
+                        "profile_offset_seconds": result.get(
+                            "profile_offset_seconds", 0.0
+                        ),
                         "quality": result.get("quality"),
                         "output_path": out_path,
                         "elapsed_seconds": elapsed,

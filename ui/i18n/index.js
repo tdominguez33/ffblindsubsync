@@ -264,6 +264,9 @@ export function createI18n({
     for (const el of root.querySelectorAll("[data-i18n-aria-label]")) {
       el.setAttribute("aria-label", t(el.dataset.i18nAriaLabel));
     }
+    for (const el of root.querySelectorAll("[data-i18n-tip]")) {
+      el.dataset.tip = t(el.dataset.i18nTip);
+    }
   }
 
   function onChange(listener) {

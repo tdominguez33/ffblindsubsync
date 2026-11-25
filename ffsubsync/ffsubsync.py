@@ -13,7 +13,13 @@ import ffmpeg
 import numpy as np
 
 from ffsubsync.aligners import FFTAligner, MaxScoreAligner
+from ffsubsync.alignment_profile import (
+    compute_profile_offset_adjustment,
+    normalize_alignment_profile,
+)
 from ffsubsync.constants import (
+    ALIGNMENT_PROFILE_CHOICES,
+    DEFAULT_ALIGNMENT_PROFILE,
     DEFAULT_APPLY_OFFSET_SECONDS,
     DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
     DEFAULT_AUTO_SPLIT_PENALTY,
@@ -515,6 +521,10 @@ def try_sync(
             use_auto_split = use_auto_split_early and reference_speech is not None
             split_segments: Optional[List[Dict[str, Any]]] = None
             dropped_cues = 0
+            alignment_profile = normalize_alignment_profile(
+                getattr(args, "alignment_profile", DEFAULT_ALIGNMENT_PROFILE)
+            )
+            profile_offset_seconds: float = 0.0
             if use_split or use_auto_split:
                 length_penalty = getattr(
                     args, "split_length_penalty", DEFAULT_SPLIT_LENGTH_PENALTY
@@ -638,6 +648,26 @@ def try_sync(
                     length_penalty=length_penalty,
                 ):
                     sync_was_successful = True
+                if alignment_profile != DEFAULT_ALIGNMENT_PROFILE:
+                    profile_delta_samples = compute_profile_offset_adjustment(
+                        reference_speech,
+                        list(scale_step.subs_),
+                        offsets_samples,
+                        profile=alignment_profile,
+                        sample_rate=SAMPLE_RATE,
+                        start_seconds=args.start_seconds,
+                    )
+                    profile_offset_seconds = profile_delta_samples / float(SAMPLE_RATE)
+                    if abs(profile_delta_samples) > 1e-6:
+                        offsets_samples = [
+                            None if off is None else off + profile_delta_samples
+                            for off in offsets_samples
+                        ]
+                        logger.info(
+                            "alignment profile '%s': adjusted block offset by %+.3fs",
+                            alignment_profile,
+                            profile_offset_seconds,
+                        )
                 offsets_seconds: List[Optional[float]] = [
                     None
                     if off is None
@@ -662,6 +692,29 @@ def try_sync(
                     if valid_offsets:
                         offset_seconds = float(np.median(valid_offsets))
             else:
+                if (
+                    not skip_sync
+                    and reference_speech is not None
+                    and alignment_profile != DEFAULT_ALIGNMENT_PROFILE
+                ):
+                    profile_delta_samples = compute_profile_offset_adjustment(
+                        reference_speech,
+                        list(scale_step.subs_),
+                        float(offset_samples),
+                        profile=alignment_profile,
+                        sample_rate=SAMPLE_RATE,
+                        start_seconds=args.start_seconds,
+                    )
+                    profile_offset_seconds = profile_delta_samples / float(SAMPLE_RATE)
+                    if abs(profile_delta_samples) > 1e-6:
+                        offset_seconds += profile_offset_seconds
+                        logger.info(
+                            "alignment profile '%s': adjusted block offset by %+.3fs "
+                            "(final offset: %.3fs)",
+                            alignment_profile,
+                            profile_offset_seconds,
+                            offset_seconds,
+                        )
                 shift_step = SubtitleShifter(offset_seconds)
             output_steps: List[Tuple[str, TransformerMixin]] = [("shift", shift_step)]
             if args.merge_with_reference:
@@ -693,6 +746,7 @@ def try_sync(
                         n_split_segments=len(split_segments) if split_segments else 1,
                         sub_format=getattr(out_subs, "_sub_format", "srt"),
                         reference_kind=reference_kind,
+                        profile_offset_seconds=profile_offset_seconds,
                     )
                     s_q = quality["sync"]
                     sub_q = quality["subtitle"]
@@ -735,6 +789,8 @@ def try_sync(
             result["split_segments"] = split_segments
             result["dropped_cues"] = dropped_cues
             result["clipped_cues"] = clipped_cues
+            result["alignment_profile"] = alignment_profile
+            result["profile_offset_seconds"] = profile_offset_seconds
             result["quality"] = quality
     result["sync_was_successful"] = sync_was_successful
     return sync_was_successful
@@ -1041,6 +1097,16 @@ def validate_args(args: argparse.Namespace) -> None:
                 "stream specified for reference subtitle extraction; "
                 "-i flag for sync input not allowed"
             )
+    alignment_profile = getattr(args, "alignment_profile", None)
+    if (
+        alignment_profile is not None
+        and alignment_profile not in ALIGNMENT_PROFILE_CHOICES
+    ):
+        raise ValueError(
+            "invalid --alignment-profile {!r}; choose one of: {}".format(
+                alignment_profile, ", ".join(ALIGNMENT_PROFILE_CHOICES)
+            )
+        )
     sub_fps = getattr(args, "sub_fps", None)
     if sub_fps is not None and sub_fps <= 0:
         raise ValueError("--sub-fps must be positive (got %r)" % (sub_fps,))
@@ -1211,6 +1277,8 @@ def run(
         "split_segments": None,
         "dropped_cues": 0,
         "clipped_cues": 0,
+        "alignment_profile": DEFAULT_ALIGNMENT_PROFILE,
+        "profile_offset_seconds": 0.0,
     }
     args = validate_and_transform_args(parser_or_args)
     if args is None:
@@ -1443,6 +1511,16 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_APPLY_OFFSET_SECONDS,
         help="Apply a predefined offset in seconds to all subtitle segments "
         "(default=%d seconds)." % DEFAULT_APPLY_OFFSET_SECONDS,
+    )
+    parser.add_argument(
+        "--alignment-profile",
+        choices=ALIGNMENT_PROFILE_CHOICES,
+        default=DEFAULT_ALIGNMENT_PROFILE,
+        help="Global block-level timing profile applied after synchronization "
+        "(default=%s). Choices: 'balanced' (default symmetric centering), "
+        "'onset' (appear right as speech starts, leaving extra reading time at "
+        "the end), 'early' (appear slightly before speech starts for early "
+        "reading lead-in)." % DEFAULT_ALIGNMENT_PROFILE,
     )
     parser.add_argument(
         "--skip-sync-on-low-quality",

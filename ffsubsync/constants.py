@@ -24,6 +24,17 @@ DEFAULT_MAX_OFFSET_SECONDS: int = 60
 DEFAULT_MIN_EMBEDDED_SUBTITLE_CUES: int = 50
 DEFAULT_APPLY_OFFSET_SECONDS: int = 0
 
+# Global block alignment profiles (--alignment-profile):
+# - "balanced": default symmetric correlation offset (current behavior).
+# - "onset":    refine the block offset so subtitles appear right as speech begins.
+# - "early":    refine the block offset so subtitles appear slightly before speech.
+ALIGNMENT_PROFILE_CHOICES: Tuple[str, ...] = (
+    "balanced",
+    "onset",
+    "early",
+)
+DEFAULT_ALIGNMENT_PROFILE: str = "balanced"
+
 # Penalty applied by the alass-style piecewise aligner (--split-penalty) when the
 # flag is given without an explicit value. Expressed in seconds-of-overlap: a split
 # is only introduced if it increases total speech overlap by more than this many

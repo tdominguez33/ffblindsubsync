@@ -808,6 +808,7 @@ def compute_quality_metrics(
     n_split_segments: int = 1,
     sub_format: str = "srt",
     reference_kind: str = "audio",
+    profile_offset_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """Compute final 0-100 ``sync`` and ``subtitle`` quality badges.
 
@@ -880,10 +881,14 @@ def compute_quality_metrics(
             ref_len,
             sample_rate,
         )
+        # Compensate for any intentional global alignment-profile shift (e.g.
+        # "onset" or "early") when measuring symmetric local-FFT residual
+        # stability so an intentional edge preference does not look like drift.
+        profile_offset_samples = float(profile_offset_seconds) * float(sample_rate)
         consistency_score = _score_temporal_consistency(
             ref,
-            starts,
-            ends,
+            starts - profile_offset_samples,
+            ends - profile_offset_samples,
             is_speech,
             durs,
             sample_rate,

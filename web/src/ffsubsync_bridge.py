@@ -112,7 +112,8 @@ class _ProgressLogHandler(logging.Handler):
 
 
 def _common_argv(in_path, out_path, *, output_encoding, no_fix_framerate, gss,
-                 max_offset_seconds, split_sync=False, auto_split=False, sub_fps=None):
+                 max_offset_seconds, split_sync=False, auto_split=False, sub_fps=None,
+                 alignment_profile=None):
     argv = ["-i", in_path, "-o", out_path]
     if output_encoding:
         argv += ["--output-encoding", output_encoding]
@@ -128,6 +129,8 @@ def _common_argv(in_path, out_path, *, output_encoding, no_fix_framerate, gss,
         argv += ["--max-offset-seconds", str(max_offset_seconds)]
     if sub_fps is not None:
         argv += ["--sub-fps", str(sub_fps)]
+    if alignment_profile:
+        argv += ["--alignment-profile", str(alignment_profile)]
     return argv
 
 
@@ -200,6 +203,8 @@ def _run_and_collect(
         "split_segments": result.get("split_segments"),
         "dropped_cues": result.get("dropped_cues", 0),
         "clipped_cues": result.get("clipped_cues", 0),
+        "alignment_profile": result.get("alignment_profile", "balanced"),
+        "profile_offset_seconds": result.get("profile_offset_seconds", 0.0),
         "quality": quality,
         "output_name": _synced_name(in_name),
         "output_text": output_text,
@@ -222,6 +227,7 @@ def sync_subtitles(
     max_offset_seconds=None,
     min_ref_cues: int = 0,
     inferred_sub_fps=None,
+    alignment_profile=None,
     progress_cb=None,
 ):
     """Sync ``in_bytes`` against subtitle reference ``ref_bytes``."""
@@ -263,6 +269,7 @@ def sync_subtitles(
         no_fix_framerate=no_fix_framerate, gss=gss, split_sync=split_sync,
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
         sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
+        alignment_profile=alignment_profile,
     )
     if reference_encoding:
         argv += ["--reference-encoding", reference_encoding]
@@ -401,6 +408,7 @@ def sync_with_audio(
     auto_split: bool = False,
     max_offset_seconds=None,
     inferred_sub_fps=None,
+    alignment_profile=None,
     progress_cb=None,
 ):
     """Sync ``in_bytes`` against decoded audio PCM from a video/audio reference.
@@ -446,6 +454,7 @@ def sync_with_audio(
         no_fix_framerate=no_fix_framerate, gss=gss, split_sync=split_sync,
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
         sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
+        alignment_profile=alignment_profile,
     )
     argv += ["--non-speech-label", str(non_speech_label)]
     return _run_and_collect(
@@ -471,6 +480,7 @@ def sync_with_timings(
     auto_split: bool = False,
     max_offset_seconds=None,
     inferred_sub_fps=None,
+    alignment_profile=None,
     progress_cb=None,
 ):
     """Sync ``in_bytes`` against ``(start_s, end_s)`` timing intervals (PGS/VobSub/DVB)."""
@@ -514,6 +524,7 @@ def sync_with_timings(
         no_fix_framerate=no_fix_framerate, gss=gss, split_sync=split_sync,
         auto_split=auto_split, max_offset_seconds=max_offset_seconds,
         sub_fps=_resolve_fallback_sub_fps(in_name, in_bytes, inferred_sub_fps),
+        alignment_profile=alignment_profile,
     )
     return _run_and_collect(
         argv, out_path, in_name, progress_cb=progress_cb, reference_kind="subtitles"

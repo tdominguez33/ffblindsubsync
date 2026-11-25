@@ -399,6 +399,31 @@
         </div>
       </div>
 
+      <div class="card settings-card" id="settings-alignment-card">
+        <div class="settings-row">
+          <div class="settings-card-title">
+            <h3>
+              <svg class="label-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="4" x2="4" y1="4" y2="20"></line>
+                <rect width="12" height="5" x="8" y="6" rx="1"></rect>
+                <rect width="8" height="5" x="8" y="13" rx="1"></rect>
+              </svg>
+              <span data-i18n="settings.alignmentProfileTitle">Alignment profile</span>
+            </h3>
+            <p class="settings-desc" data-i18n="settings.alignmentProfileDesc">
+              Choose when subtitles generally appear relative to speech.
+            </p>
+          </div>
+          <div class="settings-control">
+            <select id="settings-alignment-profile" aria-label="Alignment profile" data-i18n-aria-label="settings.alignmentProfileTitle">
+              <option value="balanced" data-i18n="settings.alignmentProfileBalanced" data-i18n-tip="settings.alignmentProfileTipBalanced" selected>Balanced (centered)</option>
+              <option value="onset" data-i18n="settings.alignmentProfileOnset" data-i18n-tip="settings.alignmentProfileTipOnset">Speech onset</option>
+              <option value="early" data-i18n="settings.alignmentProfileEarly" data-i18n-tip="settings.alignmentProfileTipEarly">Early</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <div class="card settings-card" id="settings-ffmpeg-card">
         <div class="settings-card-head">
           <div class="settings-card-title">

@@ -198,6 +198,18 @@ export default {
     "settings.languageTitle": "Language",
     "settings.languageDesc": "Choose the display language for the interface.",
     "settings.languageSystem": "System default ({language})",
+    "settings.alignmentProfileTitle": "Alignment profile",
+    "settings.alignmentProfileDesc":
+      "Choose when subtitles generally appear relative to speech.",
+    "settings.alignmentProfileBalanced": "Balanced (centered)",
+    "settings.alignmentProfileOnset": "Speech onset",
+    "settings.alignmentProfileEarly": "Early",
+    "settings.alignmentProfileTipBalanced":
+      "Centers subtitles over speech (starts slightly early, ends slightly after).",
+    "settings.alignmentProfileTipOnset":
+      "Appears right as dialogue starts, leaving extra reading time at the end.",
+    "settings.alignmentProfileTipEarly":
+      "Appears just before speech begins for an easier reading head start.",
     "settings.ffmpegTitle": "FFmpeg",
     "settings.ffmpegDescHtml":
       "Folder containing <code>ffmpeg</code> and <code>ffprobe</code> used for media analysis and audio extraction.",

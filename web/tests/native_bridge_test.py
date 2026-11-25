@@ -189,6 +189,53 @@ def main() -> int:
     assert not sparse_res["ok"], "sparse reference (<50 cues) should be rejected"
     assert "only 10 cues" in (sparse_res["error"] or "")
     print("PASS: min_ref_cues rejects sparse embedded text references")
+
+    # --- alignment_profile path (balanced / onset / early) ------------------
+    # Speech bursts are ~1.0-1.8s while subtitles linger ~0.65s after speech with
+    # slight natural start jitter (so symmetric FFT centers them ~0.30s early).
+    import random as _random
+
+    rng = _random.Random(42)
+    short_timings = []
+    wide_sub_cues = []
+    t_cur = 2.0
+    for i in range(40):
+        sp_dur = rng.uniform(1.0, 1.8)
+        tail = rng.uniform(0.45, 0.85)
+        s_jit = rng.uniform(-0.14, 0.14)
+        gap = rng.uniform(1.2, 2.8)
+        short_timings.append((t_cur, t_cur + sp_dur))
+        wide_sub_cues.append(
+            (t_cur + s_jit + 4.0, t_cur + sp_dur + tail + 4.0, "wide line {}".format(i + 1))
+        )
+        t_cur += sp_dur + tail + gap
+    wide_sub_bytes = make_srt_from(wide_sub_cues)
+
+    bal = bridge.sync_with_timings(
+        short_timings, "wide.srt", wide_sub_bytes,
+        no_fix_framerate=True, alignment_profile="balanced",
+    )
+    ons = bridge.sync_with_timings(
+        short_timings, "wide.srt", wide_sub_bytes,
+        no_fix_framerate=True, alignment_profile="onset",
+    )
+    ear = bridge.sync_with_timings(
+        short_timings, "wide.srt", wide_sub_bytes,
+        no_fix_framerate=True, alignment_profile="early",
+    )
+    assert bal["ok"] and ons["ok"] and ear["ok"]
+    assert bal["alignment_profile"] == "balanced"
+    assert ons["alignment_profile"] == "onset"
+    assert ear["alignment_profile"] == "early"
+    assert ear["offset_seconds"] < bal["offset_seconds"] < ons["offset_seconds"]
+    assert abs(ons["offset_seconds"] - (-4.0)) < 0.08, (
+        "onset should align cue starts to speech starts (~-4.0s), got %.3fs"
+        % ons["offset_seconds"]
+    )
+    print(
+        "PASS: alignment_profile offsets ordered early (%.3fs) < balanced (%.3fs) < onset (%.3fs)"
+        % (ear["offset_seconds"], bal["offset_seconds"], ons["offset_seconds"])
+    )
     return 0
 
 

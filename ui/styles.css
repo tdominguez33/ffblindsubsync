@@ -66,7 +66,10 @@
   --progress-border: #e4e4e7;         /* zinc-200 */
   --progress-fill: #10b981;           /* emerald-500 */
 
-  --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-xs: none;
+  --select-open-bg: #ffffff;
+  --select-selected-bg: #f4f4f5;
+  --select-menu-shadow: none;
   --scrollbar-thumb: rgba(161, 161, 170, 0.35);
   --scrollbar-thumb-hover: rgba(113, 113, 122, 0.65);
   --chevron-color: %23a1a1aa;
@@ -132,7 +135,10 @@ html.dark {
   --progress-border: #3f3f46;         /* zinc-700 */
   --progress-fill: #34d399;           /* emerald-400 */
 
-  --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.35);
+  --shadow-xs: none;
+  --select-open-bg: #09090b;
+  --select-selected-bg: rgba(255, 255, 255, 0.06);
+  --select-menu-shadow: none;
   --scrollbar-thumb: rgba(113, 113, 122, 0.35);
   --scrollbar-thumb-hover: rgba(161, 161, 170, 0.6);
   --chevron-color: %2371717a;
@@ -837,7 +843,7 @@ main:has(#main-view:not([hidden]) #status-row:not([hidden])) {
   font-weight: 400;
   line-height: 1.45;
   text-align: left;
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.16);
+  box-shadow: none;
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
@@ -846,8 +852,8 @@ main:has(#main-view:not([hidden]) #status-row:not([hidden])) {
 }
 
 html.dark .help-tip-bubble {
-  background: #18181b;
-  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.55);
+  background: #09090b;
+  box-shadow: none;
 }
 
 .help-tip.tip-align-end .help-tip-bubble {
@@ -1050,7 +1056,7 @@ input[type="text"][readonly] {
   height: 15px;
   border-radius: 9999px;
   background: var(--switch-knob);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+  box-shadow: none;
   transition: transform 200ms cubic-bezier(0.4, 0, 0.2, 1), background-color 200ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -1133,6 +1139,258 @@ button.secondary:hover:not(:disabled),
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* Integrated custom dropdowns (replaces raw OS-native <select> popups) */
+.custom-select {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.custom-select.is-open {
+  z-index: 35;
+}
+
+.custom-select-native {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+  pointer-events: none;
+}
+
+button.custom-select-trigger {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: left;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+button.custom-select-trigger:hover {
+  border-color: var(--border-strong);
+}
+
+button.custom-select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+.custom-select.is-open button.custom-select-trigger {
+  background: var(--select-open-bg);
+  border-color: var(--border-strong);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.custom-select.is-open.is-dropup button.custom-select-trigger {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+}
+
+.custom-select-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.custom-select-chevron {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--faint);
+  transition: transform 160ms cubic-bezier(0.4, 0, 0.2, 1), color 160ms ease;
+}
+
+button.custom-select-trigger:hover .custom-select-chevron,
+.custom-select.is-open .custom-select-chevron {
+  color: var(--muted);
+}
+
+.custom-select.is-open .custom-select-chevron {
+  transform: rotate(180deg);
+}
+
+.custom-select-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  margin-top: -1px;
+  padding: 0.28rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--select-open-bg);
+  border: 1px solid var(--border-strong);
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0 0 8px 8px;
+  box-shadow: var(--select-menu-shadow);
+  z-index: 36;
+}
+
+.custom-select.is-dropup .custom-select-menu {
+  top: auto;
+  bottom: 100%;
+  margin-top: 0;
+  margin-bottom: -1px;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 8px 8px 0 0;
+}
+
+.custom-select-menu.is-scrollable {
+  max-height: 230px;
+  overflow-y: auto;
+}
+
+.custom-select-option {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.42rem 0.5rem;
+  border-radius: 6px;
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--fg-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.custom-select-option:hover:not(.is-disabled),
+.custom-select-option.is-active:not(.is-disabled) {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.custom-select-option.is-selected {
+  color: var(--fg);
+  font-weight: 600;
+  background: var(--select-selected-bg);
+}
+
+.custom-select-option.is-selected:hover,
+.custom-select-option.is-selected.is-active {
+  background: var(--surface-hover);
+}
+
+.custom-select-option.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.custom-select-check {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg);
+  opacity: 0;
+}
+
+.custom-select-option.is-selected .custom-select-check {
+  opacity: 1;
+}
+
+.custom-select-check svg {
+  width: 13px;
+  height: 13px;
+}
+
+.custom-select-option-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Option-level tooltips inside custom dropdowns: float cleanly to the left of the menu */
+.custom-select-option .help-tip {
+  position: static;
+  flex: none;
+  margin-left: 0.15rem;
+}
+
+.custom-select-option:has(.help-tip:hover),
+.custom-select-option:has(.help-tip:focus),
+.custom-select-option:has(.help-tip:focus-visible) {
+  z-index: 3;
+}
+
+.custom-select-option .help-tip-bubble {
+  left: auto;
+  right: calc(100% + 10px);
+  top: 50%;
+  bottom: auto;
+  width: 224px;
+  white-space: normal;
+  transform: translateY(-50%) translateX(4px);
+  transition-property: opacity, transform, visibility;
+  transition-duration: 140ms;
+  transition-timing-function: ease;
+  transition-delay: 0ms;
+}
+
+.custom-select-option .help-tip:hover .help-tip-bubble {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(-50%) translateX(0);
+  transition-delay: 320ms;
+}
+
+.custom-select-option .help-tip:focus .help-tip-bubble,
+.custom-select-option .help-tip:focus-visible .help-tip-bubble {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(-50%) translateX(0);
+  transition-delay: 0ms;
+}
+
+@media (max-width: 600px) {
+  .custom-select-option .help-tip-bubble {
+    right: 0;
+    left: auto;
+    top: auto;
+    bottom: calc(100% + 6px);
+    width: min(230px, calc(100vw - 3rem));
+    transform: translateY(3px);
+  }
+
+  .custom-select-option .help-tip:hover .help-tip-bubble,
+  .custom-select-option .help-tip:focus .help-tip-bubble,
+  .custom-select-option .help-tip:focus-visible .help-tip-bubble {
+    transform: translateY(0);
+  }
 }
 
 /* Progress bar matching no-bs-transfer emerald pill progress */

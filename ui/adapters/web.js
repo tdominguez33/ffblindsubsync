@@ -465,6 +465,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         gss: Boolean(request.gss),
         split_sync: request.splitMode === "force",
         auto_split: request.splitMode === "auto",
+        alignment_profile: request.alignmentProfile || "balanced",
       };
 
       onProgress({ messageKey: "progress.readingInputSubs", fraction: 0.02 });

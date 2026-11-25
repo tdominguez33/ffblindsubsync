@@ -299,6 +299,9 @@ export function createAdapter({ i18n, callbacks }) {
       if (state && state.version && callbacks.onAppVersion) {
         callbacks.onAppVersion(state.version);
       }
+      if (state && typeof state.alignment_profile === "string" && callbacks.onAlignmentProfileInit) {
+        callbacks.onAlignmentProfileInit(state.alignment_profile);
+      }
       const ff =
         state && state.ffmpeg
           ? {
@@ -375,6 +378,7 @@ export function createAdapter({ i18n, callbacks }) {
         split_mode: request.splitMode,
         no_fix_framerate: Boolean(request.noFixFramerate),
         gss: Boolean(request.gss),
+        alignment_profile: request.alignmentProfile || "balanced",
       });
       if (!res || !res.started) {
         return {
@@ -404,6 +408,12 @@ export function createAdapter({ i18n, callbacks }) {
     onLanguageChange(pref) {
       if (api && typeof api.set_language === "function") {
         api.set_language(String(pref || "system")).catch(() => { });
+      }
+    },
+
+    onAlignmentProfileChange(profile) {
+      if (api && typeof api.set_alignment_profile === "function") {
+        api.set_alignment_profile(String(profile || "balanced")).catch(() => { });
       }
     },
   };

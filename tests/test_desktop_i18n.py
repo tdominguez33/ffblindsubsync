@@ -75,3 +75,35 @@ def test_desktop_api_language_default_and_persistence(tmp_path, monkeypatch):
     api_reloaded.set_language("system")
     saved2 = json.loads(cfg_file.read_text(encoding="utf-8"))
     assert saved2["language"] == "system"
+
+
+def test_desktop_api_alignment_profile_default_and_persistence(tmp_path, monkeypatch):
+    mod = _load_desktop_app_module()
+    cfg_file = tmp_path / "config.json"
+    monkeypatch.setattr(mod, "_config_path", lambda: cfg_file)
+    monkeypatch.setattr(mod, "get_portable_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        mod,
+        "find_ffmpeg_binaries",
+        lambda custom_path=None: {"available": False, "source": None},
+    )
+
+    api = mod.DesktopApi()
+    assert api.get_init_state()["alignment_profile"] == "balanced"
+
+    res = api.set_alignment_profile("onset")
+    assert res == {"alignment_profile": "onset"}
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert saved["alignment_profile"] == "onset"
+
+    api_reloaded = mod.DesktopApi()
+    assert api_reloaded.get_init_state()["alignment_profile"] == "onset"
+
+    res_early = api_reloaded.set_alignment_profile("early")
+    assert res_early == {"alignment_profile": "early"}
+    assert json.loads(cfg_file.read_text(encoding="utf-8"))["alignment_profile"] == "early"
+
+    # Unknown values normalize safely back to balanced.
+    res_invalid = api_reloaded.set_alignment_profile("bogus")
+    assert res_invalid == {"alignment_profile": "balanced"}
+    assert json.loads(cfg_file.read_text(encoding="utf-8"))["alignment_profile"] == "balanced"

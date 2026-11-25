@@ -30,6 +30,7 @@ const els = {
   settingsView: document.getElementById("settings-view"),
   settingsCloseBtn: document.getElementById("settings-close-btn"),
   settingsLanguage: document.getElementById("settings-language"),
+  settingsAlignmentProfile: document.getElementById("settings-alignment-profile"),
   settingsFfmpegCard: document.getElementById("settings-ffmpeg-card"),
   settingsFfPill: document.getElementById("settings-ff-pill"),
   settingsFfDot: document.getElementById("settings-ff-dot"),
@@ -84,6 +85,29 @@ const els = {
   settingsVersion: document.getElementById("settings-version"),
 };
 
+const ALIGNMENT_PROFILE_STORAGE_KEY = "ffs_alignment_profile";
+const DEFAULT_ALIGNMENT_PROFILE = "balanced";
+const ALIGNMENT_PROFILES = new Set(["balanced", "onset", "early"]);
+
+function normalizeAlignmentProfile(raw) {
+  const cleaned = String(raw || "").trim().toLowerCase();
+  return ALIGNMENT_PROFILES.has(cleaned) ? cleaned : DEFAULT_ALIGNMENT_PROFILE;
+}
+
+function readSavedAlignmentProfile() {
+  try {
+    return normalizeAlignmentProfile(localStorage.getItem(ALIGNMENT_PROFILE_STORAGE_KEY));
+  } catch (_) {
+    return DEFAULT_ALIGNMENT_PROFILE;
+  }
+}
+
+function writeSavedAlignmentProfile(profile) {
+  try {
+    localStorage.setItem(ALIGNMENT_PROFILE_STORAGE_KEY, profile);
+  } catch (_) {}
+}
+
 let adapter = null;
 let runtimeReady = false;
 let busy = false;
@@ -97,9 +121,30 @@ let streamProbeSeq = 0;
 let themeTransitionTimer = null;
 let settingsOpen = false;
 let openQualityPanel = null; // null | "sync" | "subtitle"
+let alignmentProfile = readSavedAlignmentProfile();
+
+function renderAlignmentProfileSetting() {
+  if (els.settingsAlignmentProfile) {
+    els.settingsAlignmentProfile.value = alignmentProfile;
+    observeSelect(els.settingsAlignmentProfile);
+    fitSelectOptions(els.settingsAlignmentProfile);
+  }
+}
+
+function applyAlignmentProfile(nextProfile, { persist = true, notifyAdapter = false } = {}) {
+  alignmentProfile = normalizeAlignmentProfile(nextProfile);
+  if (persist) {
+    writeSavedAlignmentProfile(alignmentProfile);
+  }
+  renderAlignmentProfileSetting();
+  if (notifyAdapter && adapter && typeof adapter.onAlignmentProfileChange === "function") {
+    adapter.onAlignmentProfileChange(alignmentProfile);
+  }
+}
 
 function setSettingsOpen(open) {
   if (!adapter || !adapter.capabilities.settings) return;
+  closeAllCustomSelects();
   settingsOpen = Boolean(open);
   if (els.mainView) els.mainView.hidden = settingsOpen;
   if (els.settingsView) els.settingsView.hidden = !settingsOpen;
@@ -107,8 +152,9 @@ function setSettingsOpen(open) {
     els.settingsBtn.classList.toggle("active", settingsOpen);
     els.settingsBtn.setAttribute("aria-pressed", String(settingsOpen));
   }
-  if (settingsOpen && els.settingsLanguage) {
-    fitSelectOptions(els.settingsLanguage);
+  if (settingsOpen) {
+    if (els.settingsLanguage) fitSelectOptions(els.settingsLanguage);
+    if (els.settingsAlignmentProfile) fitSelectOptions(els.settingsAlignmentProfile);
   }
 }
 
@@ -236,14 +282,17 @@ function formatResultSummary(res) {
   );
 }
 
-// Pixel-accurate truncation for all <select> dropdown options so native OS
-// popups never overflow the window. Preserves trailing bracketed metadata
-// (e.g. "[eac3]", "[PGS timings]", "[text: subrip]") whenever present.
+// Integrated custom dropdowns (replaces raw OS-native <select> popups while
+// keeping the underlying <select> as the single source of truth). Preserves
+// trailing bracketed metadata (e.g. "[eac3]", "[PGS timings]") on narrow widths.
 const _measureCanvas = document.createElement("canvas");
 const _measureCtx = _measureCanvas.getContext("2d");
 const _TRAILING_BRACKETS_RE = /^(.*?)(\s*(?:\[[^\]]+\]\s*)+)$/;
-const _selectObserved = new WeakSet();
+const _customSelects = new WeakMap();
+const _allCustomSelectInstances = new Set();
+let _openCustomSelect = null;
 let _selectResizeObserver = null;
+let _customSelectGlobalListenersWired = false;
 
 function truncateSelectLabel(fullText, maxPx, measure) {
   const text = String(fullText || "");
@@ -271,7 +320,6 @@ function truncateSelectLabel(fullText, maxPx, measure) {
       const prefix = head.slice(0, lo).replace(/[\s·,:;(\[-]+$/, "");
       return prefix ? prefix + tail : brackets.trim();
     }
-    // Extreme narrow width: still prioritize bracketed metadata over the prefix.
     const trimmedBrackets = brackets.trim();
     if (measure(trimmedBrackets) <= maxPx) {
       return trimmedBrackets;
@@ -301,70 +349,402 @@ function measureSelectText(str, font) {
   return str.length * 6.5;
 }
 
-function updateSelectTooltip(selectEl) {
-  if (!selectEl) return;
-  const opt = selectEl.options[selectEl.selectedIndex];
-  const full = opt ? (opt.dataset.fullLabel || opt.textContent || "") : "";
-  if (!opt || !full) {
-    selectEl.title = "";
-    return;
+function createSelectChevronSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("class", "custom-select-chevron");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2.2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", "m6 9 6 6 6-6");
+  svg.appendChild(path);
+  return svg;
+}
+
+function createSelectCheckSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2.4");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", "M20 6 9 17l-5-5");
+  svg.appendChild(path);
+  return svg;
+}
+
+function closeCustomSelect(inst, { restoreFocus = false } = {}) {
+  if (!inst || !inst.isOpen) return;
+  inst.isOpen = false;
+  inst.activeIndex = -1;
+  inst.wrap.classList.remove("is-open", "is-dropup");
+  inst.trigger.setAttribute("aria-expanded", "false");
+  inst.menu.hidden = true;
+  if (_openCustomSelect === inst) {
+    _openCustomSelect = null;
   }
-  if (opt.textContent !== full) {
-    selectEl.title = full;
-    return;
-  }
-  const width = selectEl.clientWidth;
-  if (width > 0) {
-    const cs = window.getComputedStyle(selectEl);
-    const padL = parseFloat(cs.paddingLeft) || 10;
-    const padR = parseFloat(cs.paddingRight) || 30;
-    const closedMaxPx = Math.max(40, width - padL - padR);
-    const closedFont = `${cs.fontWeight || "500"} ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
-    selectEl.title = measureSelectText(full, closedFont) > closedMaxPx ? full : "";
-  } else {
-    selectEl.title = "";
+  if (restoreFocus) {
+    inst.trigger.focus();
   }
 }
 
-function fitSelectOptions(selectEl) {
-  if (!selectEl || !selectEl.options || selectEl.options.length === 0) return;
-  const width = selectEl.clientWidth;
-  if (width <= 0) return;
-  const cs = window.getComputedStyle(selectEl);
-  // Fit options to the open popup width (no chevron, regular option weight)
-  // while CSS text-overflow: ellipsis handles the closed <select> edge cleanly.
-  const popupMaxPx = Math.max(40, width - 20);
-  const popupFont = `400 ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
-  const measure = (str) => measureSelectText(str, popupFont);
+function closeAllCustomSelects() {
+  if (_openCustomSelect) {
+    closeCustomSelect(_openCustomSelect);
+  }
+}
 
-  for (const opt of selectEl.options) {
+function ensureCustomSelectGlobalListeners() {
+  if (_customSelectGlobalListenersWired) return;
+  _customSelectGlobalListenersWired = true;
+  document.addEventListener("mousedown", (e) => {
+    if (_openCustomSelect && !_openCustomSelect.wrap.contains(e.target)) {
+      closeCustomSelect(_openCustomSelect);
+    }
+  });
+  window.addEventListener("blur", () => closeAllCustomSelects());
+  window.addEventListener("resize", () => {
+    if (_openCustomSelect) positionCustomSelectMenu(_openCustomSelect);
+  });
+}
+
+function positionCustomSelectMenu(inst) {
+  if (!inst || !inst.isOpen) return;
+  const rect = inst.trigger.getBoundingClientRect();
+  const estHeight = Math.min(230, inst.menu.scrollHeight || 160);
+  const spaceBelow = window.innerHeight - rect.bottom;
+  const spaceAbove = rect.top;
+  const dropUp = spaceBelow < estHeight + 14 && spaceAbove > spaceBelow;
+  inst.wrap.classList.toggle("is-dropup", dropUp);
+}
+
+function setCustomSelectActiveIndex(inst, idx) {
+  inst.activeIndex = idx;
+  const rows = inst.menu.querySelectorAll(".custom-select-option");
+  rows.forEach((row, i) => {
+    row.classList.toggle("is-active", i === idx);
+    if (i === idx && inst.menu.classList.contains("is-scrollable")) {
+      row.scrollIntoView({ block: "nearest" });
+    }
+  });
+}
+
+function nextEnabledOptionIndex(selectEl, startIdx, step) {
+  const opts = selectEl.options;
+  const len = opts.length;
+  if (!len) return -1;
+  let i = startIdx;
+  for (let tries = 0; tries < len; tries += 1) {
+    i = (i + step + len) % len;
+    if (!opts[i].disabled) return i;
+  }
+  return -1;
+}
+
+function openCustomSelect(inst) {
+  if (!inst || inst.isOpen || inst.select.disabled || inst.select.options.length === 0) return;
+  if (_openCustomSelect && _openCustomSelect !== inst) {
+    closeCustomSelect(_openCustomSelect);
+  }
+  renderCustomSelectOptions(inst);
+  inst.isOpen = true;
+  inst.menu.hidden = false;
+  inst.wrap.classList.add("is-open");
+  inst.trigger.setAttribute("aria-expanded", "true");
+  _openCustomSelect = inst;
+  positionCustomSelectMenu(inst);
+  const selIdx = inst.select.selectedIndex >= 0 ? inst.select.selectedIndex : 0;
+  setCustomSelectActiveIndex(inst, selIdx);
+}
+
+function selectCustomOptionByIndex(inst, idx) {
+  const opt = inst.select.options[idx];
+  if (!opt || opt.disabled) return;
+  const changed = inst.select.selectedIndex !== idx;
+  inst.select.selectedIndex = idx;
+  renderCustomSelectTrigger(inst);
+  closeCustomSelect(inst, { restoreFocus: true });
+  if (changed) {
+    inst.select.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+}
+
+function renderCustomSelectTrigger(inst) {
+  const { select, trigger, valueEl } = inst;
+  const ariaLabel = select.getAttribute("aria-label");
+  if (ariaLabel) {
+    trigger.setAttribute("aria-label", ariaLabel);
+  }
+  const opt = select.options[select.selectedIndex];
+  const full = opt ? (opt.dataset.fullLabel || opt.textContent || "") : "";
+  const width = trigger.clientWidth;
+  if (width > 0 && full) {
+    const cs = window.getComputedStyle(trigger);
+    const padL = parseFloat(cs.paddingLeft) || 10;
+    const padR = parseFloat(cs.paddingRight) || 10;
+    const maxPx = Math.max(40, width - padL - padR - 22);
+    const font = `${cs.fontWeight || "500"} ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
+    const fitted = truncateSelectLabel(full, maxPx, (s) => measureSelectText(s, font));
+    valueEl.textContent = fitted;
+    trigger.title = fitted !== full ? full : "";
+  } else {
+    valueEl.textContent = full;
+    trigger.title = "";
+  }
+}
+
+function renderCustomSelectOptions(inst) {
+  const { select, menu, trigger } = inst;
+  menu.innerHTML = "";
+  const width = trigger.clientWidth;
+  const cs = window.getComputedStyle(trigger);
+  const optionFont = `500 ${cs.fontSize || "12px"} ${cs.fontFamily || "sans-serif"}`;
+  const opts = Array.from(select.options);
+  const hasTips = opts.some((o) => Boolean(o.dataset.tip));
+  const scrollable = opts.length > 7 && !hasTips;
+  menu.classList.toggle("is-scrollable", scrollable);
+
+  opts.forEach((opt, idx) => {
     if (opt.dataset.fullLabel === undefined) {
       opt.dataset.fullLabel = opt.textContent || "";
     }
     const full = opt.dataset.fullLabel;
-    const fitted = truncateSelectLabel(full, popupMaxPx, measure);
-    if (opt.textContent !== fitted) {
-      opt.textContent = fitted;
+    const tipText = opt.dataset.tip || "";
+    const row = document.createElement("div");
+    row.className = "custom-select-option";
+    row.setAttribute("role", "option");
+    row.dataset.index = String(idx);
+    const isSelected = idx === select.selectedIndex;
+    row.setAttribute("aria-selected", String(isSelected));
+    if (isSelected) row.classList.add("is-selected");
+    if (opt.disabled) {
+      row.classList.add("is-disabled");
+      row.setAttribute("aria-disabled", "true");
     }
-    opt.title = fitted !== full ? full : "";
-  }
-  updateSelectTooltip(selectEl);
+
+    const check = document.createElement("span");
+    check.className = "custom-select-check";
+    check.setAttribute("aria-hidden", "true");
+    check.appendChild(createSelectCheckSvg());
+
+    const label = document.createElement("span");
+    label.className = "custom-select-option-label";
+    let display = full;
+    if (width > 0 && full) {
+      const reserved = 44 + (tipText ? 22 : 0) + (scrollable ? 8 : 0);
+      const maxPx = Math.max(40, width - reserved);
+      display = truncateSelectLabel(full, maxPx, (s) => measureSelectText(s, optionFont));
+    }
+    label.textContent = display;
+    if (display !== full) {
+      row.title = full;
+    }
+
+    row.appendChild(check);
+    row.appendChild(label);
+
+    if (tipText) {
+      const tip = createHelpTip(tipText);
+      tip.classList.remove("tip-align-start");
+      tip.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      });
+      tip.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (document.activeElement === tip) {
+          tip.blur();
+        } else {
+          tip.focus();
+        }
+      });
+      row.appendChild(tip);
+    }
+
+    row.addEventListener("mouseenter", () => {
+      if (
+        document.activeElement &&
+        menu.contains(document.activeElement) &&
+        !row.contains(document.activeElement)
+      ) {
+        document.activeElement.blur();
+      }
+      if (!opt.disabled) setCustomSelectActiveIndex(inst, idx);
+    });
+    row.addEventListener("mousedown", (e) => {
+      // Keep focus clean and select immediately on primary mouse click.
+      if (e.button !== 0) return;
+      e.preventDefault();
+    });
+    row.addEventListener("click", () => {
+      if (!opt.disabled) selectCustomOptionByIndex(inst, idx);
+    });
+
+    menu.appendChild(row);
+  });
 }
 
-function observeSelect(selectEl) {
-  if (!selectEl || _selectObserved.has(selectEl)) return;
-  _selectObserved.add(selectEl);
-  selectEl.addEventListener("change", () => updateSelectTooltip(selectEl));
+function ensureCustomSelect(selectEl) {
+  if (!selectEl) return null;
+  if (_customSelects.has(selectEl)) return _customSelects.get(selectEl);
+  ensureCustomSelectGlobalListeners();
+
+  const wrap = document.createElement("div");
+  wrap.className = "custom-select";
+  if (selectEl.id) {
+    wrap.dataset.for = selectEl.id;
+  }
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "custom-select-trigger";
+  trigger.setAttribute("role", "combobox");
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+
+  const valueEl = document.createElement("span");
+  valueEl.className = "custom-select-value";
+
+  trigger.appendChild(valueEl);
+  trigger.appendChild(createSelectChevronSvg());
+
+  const menu = document.createElement("div");
+  menu.className = "custom-select-menu";
+  menu.setAttribute("role", "listbox");
+  menu.hidden = true;
+
+  const parent = selectEl.parentNode;
+  if (parent) {
+    parent.insertBefore(wrap, selectEl);
+  }
+  selectEl.classList.add("custom-select-native");
+  selectEl.tabIndex = -1;
+  selectEl.setAttribute("aria-hidden", "true");
+  wrap.appendChild(selectEl);
+  wrap.appendChild(trigger);
+  wrap.appendChild(menu);
+
+  const inst = {
+    select: selectEl,
+    wrap,
+    trigger,
+    valueEl,
+    menu,
+    isOpen: false,
+    activeIndex: -1,
+  };
+  _customSelects.set(selectEl, inst);
+  _allCustomSelectInstances.add(inst);
+
+  trigger.addEventListener("click", () => {
+    if (inst.isOpen) {
+      closeCustomSelect(inst);
+    } else {
+      openCustomSelect(inst);
+    }
+  });
+
+  trigger.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!inst.isOpen) {
+        openCustomSelect(inst);
+      } else {
+        const next = nextEnabledOptionIndex(
+          selectEl,
+          inst.activeIndex >= 0 ? inst.activeIndex : selectEl.selectedIndex,
+          1,
+        );
+        if (next >= 0) setCustomSelectActiveIndex(inst, next);
+      }
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!inst.isOpen) {
+        openCustomSelect(inst);
+      } else {
+        const prev = nextEnabledOptionIndex(
+          selectEl,
+          inst.activeIndex >= 0 ? inst.activeIndex : selectEl.selectedIndex,
+          -1,
+        );
+        if (prev >= 0) setCustomSelectActiveIndex(inst, prev);
+      }
+    } else if (e.key === "Home" && inst.isOpen) {
+      e.preventDefault();
+      const first = nextEnabledOptionIndex(selectEl, -1, 1);
+      if (first >= 0) setCustomSelectActiveIndex(inst, first);
+    } else if (e.key === "End" && inst.isOpen) {
+      e.preventDefault();
+      const last = nextEnabledOptionIndex(selectEl, 0, -1);
+      if (last >= 0) setCustomSelectActiveIndex(inst, last);
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (!inst.isOpen) {
+        openCustomSelect(inst);
+      } else if (inst.activeIndex >= 0) {
+        selectCustomOptionByIndex(inst, inst.activeIndex);
+      }
+    } else if (e.key === "Escape" && inst.isOpen) {
+      e.preventDefault();
+      e.stopPropagation();
+      closeCustomSelect(inst, { restoreFocus: true });
+    } else if (e.key === "Tab" && inst.isOpen) {
+      closeCustomSelect(inst);
+    }
+  });
+
+  selectEl.addEventListener("change", () => {
+    renderCustomSelectTrigger(inst);
+    if (inst.isOpen) renderCustomSelectOptions(inst);
+  });
+
   if (typeof ResizeObserver === "function") {
     if (!_selectResizeObserver) {
       _selectResizeObserver = new ResizeObserver((entries) => {
         for (const entry of entries) {
-          fitSelectOptions(entry.target);
+          for (const candidate of _allCustomSelectInstances) {
+            if (candidate.trigger === entry.target) {
+              renderCustomSelectTrigger(candidate);
+              if (candidate.isOpen) {
+                renderCustomSelectOptions(candidate);
+                positionCustomSelectMenu(candidate);
+              }
+              break;
+            }
+          }
         }
       });
     }
-    _selectResizeObserver.observe(selectEl);
+    _selectResizeObserver.observe(trigger);
   }
+
+  renderCustomSelectTrigger(inst);
+  return inst;
+}
+
+function fitSelectOptions(selectEl) {
+  if (!selectEl) return;
+  const inst = ensureCustomSelect(selectEl);
+  if (!inst) return;
+  renderCustomSelectTrigger(inst);
+  if (inst.isOpen) {
+    renderCustomSelectOptions(inst);
+    positionCustomSelectMenu(inst);
+  }
+}
+
+function observeSelect(selectEl) {
+  ensureCustomSelect(selectEl);
 }
 
 function fitAllSelectOptions() {
@@ -431,6 +811,7 @@ function resetStreamSelectToAuto() {
   els.refStream.value = "";
   els.refStream.title = "";
   els.streamHint.textContent = i18n.t("form.streamHintAuto");
+  fitSelectOptions(els.refStream);
 }
 
 function renderStreamProbe(res, { preserveSelection = false } = {}) {
@@ -953,6 +1334,7 @@ function resetFormState() {
   els.splitMode.value = "auto";
   els.noFixFramerate.checked = false;
   els.gss.checked = false;
+  fitAllSelectOptions();
   refreshSyncBtn();
 }
 
@@ -1030,6 +1412,7 @@ function applyAdapterMeta(ad) {
 function applyLanguageToUi() {
   i18n.applyTranslations(document);
   populateLanguageSelect();
+  renderAlignmentProfileSetting();
   syncThemeToggleLabel(isDarkTheme());
   syncMaximizedState(document.body.classList.contains("is-maximized"));
 
@@ -1333,8 +1716,14 @@ function wireEvents(ad) {
       els.settingsCloseBtn.addEventListener("click", () => setSettingsOpen(false));
     }
     window.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && settingsOpen) {
-        setSettingsOpen(false);
+      if (e.key === "Escape") {
+        if (_openCustomSelect) {
+          closeCustomSelect(_openCustomSelect, { restoreFocus: true });
+          return;
+        }
+        if (settingsOpen) {
+          setSettingsOpen(false);
+        }
       }
     });
 
@@ -1345,6 +1734,15 @@ function wireEvents(ad) {
         if (typeof ad.onLanguageChange === "function") {
           ad.onLanguageChange(i18n.getPreference());
         }
+      });
+    }
+
+    if (els.settingsAlignmentProfile) {
+      els.settingsAlignmentProfile.addEventListener("change", () => {
+        applyAlignmentProfile(els.settingsAlignmentProfile.value, {
+          persist: true,
+          notifyAdapter: true,
+        });
       });
     }
 
@@ -1413,6 +1811,7 @@ function wireEvents(ad) {
           splitMode: els.splitMode.value,
           noFixFramerate: Boolean(els.noFixFramerate.checked),
           gss: Boolean(els.gss.checked),
+          alignmentProfile,
         },
         {
           onProgress: ({ message, messageKey, messageParams, fraction }) => {
@@ -1468,6 +1867,8 @@ async function boot() {
       },
       onWindowMaximizedChange: syncMaximizedState,
       onAppVersion: applyAppVersion,
+      onAlignmentProfileInit: (profile) =>
+        applyAlignmentProfile(profile, { persist: true, notifyAdapter: false }),
     },
   });
 

@@ -198,6 +198,18 @@ export default {
     "settings.languageTitle": "Idioma",
     "settings.languageDesc": "Elige el idioma de la interfaz.",
     "settings.languageSystem": "Configuración del sistema ({language})",
+    "settings.alignmentProfileTitle": "Perfil de alineación",
+    "settings.alignmentProfileDesc":
+      "Elige en qué momento general aparecen los subtítulos respecto a la voz.",
+    "settings.alignmentProfileBalanced": "Equilibrado (centrado)",
+    "settings.alignmentProfileOnset": "Al inicio de la voz",
+    "settings.alignmentProfileEarly": "Anticipado",
+    "settings.alignmentProfileTipBalanced":
+      "Centra los subtítulos sobre la voz (empiezan un poco antes y terminan después).",
+    "settings.alignmentProfileTipOnset":
+      "Aparecen justo al empezar a hablar, dejando el tiempo extra al final.",
+    "settings.alignmentProfileTipEarly":
+      "Aparecen un instante antes de que hablen para facilitar la lectura.",
     "settings.ffmpegTitle": "FFmpeg",
     "settings.ffmpegDescHtml":
       "Carpeta que contiene <code>ffmpeg</code> y <code>ffprobe</code> usados para el análisis multimedia y la extracción de audio.",
