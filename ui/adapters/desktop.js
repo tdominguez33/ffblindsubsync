@@ -129,6 +129,31 @@ export function createAdapter({ i18n, callbacks }) {
     if (!fullPath) return;
     callbacks.onExternalDrop(target, { value: fullPath, display: fullPath });
   };
+  window.setDroppedPaths = async function (target, paths) {
+    if (!Array.isArray(paths) || !paths.length) return;
+    if (target === "in" && api && typeof api.resolve_subtitle_inputs === "function") {
+      const refPath = callbacks.getCurrentReference ? callbacks.getCurrentReference() : null;
+      const resolved = await api.resolve_subtitle_inputs(paths, refPath || null);
+      if (resolved && resolved.error) {
+        if (callbacks.onInputError) {
+          callbacks.onInputError(resolved.error_key ? t(resolved.error_key) : resolved.error);
+        }
+        return;
+      }
+      const files = (resolved && resolved.files) || [];
+      if (files.length) {
+        callbacks.onExternalDrop(
+          target,
+          files.map((p) => ({ value: p, display: p })),
+        );
+      }
+      return;
+    }
+    callbacks.onExternalDrop(
+      target,
+      paths.map((p) => ({ value: p, display: p })),
+    );
+  };
   window.setWindowMaximized = function (isMax) {
     if (callbacks.onWindowMaximizedChange) {
       callbacks.onWindowMaximizedChange(Boolean(isMax));
@@ -196,6 +221,9 @@ export function createAdapter({ i18n, callbacks }) {
         pendingSync = null;
         current.resolve({
           ok: Boolean(sy.ok),
+          multi_mode: Boolean(sy.multi_mode),
+          candidates: Array.isArray(sy.candidates) ? sy.candidates : null,
+          ref_cached: Boolean(sy.ref_cached),
           offset_seconds: sy.offset_seconds,
           framerate_scale_factor: sy.framerate_scale_factor,
           split_segments: sy.split_segments,
@@ -331,8 +359,53 @@ export function createAdapter({ i18n, callbacks }) {
         `${t("dialogs.subtitles")} (*.srt;*.ass;*.ssa;*.sub;*.vtt)`,
         `${t("dialogs.allFiles")} (*.*)`,
       ];
-      const p = await api.pick_subtitle(fileTypes);
-      return p ? { value: p, display: p } : null;
+      const res = await api.pick_subtitle(fileTypes);
+      if (!res) return null;
+      const list = Array.isArray(res) ? res : [res];
+      const cleaned = list.filter(Boolean);
+      if (!cleaned.length) return null;
+      return cleaned.map((p) => ({ value: p, display: p }));
+    },
+
+    async pickSubtitleFolder(refPath) {
+      if (!api || typeof api.pick_subtitle_folder !== "function") return null;
+      const res = await api.pick_subtitle_folder(refPath || null);
+      if (!res || res.cancelled) return null;
+      if (res.error) {
+        return { error: res.error_key ? t(res.error_key) : res.error, entries: [] };
+      }
+      const files = Array.isArray(res.files) ? res.files : [];
+      return { error: null, entries: files.map((p) => ({ value: p, display: p })) };
+    },
+
+    async resolveSubtitleInputs(paths, refPath) {
+      if (!api || typeof api.resolve_subtitle_inputs !== "function") {
+        return { error: null, entries: (paths || []).map((p) => ({ value: p, display: p })) };
+      }
+      const res = await api.resolve_subtitle_inputs(paths, refPath || null);
+      if (res && res.error) {
+        return { error: res.error_key ? t(res.error_key) : res.error, entries: [] };
+      }
+      const files = (res && res.files) || [];
+      return { error: null, entries: files.map((p) => ({ value: p, display: p })) };
+    },
+
+    async saveCandidate(candidate) {
+      if (!api || !candidate || !candidate.id || typeof api.save_candidate !== "function") {
+        return { saved: false, cancelled: false, error: t("errors.desktopApiNotReady") };
+      }
+      const outName = String(candidate.output_name || "").toLowerCase();
+      let fileTypes;
+      if (outName.endsWith(".ass")) {
+        fileTypes = [`ASS (*.ass)`, `${t("dialogs.subRip")} (*.srt)`, `${t("dialogs.allFiles")} (*.*)`];
+      } else if (outName.endsWith(".ssa")) {
+        fileTypes = [`SSA (*.ssa)`, `${t("dialogs.subRip")} (*.srt)`, `${t("dialogs.allFiles")} (*.*)`];
+      } else if (outName.endsWith(".vtt")) {
+        fileTypes = [`WebVTT (*.vtt)`, `${t("dialogs.subRip")} (*.srt)`, `${t("dialogs.allFiles")} (*.*)`];
+      } else {
+        fileTypes = [`${t("dialogs.subRip")} (*.srt)`, `${t("dialogs.allFiles")} (*.*)`];
+      }
+      return api.save_candidate(candidate.id, fileTypes);
     },
 
     async pickOutput(defaultPath) {
@@ -367,10 +440,14 @@ export function createAdapter({ i18n, callbacks }) {
           error_key: "errors.desktopApiNotReady",
         };
       }
+      const inputs = Array.isArray(request.inputs) && request.inputs.length
+        ? request.inputs.map((x) => String(x))
+        : (request.input ? [String(request.input)] : []);
       const res = await api.start_sync({
         ref_path: String(request.ref),
-        in_path: String(request.input),
-        out_path: String(request.outPath),
+        in_path: inputs[0] || "",
+        in_paths: inputs,
+        out_path: inputs.length > 1 ? "" : String(request.outPath || ""),
         vad: request.vad,
         frame_rate: Number(request.frameRate),
         ref_stream: request.refStream || null,

@@ -40,7 +40,12 @@ from ffsubsync.ffmpeg_downloader import (
     get_portable_dir,
 )
 from ffsubsync.ffmpeg_utils import subprocess_args
-from ffsubsync.ffsubsync import make_parser, run
+from ffsubsync.ffsubsync import (
+    _default_synced_output_path,
+    discover_subtitle_files,
+    make_parser,
+    run,
+)
 from ffsubsync.speech_transformers import ProgressInfo
 from ffsubsync.version import get_version
 
@@ -71,7 +76,7 @@ def _is_subtitle_ref(path: str) -> bool:
     return ext in SUBTITLE_EXTENSIONS or ext in ("npz", "npy")
 
 
-_DEFAULT_WIN_WIDTH = 760
+_DEFAULT_WIN_WIDTH = 860
 _DEFAULT_WIN_HEIGHT = 720
 _MIN_WIN_WIDTH = 620
 _MIN_WIN_HEIGHT = 580
@@ -303,6 +308,9 @@ class DesktopApi:
         self._dl_done_event.set()
         self._ffmpeg_dl: Dict[str, Any] = {"active": False, "done": False, "seq": 0}
         self._sync_state: Dict[str, Any] = {"active": False, "done": False, "seq": 0}
+        self._ref_cache_key: Optional[tuple] = None
+        self._ref_cache_pipe: Optional[Any] = None
+        self._multi_outputs: Dict[str, Dict[str, Any]] = {}
         self._config: Dict[str, Any] = _load_desktop_config()
         self._custom_ffmpeg_path: str = str(self._config.get("ffmpeg_path") or "").strip()
         self._language: str = str(self._config.get("language") or "system").strip() or "system"
@@ -540,7 +548,7 @@ class DesktopApi:
             "has_pgs_subs": has_pgs_subs,
         }
 
-    def pick_subtitle(self, file_types: Optional[List[str]] = None) -> Optional[str]:
+    def pick_subtitle(self, file_types: Optional[List[str]] = None) -> List[str]:
         assert self._window is not None
         default_types = (
             "Subtitles (*.srt;*.ass;*.ssa;*.sub;*.vtt)",
@@ -553,9 +561,98 @@ class DesktopApi:
         )
         res = self._window.create_file_dialog(
             webview.FileDialog.OPEN,
+            allow_multiple=True,
             file_types=filters,
         )
-        return res[0] if res else None
+        if not res:
+            return []
+        if isinstance(res, (list, tuple)):
+            return [str(p) for p in res if p]
+        return [str(res)]
+
+    def pick_subtitle_folder(self, ref_path: Optional[str] = None) -> Dict[str, Any]:
+        assert self._window is not None
+        res = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+        if not res:
+            return {"cancelled": True, "folder": None, "files": [], "error": None}
+        folder = res[0] if isinstance(res, (list, tuple)) else str(res)
+        return self.resolve_subtitle_inputs([folder], ref_path=ref_path)
+
+    def resolve_subtitle_inputs(
+        self, paths: List[str], ref_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        cleaned = [str(p).strip() for p in (paths or []) if p and str(p).strip()]
+        if not cleaned:
+            return {"cancelled": False, "files": [], "error": None}
+        try:
+            discovered, had_dir = discover_subtitle_files(
+                cleaned, recursive=False, exclude_path=ref_path or None
+            )
+            files = [p for p in discovered if p is not None]
+            return {
+                "cancelled": False,
+                "files": files,
+                "had_dir": had_dir,
+                "error": None,
+            }
+        except ValueError as exc:
+            return {
+                "cancelled": False,
+                "files": [],
+                "had_dir": True,
+                "error": str(exc),
+                "error_key": "errors.noSubsInFolder",
+            }
+
+    def save_candidate(
+        self, candidate_id: str, file_types: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        assert self._window is not None
+        with self._lock:
+            entry = self._multi_outputs.get(str(candidate_id))
+        if not entry or entry.get("subs") is None:
+            return {
+                "saved": False,
+                "cancelled": False,
+                "error": "Candidate output is no longer available.",
+            }
+        default_path = entry.get("default_path") or "synced.srt"
+        chosen = self.pick_output(default_path=default_path, file_types=file_types)
+        if not chosen:
+            return {"saved": False, "cancelled": True, "path": None, "error": None}
+        try:
+            entry["subs"].write_file(chosen)
+            return {"saved": True, "cancelled": False, "path": chosen, "error": None}
+        except Exception as exc:
+            logger.exception("Failed to save candidate %s to %s", candidate_id, chosen)
+            return {
+                "saved": False,
+                "cancelled": False,
+                "path": None,
+                "error": str(exc),
+            }
+
+    def _build_ref_cache_key(
+        self,
+        ref_path: str,
+        vad: str,
+        frame_rate: int,
+        ref_stream: Optional[str],
+        ref_stream_kind: Optional[str],
+    ) -> Optional[tuple]:
+        try:
+            st = os.stat(ref_path)
+        except OSError:
+            return None
+        return (
+            os.path.normcase(os.path.abspath(ref_path)),
+            int(st.st_mtime_ns),
+            int(st.st_size),
+            str(vad),
+            int(frame_rate),
+            str(ref_stream or ""),
+            str(ref_stream_kind or ""),
+        )
 
     def pick_output(
         self, default_path: str = "", file_types: Optional[List[str]] = None
@@ -654,8 +751,14 @@ class DesktopApi:
             ff_logger = logging.getLogger("ffsubsync")
             try:
                 ref_path = str(params["ref_path"])
-                in_path = str(params["in_path"])
-                out_path = str(params["out_path"])
+                raw_inputs = params.get("in_paths")
+                if isinstance(raw_inputs, list) and raw_inputs:
+                    in_paths_raw = [str(p).strip() for p in raw_inputs if p and str(p).strip()]
+                else:
+                    single_in = str(params.get("in_path") or "").strip()
+                    in_paths_raw = [single_in] if single_in else []
+                out_path = str(params.get("out_path") or "").strip()
+
                 if not os.path.isfile(ref_path):
                     with self._lock:
                         self._sync_state = {
@@ -669,19 +772,53 @@ class DesktopApi:
                             "elapsed_seconds": time.perf_counter() - t0,
                         }
                     return
-                if not os.path.isfile(in_path):
+                try:
+                    discovered, _had_dir = discover_subtitle_files(
+                        in_paths_raw, recursive=False, exclude_path=ref_path
+                    )
+                    in_paths = [p for p in discovered if p is not None]
+                except ValueError as exc:
                     with self._lock:
                         self._sync_state = {
                             "active": False,
                             "done": True,
                             "seq": sync_seq,
                             "ok": False,
-                            "error": "Subtitle file not found: %s" % in_path,
-                            "error_key": "errors.subNotFound",
-                            "error_params": {"path": in_path},
+                            "error": str(exc),
+                            "error_key": "errors.noSubsInFolder",
                             "elapsed_seconds": time.perf_counter() - t0,
                         }
                     return
+                if not in_paths:
+                    with self._lock:
+                        self._sync_state = {
+                            "active": False,
+                            "done": True,
+                            "seq": sync_seq,
+                            "ok": False,
+                            "error": "No subtitle files selected.",
+                            "error_key": "errors.noSubsInFolder",
+                            "elapsed_seconds": time.perf_counter() - t0,
+                        }
+                    return
+                for p in in_paths:
+                    if not os.path.isfile(p):
+                        with self._lock:
+                            self._sync_state = {
+                                "active": False,
+                                "done": True,
+                                "seq": sync_seq,
+                                "ok": False,
+                                "error": "Subtitle file not found: %s" % p,
+                                "error_key": "errors.subNotFound",
+                                "error_params": {"path": p},
+                                "elapsed_seconds": time.perf_counter() - t0,
+                            }
+                        return
+
+                multi_mode = len(in_paths) > 1
+                if not multi_mode and not out_path:
+                    out_path = _default_synced_output_path(in_paths[0])
 
                 ff_info = self._find_ffmpeg()
                 if not _is_subtitle_ref(ref_path) and not ff_info["available"]:
@@ -765,14 +902,6 @@ class DesktopApi:
                         finally:
                             self._dl_done_event.set()
 
-                with self._lock:
-                    self._sync_state.update(
-                        message="Analyzing reference…",
-                        message_key="progress.analyzingRef",
-                        message_params=None,
-                        fraction=None,
-                    )
-
                 ref_stream = params.get("ref_stream")
                 ref_stream_kind = params.get("ref_stream_kind")
                 vad = str(params.get("vad") or "subs_then_webrtc")
@@ -787,16 +916,41 @@ class DesktopApi:
                 ):
                     vad = "subs_then_webrtc"
 
-                argv = [
-                    ref_path,
-                    "-i",
-                    in_path,
-                    "-o",
-                    out_path,
+                frame_rate = int(params.get("frame_rate") or 48000)
+                cache_key = self._build_ref_cache_key(
+                    ref_path, vad, frame_rate, ref_stream, ref_stream_kind
+                )
+                with self._lock:
+                    cached_pipe = (
+                        self._ref_cache_pipe
+                        if (cache_key is not None and self._ref_cache_key == cache_key)
+                        else None
+                    )
+
+                with self._lock:
+                    if cached_pipe is not None:
+                        self._sync_state.update(
+                            message="Reusing analyzed video audio…",
+                            message_key="progress.reusingCachedRef",
+                            message_params=None,
+                            fraction=0.05 if multi_mode else None,
+                        )
+                    else:
+                        self._sync_state.update(
+                            message="Analyzing reference…",
+                            message_key="progress.analyzingRef",
+                            message_params=None,
+                            fraction=None,
+                        )
+
+                argv = [ref_path, "-i"] + in_paths
+                if not multi_mode:
+                    argv += ["-o", out_path]
+                argv += [
                     "--output-encoding",
                     "utf-8",
                     "--frame-rate",
-                    str(int(params.get("frame_rate") or 48000)),
+                    str(frame_rate),
                 ]
                 if ff_info.get("resource_dir"):
                     argv += ["--ffmpeg-path", str(ff_info["resource_dir"])]
@@ -828,8 +982,12 @@ class DesktopApi:
                 args = make_parser().parse_args(argv)
                 args.gui_mode = True
 
+                ref_weight = 0.55 if (multi_mode and cached_pipe is None) else (0.0 if cached_pipe is not None else 1.0)
+                cand_state = {"idx": 0, "total": len(in_paths), "name": ""}
+
                 def _on_progress(info: ProgressInfo) -> None:
                     frac = info.fraction
+                    scaled_frac = (frac * ref_weight) if frac is not None else None
                     with self._lock:
                         if frac is not None:
                             pct = int(round(frac * 100))
@@ -837,7 +995,7 @@ class DesktopApi:
                                 message="Decoding audio + VAD (%d%%)…" % pct,
                                 message_key="progress.decodingAudioVadPct",
                                 message_params={"pct": pct},
-                                fraction=frac,
+                                fraction=scaled_frac,
                             )
                         else:
                             sec = "%.0f" % info.processed_seconds
@@ -848,66 +1006,185 @@ class DesktopApi:
                                 fraction=None,
                             )
 
+                def _on_candidate(idx: int, total: int, srtin: Optional[str]) -> None:
+                    name = os.path.basename(srtin) if srtin else ""
+                    cand_state["idx"] = idx
+                    cand_state["total"] = max(1, total)
+                    cand_state["name"] = name
+                    if not multi_mode:
+                        return
+                    base = ref_weight
+                    span = 1.0 - base
+                    frac = base + span * (idx / float(max(1, total)))
+                    with self._lock:
+                        self._sync_state.update(
+                            message="Analyzing subtitle %d/%d (%s)…" % (idx + 1, total, name),
+                            message_key="progress.analyzingSubtitle",
+                            message_params={"cur": idx + 1, "tot": total, "name": name},
+                            fraction=frac,
+                        )
+
                 def _on_log(
                     msg: str,
                     frac: Optional[float] = None,
                     msg_key: Optional[str] = None,
                     msg_params: Optional[Dict[str, Any]] = None,
                 ) -> None:
+                    if multi_mode and msg_key in (
+                        "progress.computingAlignmentStep",
+                        "progress.checkingBreaks",
+                        "progress.extractingSubTimings",
+                        "progress.computingAlignments",
+                    ):
+                        # Keep the crisp per-subtitle progress message in multi mode,
+                        # advancing the progress bar smoothly inside the candidate's slice.
+                        tot = max(1, cand_state["total"])
+                        idx = cand_state["idx"]
+                        base = ref_weight
+                        span = (1.0 - base) / float(tot)
+                        local_f = frac if frac is not None else 0.1
+                        with self._lock:
+                            self._sync_state["fraction"] = min(0.99, base + (idx + local_f) * span)
+                        return
                     with self._lock:
                         self._sync_state["message"] = msg
                         self._sync_state["message_key"] = msg_key
                         self._sync_state["message_params"] = msg_params
                         if frac is not None:
-                            self._sync_state["fraction"] = frac
+                            self._sync_state["fraction"] = (
+                                frac * ref_weight if multi_mode else frac
+                            )
 
                 phase_handler = _PhaseLogHandler(_on_log)
                 ff_logger.addHandler(phase_handler)
 
-                result = run(args, progress_handler=_on_progress)
-                elapsed = time.perf_counter() - t0
-                ok = bool(result.get("sync_was_successful")) and os.path.isfile(out_path)
-                last_err = (
-                    phase_handler.error_lines[-1]
-                    if phase_handler.error_lines
-                    else None
+                if cached_pipe is not None:
+                    ref_step = (
+                        cached_pipe[-1]
+                        if hasattr(cached_pipe, "__getitem__")
+                        else cached_pipe
+                    )
+                    if hasattr(ref_step, "progress_handler"):
+                        ref_step.progress_handler = _on_progress
+
+                result = run(
+                    args,
+                    progress_handler=_on_progress,
+                    reference_pipe=cached_pipe,
+                    candidate_progress_cb=_on_candidate,
+                    return_reference_pipe=True,
+                    in_memory_only=multi_mode,
                 )
-                err_msg = None
-                err_key = None
-                err_params = None
-                if not ok:
-                    if last_err:
-                        err_msg = "Sync failed: %s" % last_err
-                        err_key = "errors.syncFailedWithReason"
-                        err_params = {"reason": last_err}
-                    else:
-                        err_msg = "Sync failed (check input tracks/format)."
-                        err_key = "errors.syncFailedCheckTracks"
-                with self._lock:
-                    self._sync_state = {
-                        "active": False,
-                        "done": True,
-                        "seq": sync_seq,
-                        "ok": ok,
-                        "offset_seconds": result.get("offset_seconds"),
-                        "framerate_scale_factor": result.get("framerate_scale_factor"),
-                        "split_segments": result.get("split_segments"),
-                        "dropped_cues": result.get("dropped_cues", 0),
-                        "clipped_cues": result.get("clipped_cues", 0),
-                        "alignment_profile": result.get(
-                            "alignment_profile", alignment_profile
-                        ),
-                        "profile_offset_seconds": result.get(
-                            "profile_offset_seconds", 0.0
-                        ),
-                        "quality": result.get("quality"),
-                        "output_path": out_path,
-                        "elapsed_seconds": elapsed,
-                        "ffmpeg_info": ff_info,
-                        "error": err_msg,
-                        "error_key": err_key,
-                        "error_params": err_params,
-                    }
+                elapsed = time.perf_counter() - t0
+
+                fitted_pipe = result.get("reference_pipe")
+                if fitted_pipe is not None and cache_key is not None:
+                    with self._lock:
+                        self._ref_cache_key = cache_key
+                        self._ref_cache_pipe = fitted_pipe
+
+                if multi_mode:
+                    raw_cands = result.get("candidates") or []
+                    stored_outputs: Dict[str, Dict[str, Any]] = {}
+                    serialized_cands: List[Dict[str, Any]] = []
+                    any_ok = False
+                    for i, cand in enumerate(raw_cands):
+                        cid = "cand-%d-%d" % (sync_seq, i)
+                        in_p = cand.get("input_path") or ""
+                        default_out = _default_synced_output_path(in_p) if in_p else "synced.srt"
+                        out_subs = cand.get("output_subs")
+                        has_output = out_subs is not None and not cand.get("error")
+                        if has_output:
+                            stored_outputs[cid] = {
+                                "subs": out_subs,
+                                "default_path": default_out,
+                                "input_path": in_p,
+                            }
+                        cand_ok = bool(cand.get("sync_was_successful")) and has_output
+                        if has_output:
+                            any_ok = True
+                        serialized_cands.append(
+                            {
+                                "id": cid,
+                                "rank": cand.get("rank", i + 1),
+                                "input_path": in_p,
+                                "input_name": cand.get("input_name") or os.path.basename(in_p),
+                                "output_name": os.path.basename(default_out),
+                                "ok": cand_ok,
+                                "can_save": has_output,
+                                "sync_was_successful": bool(cand.get("sync_was_successful")),
+                                "overall_score": int(cand.get("overall_score") or 0),
+                                "offset_seconds": cand.get("offset_seconds"),
+                                "framerate_scale_factor": cand.get("framerate_scale_factor"),
+                                "split_segments": cand.get("split_segments"),
+                                "dropped_cues": cand.get("dropped_cues", 0),
+                                "clipped_cues": cand.get("clipped_cues", 0),
+                                "alignment_profile": cand.get("alignment_profile", alignment_profile),
+                                "profile_offset_seconds": cand.get("profile_offset_seconds", 0.0),
+                                "quality": cand.get("quality"),
+                                "error": cand.get("error"),
+                            }
+                        )
+                    with self._lock:
+                        self._multi_outputs = stored_outputs
+                        self._sync_state = {
+                            "active": False,
+                            "done": True,
+                            "seq": sync_seq,
+                            "ok": any_ok,
+                            "multi_mode": True,
+                            "candidates": serialized_cands,
+                            "ref_cached": cached_pipe is not None,
+                            "elapsed_seconds": elapsed,
+                            "ffmpeg_info": ff_info,
+                            "error": None if any_ok else "All subtitle candidates failed to analyze.",
+                            "error_key": None if any_ok else "errors.allCandidatesFailed",
+                        }
+                else:
+                    ok = bool(result.get("sync_was_successful")) and os.path.isfile(out_path)
+                    last_err = (
+                        phase_handler.error_lines[-1]
+                        if phase_handler.error_lines
+                        else None
+                    )
+                    err_msg = None
+                    err_key = None
+                    err_params = None
+                    if not ok:
+                        if last_err:
+                            err_msg = "Sync failed: %s" % last_err
+                            err_key = "errors.syncFailedWithReason"
+                            err_params = {"reason": last_err}
+                        else:
+                            err_msg = "Sync failed (check input tracks/format)."
+                            err_key = "errors.syncFailedCheckTracks"
+                    with self._lock:
+                        self._sync_state = {
+                            "active": False,
+                            "done": True,
+                            "seq": sync_seq,
+                            "ok": ok,
+                            "multi_mode": False,
+                            "ref_cached": cached_pipe is not None,
+                            "offset_seconds": result.get("offset_seconds"),
+                            "framerate_scale_factor": result.get("framerate_scale_factor"),
+                            "split_segments": result.get("split_segments"),
+                            "dropped_cues": result.get("dropped_cues", 0),
+                            "clipped_cues": result.get("clipped_cues", 0),
+                            "alignment_profile": result.get(
+                                "alignment_profile", alignment_profile
+                            ),
+                            "profile_offset_seconds": result.get(
+                                "profile_offset_seconds", 0.0
+                            ),
+                            "quality": result.get("quality"),
+                            "output_path": out_path,
+                            "elapsed_seconds": elapsed,
+                            "ffmpeg_info": ff_info,
+                            "error": err_msg,
+                            "error_key": err_key,
+                            "error_params": err_params,
+                        }
             except Exception as exc:
                 logger.exception("Desktop sync failed")
                 with self._lock:
@@ -1181,12 +1458,20 @@ def _wire_drop_zones(window: webview.Window) -> None:
             files = (e.get("dataTransfer") or {}).get("files") or []
             if not files:
                 return
-            full_path = files[0].get("pywebviewFullPath") or ""
-            if full_path:
-                window.evaluate_js(
-                    "window.setDroppedPath(%s, %s)"
-                    % (json.dumps(target), json.dumps(full_path))
-                )
+            if target == "in":
+                paths = [f.get("pywebviewFullPath") for f in files if f.get("pywebviewFullPath")]
+                if paths:
+                    window.evaluate_js(
+                        "window.setDroppedPaths && window.setDroppedPaths(%s, %s)"
+                        % (json.dumps(target), json.dumps(paths))
+                    )
+            else:
+                full_path = files[0].get("pywebviewFullPath") or ""
+                if full_path:
+                    window.evaluate_js(
+                        "window.setDroppedPath(%s, %s)"
+                        % (json.dumps(target), json.dumps(full_path))
+                    )
 
         return _on_drop
 

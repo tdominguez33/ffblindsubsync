@@ -988,3 +988,109 @@ def compute_quality_metrics(
             },
         },
     }
+
+
+def compute_overall_score(
+    quality: Optional[Dict[str, Any]],
+    *,
+    sync_was_successful: bool = True,
+) -> int:
+    """Compute a single 0-100 ranking score combining sync confidence and subtitle quality.
+
+    Weights sync confidence heavily (70% sync / 30% subtitle) and applies safety caps
+    whenever sync failed, sync confidence is below 50, or timeline coverage is very low
+    (e.g. forced/signs tracks), so a clean subtitle from the wrong episode can never
+    outrank a genuinely synchronized candidate.
+    """
+    if not isinstance(quality, dict):
+        return 0
+    sync_group = quality.get("sync")
+    sub_group = quality.get("subtitle")
+    if not isinstance(sync_group, dict) or not isinstance(sub_group, dict):
+        return 0
+    try:
+        sync_score = float(sync_group.get("score", 0.0))
+        sub_score = float(sub_group.get("score", 0.0))
+    except (TypeError, ValueError):
+        return 0
+
+    overall = 0.70 * sync_score + 0.30 * sub_score
+
+    if not sync_was_successful:
+        overall = min(overall, min(35.0, sync_score))
+    if sync_score < 50.0:
+        overall = min(overall, min(54.0, sync_score + 8.0))
+
+    sub_metrics = sub_group.get("metrics")
+    if isinstance(sub_metrics, dict) and sub_metrics.get("timeline_coverage") is not None:
+        try:
+            cov_score = float(sub_metrics["timeline_coverage"])
+            if cov_score < 35.0:
+                overall = min(overall, max(0.0, cov_score + 20.0))
+        except (TypeError, ValueError):
+            pass
+
+    return _round_score(overall)
+
+
+def rank_sync_candidates(
+    candidates: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return candidates sorted best-first with 1-based ``rank`` and ``overall_score``.
+
+    Successful candidates always sort ahead of failed/corrupted ones. Within each
+    tier, candidates sort by ``overall_score``, then ``sync.score``, then
+    ``subtitle.score``, then ``best_peak_snr``, keeping original order on exact ties.
+    """
+    enriched: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = []
+    for idx, raw in enumerate(candidates):
+        item = dict(raw)
+        has_error = bool(item.get("error"))
+        sync_ok = bool(item.get("sync_was_successful", item.get("ok", False))) and not has_error
+        quality = item.get("quality") if not has_error else None
+        overall = (
+            compute_overall_score(quality, sync_was_successful=sync_ok)
+            if quality is not None
+            else 0
+        )
+        item["overall_score"] = overall
+
+        sync_score = -1.0
+        sub_score = -1.0
+        if isinstance(quality, dict):
+            s_grp = quality.get("sync")
+            q_grp = quality.get("subtitle")
+            if isinstance(s_grp, dict) and s_grp.get("score") is not None:
+                try:
+                    sync_score = float(s_grp["score"])
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(q_grp, dict) and q_grp.get("score") is not None:
+                try:
+                    sub_score = float(q_grp["score"])
+                except (TypeError, ValueError):
+                    pass
+
+        raw_snr = item.get("best_peak_snr")
+        try:
+            peak_snr = float(raw_snr) if raw_snr is not None else -1e9
+        except (TypeError, ValueError):
+            peak_snr = -1e9
+
+        sort_key = (
+            1 if not has_error else 0,
+            1 if sync_ok else 0,
+            overall,
+            sync_score,
+            sub_score,
+            peak_snr,
+            -idx,
+        )
+        enriched.append((sort_key, item))
+
+    enriched.sort(key=lambda pair: pair[0], reverse=True)
+    ranked: List[Dict[str, Any]] = []
+    for rank_idx, (_, item) in enumerate(enriched, start=1):
+        item["rank"] = rank_idx
+        ranked.append(item)
+    return ranked

@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import cast, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import cast, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import ffmpeg
 import numpy as np
@@ -47,7 +47,11 @@ from ffsubsync.constants import (
 )
 from ffsubsync.ffmpeg_utils import ffmpeg_bin_path, subprocess_args
 from ffsubsync.generic_subtitles import SUPPORTED_OUTPUT_FORMATS
-from ffsubsync.quality import compute_quality_metrics
+from ffsubsync.quality import (
+    compute_overall_score,
+    compute_quality_metrics,
+    rank_sync_candidates,
+)
 from ffsubsync.sklearn_shim import Pipeline, TransformerMixin
 from ffsubsync.speech_transformers import (
     VideoSpeechTransformer,
@@ -136,6 +140,152 @@ def make_test_case(
     finally:
         shutil.rmtree(tar_dir)
     return 0
+
+
+_PRESERVED_SYNCED_EXTS = frozenset({".srt", ".ass", ".ssa", ".vtt"})
+
+
+def is_synced_output_filename(name: str) -> bool:
+    """Return True if ``name`` looks like a prior ``*.synced.<ext>`` output."""
+    stem, _ext = os.path.splitext(os.path.basename(name))
+    return stem.lower().endswith(".synced")
+
+
+def _default_synced_output_path(
+    srtin: str, out_dir: Optional[str] = None
+) -> str:
+    """Derive ``<stem>.synced.<ext>`` next to ``srtin`` (or inside ``out_dir``)."""
+    base = os.path.basename(srtin)
+    stem, ext = os.path.splitext(base)
+    low = ext.lower()
+    out_ext = low if low in _PRESERVED_SYNCED_EXTS else ".srt"
+    filename = "{}.synced{}".format(stem, out_ext)
+    if out_dir:
+        return os.path.join(out_dir, filename)
+    return os.path.join(os.path.dirname(srtin), filename)
+
+
+def discover_subtitle_files(
+    inputs: Sequence[Optional[str]],
+    *,
+    recursive: bool = False,
+    exclude_path: Optional[str] = None,
+) -> Tuple[List[Optional[str]], bool]:
+    """Expand files and directories in ``inputs`` into a deduplicated subtitle list.
+
+    Directories are scanned top-level only by default (or recursively when
+    ``recursive=True``), keeping files with extensions in ``SUBTITLE_EXTENSIONS``
+    and skipping prior ``*.synced.*`` outputs as well as ``exclude_path``.
+    """
+    exclude_norm: Optional[str] = None
+    if exclude_path and not is_remote_url(exclude_path):
+        exclude_norm = os.path.normcase(os.path.abspath(exclude_path))
+
+    seen: set = set()
+    discovered: List[Optional[str]] = []
+    had_dir = False
+    empty_dirs: List[str] = []
+
+    def _add_path(p: str) -> None:
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            discovered.append(p)
+
+    def _is_dir_candidate(path: str, name: str) -> bool:
+        ext = os.path.splitext(name)[1].lstrip(".").lower()
+        if ext not in SUBTITLE_EXTENSIONS:
+            return False
+        if is_synced_output_filename(name):
+            return False
+        if exclude_norm is not None:
+            if os.path.normcase(os.path.abspath(path)) == exclude_norm:
+                return False
+        return os.path.isfile(path)
+
+    for raw in inputs:
+        if raw is None:
+            discovered.append(None)
+            continue
+        if os.path.isdir(raw):
+            had_dir = True
+            found_here = 0
+            if recursive:
+                for root, dirnames, filenames in os.walk(raw):
+                    dirnames.sort()
+                    for name in sorted(filenames):
+                        path = os.path.join(root, name)
+                        if _is_dir_candidate(path, name):
+                            _add_path(path)
+                            found_here += 1
+            else:
+                for name in sorted(os.listdir(raw)):
+                    path = os.path.join(raw, name)
+                    if _is_dir_candidate(path, name):
+                        _add_path(path)
+                        found_here += 1
+            if found_here == 0:
+                empty_dirs.append(raw)
+        else:
+            _add_path(raw)
+
+    if had_dir and not discovered:
+        raise ValueError(
+            "no subtitle files found in directory: {}".format(", ".join(empty_dirs))
+        )
+    return discovered, had_dir
+
+
+def format_ranking_table(ranked: Sequence[Dict[str, Any]]) -> str:
+    """Format ranked multi-subtitle results into a human-readable CLI table."""
+    lines = [
+        "Subtitle ranking ({} candidate{}):".format(
+            len(ranked), "" if len(ranked) == 1 else "s"
+        ),
+        "  {:>2}  {:>5}  {:>4}  {:>4}  {:>9}  {:>7}  {}".format(
+            "#", "Score", "Sync", "Qual", "Offset", "FPS", "File"
+        ),
+    ]
+    for item in ranked:
+        rank = item.get("rank", "-")
+        name = os.path.basename(item.get("input_path") or "") or (
+            item.get("input_name") or "stdin"
+        )
+        err = item.get("error")
+        if err:
+            lines.append(
+                "  {:>2}  {:>5}  {:>4}  {:>4}  {:>9}  {:>7}  {} [error: {}]".format(
+                    rank, 0, "-", "-", "-", "-", name, err
+                )
+            )
+            continue
+        quality = item.get("quality") or {}
+        sync_s = (quality.get("sync") or {}).get("score")
+        sub_s = (quality.get("subtitle") or {}).get("score")
+        overall = item.get("overall_score", 0)
+        off = item.get("offset_seconds")
+        scale = item.get("framerate_scale_factor")
+        off_str = "{:+.3f}s".format(off) if off is not None else "-"
+        fps_str = "{:.3f}x".format(scale) if scale is not None else "-"
+        notes: List[str] = []
+        if item.get("output_path"):
+            notes.append("saved -> {}".format(item["output_path"]))
+        if not item.get("sync_was_successful", False):
+            notes.append("low confidence")
+        note_str = " [{}]".format("; ".join(notes)) if notes else ""
+        lines.append(
+            "  {:>2}  {:>5}  {:>4}  {:>4}  {:>9}  {:>7}  {}{}".format(
+                rank,
+                overall,
+                sync_s if sync_s is not None else "-",
+                sub_s if sub_s is not None else "-",
+                off_str,
+                fps_str,
+                name,
+                note_str,
+            )
+        )
+    return "\n".join(lines)
 
 
 def _resolve_srtout(args: argparse.Namespace, srtin: Optional[str]) -> Optional[str]:
@@ -280,518 +430,780 @@ def assess_alignment_quality(
     return reasons
 
 
+def _write_candidate_output(
+    args: argparse.Namespace,
+    out_subs: Any,
+    srtout: Optional[str],
+    offset_seconds: float,
+    *,
+    is_unmodified: bool = False,
+) -> Optional[str]:
+    if is_unmodified:
+        logger.info(
+            "writing original (unsynced) output to {}".format(srtout or "stdout")
+        )
+        out_subs.write_file(srtout)
+        return srtout
+    suppress_output_thresh = args.suppress_output_if_offset_less_than
+    if offset_seconds >= (suppress_output_thresh or float("-inf")):
+        logger.info("writing output to {}".format(srtout or "stdout"))
+        out_subs.write_file(srtout)
+        return srtout
+    logger.warning(
+        "suppressing output because offset %s was less than suppression threshold %s",
+        offset_seconds,
+        args.suppress_output_if_offset_less_than,
+    )
+    return None
+
+
+def _sync_single_subtitle(
+    args: argparse.Namespace,
+    srtin: Optional[str],
+    reference_pipe: Optional[Pipeline],
+    *,
+    write_output: bool = True,
+    srtout: Optional[str] = None,
+    keep_in_memory: bool = False,
+) -> Dict[str, Any]:
+    candidate: Dict[str, Any] = {
+        "input_path": srtin,
+        "input_name": os.path.basename(srtin) if srtin else "stdin",
+        "output_path": None,
+        "sync_was_successful": False,
+        "offset_seconds": None,
+        "framerate_scale_factor": None,
+        "split_segments": None,
+        "dropped_cues": 0,
+        "clipped_cues": 0,
+        "alignment_profile": normalize_alignment_profile(
+            getattr(args, "alignment_profile", DEFAULT_ALIGNMENT_PROFILE)
+        ),
+        "profile_offset_seconds": 0.0,
+        "quality": None,
+        "overall_score": 0,
+        "best_score": None,
+        "best_peak_snr": None,
+        "best_peak_margin": None,
+        "low_quality_reasons": [],
+        "error": None,
+    }
+    sync_was_successful = True
+    try:
+        skip_sync = args.skip_sync or reference_pipe is None
+        skip_infer_framerate_ratio = (
+            args.skip_infer_framerate_ratio or reference_pipe is None
+        )
+        resolved_srtout = srtout if srtout is not None else _resolve_srtout(args, srtin)
+        srt_pipe_maker = get_srt_pipe_maker(args, srtin)
+        framerate_ratios = get_framerate_ratios_to_try(args)
+        srt_pipes = [srt_pipe_maker(1.0)] + [
+            srt_pipe_maker(rat) for rat in framerate_ratios
+        ]
+        for srt_pipe in srt_pipes:
+            if callable(srt_pipe):
+                continue
+            else:
+                srt_pipe.fit(srtin)
+        if (
+            not skip_infer_framerate_ratio
+            and hasattr(reference_pipe[-1], "num_frames")
+            and reference_pipe[-1].num_frames is not None
+        ):
+            inferred_framerate_ratio_from_length = (
+                float(reference_pipe[-1].num_frames)
+                / cast(Pipeline, srt_pipes[0])[-1].num_frames
+            )
+            logger.info(
+                "inferred frameratio ratio: %.3f"
+                % inferred_framerate_ratio_from_length
+            )
+            srt_pipes.append(
+                cast(
+                    Pipeline, srt_pipe_maker(inferred_framerate_ratio_from_length)
+                ).fit(srtin)
+            )
+            logger.info("...done")
+        logger.info("computing alignments...")
+        reference_speech = None
+        split_penalty = getattr(args, "split_penalty", None)
+        use_split_early = split_penalty is not None and not skip_sync
+        use_auto_split_early = (
+            bool(getattr(args, "auto_split", False))
+            and not use_split_early
+            and not skip_sync
+        )
+        align_max_offset_seconds = (
+            max(
+                float(args.max_offset_seconds),
+                DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
+            )
+            if use_auto_split_early
+            else args.max_offset_seconds
+        )
+        aligner: Optional[MaxScoreAligner] = None
+        best_peak_snr: Optional[float] = None
+        best_peak_margin: Optional[float] = None
+        reference_kind: str = "audio"
+        if skip_sync:
+            best_score = 0.0
+            best_srt_pipe = cast(Pipeline, srt_pipes[0])
+            offset_samples = 0
+        else:
+            reference_speech = reference_pipe.transform(args.reference)
+            aligner = MaxScoreAligner(
+                FFTAligner, srtin, SAMPLE_RATE, align_max_offset_seconds
+            )
+            (best_score, offset_samples), best_srt_pipe = aligner.fit_transform(
+                reference_speech,
+                srt_pipes,
+            )
+            best_peak_snr = getattr(aligner, "best_peak_snr_", None)
+            best_peak_margin = getattr(aligner, "best_peak_margin_", None)
+
+            ref_step = (
+                reference_pipe[-1]
+                if hasattr(reference_pipe, "__getitem__")
+                else reference_pipe
+            )
+            if isinstance(
+                ref_step, (SubtitleSpeechTransformer, PGSSpeechTransformer)
+            ) or bool(getattr(ref_step, "used_embedded_subs_", False)):
+                reference_kind = "subtitles"
+            else:
+                reference_kind = "audio"
+            alt_candidates = list(
+                getattr(ref_step, "alt_video_speech_results_", None) or []
+            )
+            embedded_peak_weak = (
+                best_peak_snr is not None
+                and best_peak_snr < DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+            )
+            poor_embedded_alignment = (
+                (
+                    (best_score < 0 and (best_peak_snr is None or embedded_peak_weak))
+                    or embedded_peak_weak
+                )
+                and bool(getattr(ref_step, "can_fallback_to_audio", False))
+            )
+            if poor_embedded_alignment:
+                logger.warning(
+                    "embedded subtitle alignment looked unreliable "
+                    "(score=%.1f, peak SNR=%s); falling back to audio VAD",
+                    best_score,
+                    "%.2f" % best_peak_snr if best_peak_snr is not None else "n/a",
+                )
+                try:
+                    audio_speech, audio_alts = ref_step.fallback_to_audio(
+                        args.reference
+                    )
+                    alt_candidates.append(("audio VAD fallback", audio_speech))
+                    alt_candidates.extend(audio_alts)
+                except Exception as e:
+                    logger.warning(
+                        "audio VAD fallback failed (%s); keeping embedded alignment",
+                        e,
+                    )
+            for cand_label, cand_speech in alt_candidates:
+                logger.info("comparing alignment with %s...", cand_label)
+                cand_aligner = MaxScoreAligner(
+                    FFTAligner, srtin, SAMPLE_RATE, align_max_offset_seconds
+                )
+                (cand_score, cand_offset), cand_pipe = cand_aligner.fit_transform(
+                    cand_speech,
+                    srt_pipes,
+                )
+                cand_snr = getattr(cand_aligner, "best_peak_snr_", None)
+                cand_is_valid = cand_score >= 0 or (
+                    cand_snr is not None
+                    and cand_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+                )
+                best_is_valid = best_score >= 0 or (
+                    best_peak_snr is not None
+                    and best_peak_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+                )
+                prefer_cand = (
+                    (cand_is_valid and not best_is_valid)
+                    or (
+                        cand_snr is not None
+                        and (best_peak_snr is None or cand_snr > best_peak_snr)
+                    )
+                    or (
+                        cand_snr is None
+                        and best_peak_snr is None
+                        and cand_score > best_score
+                    )
+                )
+                if prefer_cand:
+                    logger.info(
+                        "%s alignment scored higher peak SNR (%.2f vs %.2f; "
+                        "offset %.3fs vs %.3fs); using %s",
+                        cand_label,
+                        cand_snr or 0.0,
+                        best_peak_snr or 0.0,
+                        cand_offset / float(SAMPLE_RATE),
+                        offset_samples / float(SAMPLE_RATE),
+                        cand_label,
+                    )
+                    reference_speech = cand_speech
+                    aligner = cand_aligner
+                    best_score = cand_score
+                    offset_samples = cand_offset
+                    best_srt_pipe = cand_pipe
+                    best_peak_snr = cand_snr
+                    best_peak_margin = getattr(
+                        cand_aligner, "best_peak_margin_", None
+                    )
+                    if "audio" in cand_label.lower() or "center channel" in cand_label.lower():
+                        reference_kind = "audio"
+                else:
+                    logger.info(
+                        "keeping primary alignment over %s (peak SNR %.2f vs %.2f)",
+                        cand_label,
+                        best_peak_snr or 0.0,
+                        cand_snr or 0.0,
+                    )
+        if best_score < 0:
+            if (
+                best_peak_snr is not None
+                and best_peak_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
+            ):
+                logger.info(
+                    "raw score was negative (%.1f) due to speech-density mismatch, "
+                    "but peak SNR is strong (%.2f >= %.1f); accepting alignment",
+                    best_score,
+                    best_peak_snr,
+                    DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD,
+                )
+            else:
+                sync_was_successful = False
+        logger.info("...done")
+        offset_seconds = (
+            offset_samples / float(SAMPLE_RATE) + args.apply_offset_seconds
+        )
+        scale_step = best_srt_pipe.named_steps["scale"]
+        if best_peak_snr is not None:
+            logger.info("score: %.3f (peak SNR: %.2f)", best_score, best_peak_snr)
+        else:
+            logger.info("score: %.3f", best_score)
+        logger.info("offset seconds: %.3f", offset_seconds)
+        logger.info("framerate scale factor: %.3f", scale_step.scale_factor)
+        low_quality_reasons: List[str] = []
+        if getattr(args, "skip_sync_on_low_quality", False):
+            low_quality_reasons = assess_alignment_quality(
+                best_score,
+                offset_seconds,
+                scale_step.scale_factor,
+                min_score=args.min_score,
+                max_offset_seconds=args.quality_max_offset_seconds,
+                max_framerate_deviation=args.max_framerate_deviation,
+            )
+        if low_quality_reasons:
+            logger.warning(
+                "low-quality alignment (%s); leaving subtitles unmodified",
+                "; ".join(low_quality_reasons),
+            )
+            sync_was_successful = False
+            original_subs = best_srt_pipe.named_steps["parse"].subs_
+            out_subs = original_subs.clone_props_for_subs(list(original_subs))
+            if args.output_encoding != "same":
+                out_subs = out_subs.set_encoding(args.output_encoding)
+            written_path = None
+            if write_output:
+                written_path = _write_candidate_output(
+                    args, out_subs, resolved_srtout, offset_seconds, is_unmodified=True
+                )
+            candidate.update(
+                {
+                    "sync_was_successful": False,
+                    "offset_seconds": offset_seconds,
+                    "framerate_scale_factor": scale_step.scale_factor,
+                    "best_score": best_score,
+                    "best_peak_snr": best_peak_snr,
+                    "best_peak_margin": best_peak_margin,
+                    "low_quality_reasons": low_quality_reasons,
+                    "output_path": written_path,
+                }
+            )
+            if keep_in_memory:
+                candidate["output_subs"] = out_subs
+                candidate["_is_unmodified"] = True
+            return candidate
+        use_split = use_split_early and reference_speech is not None
+        use_auto_split = use_auto_split_early and reference_speech is not None
+        split_segments: Optional[List[Dict[str, Any]]] = None
+        dropped_cues = 0
+        alignment_profile = normalize_alignment_profile(
+            getattr(args, "alignment_profile", DEFAULT_ALIGNMENT_PROFILE)
+        )
+        profile_offset_seconds: float = 0.0
+        if use_split or use_auto_split:
+            length_penalty = getattr(
+                args, "split_length_penalty", DEFAULT_SPLIT_LENGTH_PENALTY
+            )
+            subsample = max(1, int(getattr(args, "split_subsample", 1) or 1))
+            max_off = abs(int(args.max_offset_seconds * SAMPLE_RATE))
+            offsets_samples: List[Optional[float]]
+            if use_split:
+                candidate_pipes = [p for p in srt_pipes if not callable(p)]
+                if best_srt_pipe not in candidate_pipes:
+                    candidate_pipes.append(cast(Pipeline, best_srt_pipe))
+                best_split: Optional[Tuple[float, List[float], Pipeline]] = None
+                for cand_pipe in candidate_pipes:
+                    cand_offsets, cand_score = compute_split_offsets(
+                        reference_speech,
+                        list(cand_pipe.named_steps["scale"].subs_),
+                        sample_rate=SAMPLE_RATE,
+                        start_seconds=args.start_seconds,
+                        split_penalty=split_penalty * SAMPLE_RATE,
+                        length_penalty=length_penalty,
+                        offset_step_samples=1.0 / subsample,
+                        max_offset_samples=max_off,
+                        return_score=True,
+                        log_segments=False,
+                    )
+                    if best_split is None or cand_score > best_split[0]:
+                        best_split = (cand_score, cand_offsets, cand_pipe)
+                assert best_split is not None
+                _, split_offs, best_split_pipe = best_split
+                offsets_samples = list(split_offs)
+                if best_split_pipe is not best_srt_pipe:
+                    logger.info(
+                        "split search preferred framerate scale %.3f (single-offset "
+                        "search had chosen %.3f)",
+                        best_split_pipe.named_steps["scale"].scale_factor,
+                        scale_step.scale_factor,
+                    )
+                scale_step = best_split_pipe.named_steps["scale"]
+            else:
+                auto_max_search = max(
+                    float(args.max_offset_seconds),
+                    DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
+                )
+                auto_search_samples = int(round(auto_max_search * SAMPLE_RATE))
+                precomputed_offsets: Dict[int, float] = {}
+                if aligner is not None:
+                    for cand_score_tuple, cand_pipe in getattr(
+                        aligner, "_scores", []
+                    ):
+                        precomputed_offsets[id(cand_pipe)] = float(
+                            cand_score_tuple[1]
+                        )
+
+                def _run_auto_for_pipe(
+                    cand_pipe: Pipeline, cand_global: float
+                ) -> Tuple[float, List[Optional[float]], Pipeline]:
+                    cand_offsets, cand_score = compute_auto_split_offsets(
+                        reference_speech,
+                        list(cand_pipe.named_steps["scale"].subs_),
+                        global_offset_samples=cand_global,
+                        sample_rate=SAMPLE_RATE,
+                        start_seconds=args.start_seconds,
+                        split_penalty=DEFAULT_AUTO_SPLIT_PENALTY * SAMPLE_RATE,
+                        length_penalty=length_penalty,
+                        offset_step_samples=1.0 / subsample,
+                        max_search_samples=auto_search_samples,
+                        log_segments=False,
+                    )
+                    cand_scale = float(cand_pipe.named_steps["scale"].scale_factor)
+                    norm_score = cand_score * min(1.0 / cand_scale, 1.0)
+                    return norm_score, cand_offsets, cand_pipe
+
+                best_auto = _run_auto_for_pipe(
+                    cast(Pipeline, best_srt_pipe), float(offset_samples)
+                )
+                first_segs = summarize_split_segments(best_auto[1], SAMPLE_RATE)
+                first_dropped = count_dropped_cues(best_auto[1])
+                needs_alt_scale_check = (
+                    len(first_segs) > 1
+                    or first_dropped > 0
+                    or best_score < 0
+                    or abs(scale_step.scale_factor - 1.0) > 1e-6
+                )
+                if needs_alt_scale_check:
+                    for cand_pipe in srt_pipes:
+                        if callable(cand_pipe) or cand_pipe is best_srt_pipe:
+                            continue
+                        cand_global = precomputed_offsets.get(id(cand_pipe))
+                        if cand_global is None:
+                            cand_global = float(
+                                FFTAligner(
+                                    max_offset_samples=auto_search_samples
+                                ).fit_transform(
+                                    reference_speech, cand_pipe.transform(None)
+                                )
+                            )
+                        cand_res = _run_auto_for_pipe(cand_pipe, cand_global)
+                        if cand_res[0] > best_auto[0]:
+                            best_auto = cand_res
+                _, offsets_samples, best_auto_pipe = best_auto
+                if best_auto_pipe is not best_srt_pipe:
+                    logger.info(
+                        "auto-split preferred framerate scale %.3f (single-offset "
+                        "search had chosen %.3f)",
+                        best_auto_pipe.named_steps["scale"].scale_factor,
+                        scale_step.scale_factor,
+                    )
+                scale_step = best_auto_pipe.named_steps["scale"]
+            log_split_segments(offsets_samples, SAMPLE_RATE)
+            dropped_cues = count_dropped_cues(offsets_samples)
+            if not sync_was_successful and alignment_has_positive_signal(
+                reference_speech,
+                list(scale_step.subs_),
+                offsets_samples,
+                sample_rate=SAMPLE_RATE,
+                start_seconds=args.start_seconds,
+                length_penalty=length_penalty,
+            ):
+                sync_was_successful = True
+            if alignment_profile != DEFAULT_ALIGNMENT_PROFILE:
+                profile_delta_samples = compute_profile_offset_adjustment(
+                    reference_speech,
+                    list(scale_step.subs_),
+                    offsets_samples,
+                    profile=alignment_profile,
+                    sample_rate=SAMPLE_RATE,
+                    start_seconds=args.start_seconds,
+                )
+                profile_offset_seconds = profile_delta_samples / float(SAMPLE_RATE)
+                if abs(profile_delta_samples) > 1e-6:
+                    offsets_samples = [
+                        None if off is None else off + profile_delta_samples
+                        for off in offsets_samples
+                    ]
+                    logger.info(
+                        "alignment profile '%s': adjusted block offset by %+.3fs",
+                        alignment_profile,
+                        profile_offset_seconds,
+                    )
+            offsets_seconds: List[Optional[float]] = [
+                None
+                if off is None
+                else off / float(SAMPLE_RATE) + args.apply_offset_seconds
+                for off in offsets_samples
+            ]
+            valid_offsets = [off for off in offsets_seconds if off is not None]
+            split_segments = [
+                {
+                    "count": count,
+                    "offset_seconds": off_s + args.apply_offset_seconds,
+                }
+                for count, off_s in summarize_split_segments(
+                    offsets_samples, SAMPLE_RATE
+                )
+            ]
+            if len(split_segments) <= 1 and dropped_cues == 0 and valid_offsets:
+                offset_seconds = valid_offsets[0]
+                shift_step: TransformerMixin = SubtitleShifter(offset_seconds)
+            else:
+                shift_step = VariableSubtitleShifter(offsets_seconds)
+                if valid_offsets:
+                    offset_seconds = float(np.median(valid_offsets))
+        else:
+            if (
+                not skip_sync
+                and reference_speech is not None
+                and alignment_profile != DEFAULT_ALIGNMENT_PROFILE
+            ):
+                profile_delta_samples = compute_profile_offset_adjustment(
+                    reference_speech,
+                    list(scale_step.subs_),
+                    float(offset_samples),
+                    profile=alignment_profile,
+                    sample_rate=SAMPLE_RATE,
+                    start_seconds=args.start_seconds,
+                )
+                profile_offset_seconds = profile_delta_samples / float(SAMPLE_RATE)
+                if abs(profile_delta_samples) > 1e-6:
+                    offset_seconds += profile_offset_seconds
+                    logger.info(
+                        "alignment profile '%s': adjusted block offset by %+.3fs "
+                        "(final offset: %.3fs)",
+                        alignment_profile,
+                        profile_offset_seconds,
+                        offset_seconds,
+                    )
+            shift_step = SubtitleShifter(offset_seconds)
+        output_steps: List[Tuple[str, TransformerMixin]] = [("shift", shift_step)]
+        if args.merge_with_reference:
+            output_steps.append(
+                ("merge", SubtitleMerger(reference_pipe.named_steps["parse"].subs_))
+            )
+        output_pipe = Pipeline(output_steps)
+        out_subs = output_pipe.fit_transform(scale_step.subs_)
+        out_subs, clipped_cues = out_subs.sanitize_negative_timestamps()
+        if clipped_cues > 0:
+            logger.warning(
+                "%d subtitle cue(s) shifted before 00:00:00 and were omitted",
+                clipped_cues,
+            )
+        quality: Optional[Dict[str, Any]] = None
+        if not skip_sync:
+            try:
+                quality = compute_quality_metrics(
+                    reference_speech,
+                    list(out_subs),
+                    sample_rate=SAMPLE_RATE,
+                    start_seconds=args.start_seconds,
+                    best_peak_snr=best_peak_snr,
+                    best_peak_margin=best_peak_margin,
+                    sync_was_successful=sync_was_successful,
+                    total_input_cues=len(scale_step.subs_),
+                    dropped_cues=dropped_cues,
+                    clipped_cues=clipped_cues,
+                    n_split_segments=len(split_segments) if split_segments else 1,
+                    sub_format=getattr(out_subs, "_sub_format", "srt"),
+                    reference_kind=reference_kind,
+                    profile_offset_seconds=profile_offset_seconds,
+                )
+                s_q = quality["sync"]
+                sub_q = quality["subtitle"]
+                logger.info(
+                    "sync confidence: %d/100 (consistency=%d, overlap=%d, peak=%d, integrity=%d)",
+                    s_q["score"],
+                    s_q["metrics"]["temporal_consistency"],
+                    s_q["metrics"]["overlap_lift"],
+                    s_q["metrics"]["peak_confidence"],
+                    s_q["metrics"]["sync_integrity"],
+                )
+                logger.info(
+                    "subtitle quality: %d/100 (coverage=%d, speed=%d, timing=%d, text=%d)",
+                    sub_q["score"],
+                    sub_q["metrics"]["timeline_coverage"],
+                    sub_q["metrics"]["reading_speed"],
+                    sub_q["metrics"]["timing_hygiene"],
+                    sub_q["metrics"]["text_integrity"],
+                )
+            except Exception:
+                logger.debug("failed to compute quality metrics", exc_info=True)
+        if args.output_encoding != "same":
+            out_subs = out_subs.set_encoding(args.output_encoding)
+        written_path = None
+        if write_output:
+            written_path = _write_candidate_output(
+                args, out_subs, resolved_srtout, offset_seconds
+            )
+        overall_score = compute_overall_score(
+            quality, sync_was_successful=sync_was_successful
+        )
+        candidate.update(
+            {
+                "sync_was_successful": sync_was_successful,
+                "offset_seconds": offset_seconds,
+                "framerate_scale_factor": scale_step.scale_factor,
+                "split_segments": split_segments,
+                "dropped_cues": dropped_cues,
+                "clipped_cues": clipped_cues,
+                "alignment_profile": alignment_profile,
+                "profile_offset_seconds": profile_offset_seconds,
+                "quality": quality,
+                "overall_score": overall_score,
+                "best_score": best_score,
+                "best_peak_snr": best_peak_snr,
+                "best_peak_margin": best_peak_margin,
+                "output_path": written_path,
+            }
+        )
+        if keep_in_memory:
+            candidate["output_subs"] = out_subs
+            candidate["_is_unmodified"] = False
+    except Exception as exc:
+        logger.exception("failed to sync %s", srtin)
+        candidate["sync_was_successful"] = False
+        candidate["error"] = str(exc) or exc.__class__.__name__
+    return candidate
+
+
+def _unique_output_path(dest: str, used: set) -> str:
+    key = os.path.normcase(os.path.abspath(dest))
+    if key not in used:
+        used.add(key)
+        return dest
+    stem, ext = os.path.splitext(dest)
+    n = 2
+    while True:
+        cand = "{}_{}{}".format(stem, n, ext)
+        ckey = os.path.normcase(os.path.abspath(cand))
+        if ckey not in used:
+            used.add(ckey)
+            return cand
+        n += 1
+
+
 def try_sync(
-    args: argparse.Namespace, reference_pipe: Optional[Pipeline], result: Dict[str, Any]
+    args: argparse.Namespace,
+    reference_pipe: Optional[Pipeline],
+    result: Dict[str, Any],
+    *,
+    candidate_progress_cb: Optional[Callable[[int, int, Optional[str]], None]] = None,
+    in_memory_only: bool = False,
 ) -> bool:
     result["sync_was_successful"] = False
-    sync_was_successful = True
     logger.info(
         "extracting speech segments from %s...",
         "stdin" if not args.srtin else "subtitles file(s) {}".format(args.srtin),
     )
     if not args.srtin:
         args.srtin = [None]
-    for srtin in args.srtin:
-        try:
-            skip_sync = args.skip_sync or reference_pipe is None
-            skip_infer_framerate_ratio = (
-                args.skip_infer_framerate_ratio or reference_pipe is None
-            )
-            srtout = _resolve_srtout(args, srtin)
-            srt_pipe_maker = get_srt_pipe_maker(args, srtin)
-            framerate_ratios = get_framerate_ratios_to_try(args)
-            srt_pipes = [srt_pipe_maker(1.0)] + [
-                srt_pipe_maker(rat) for rat in framerate_ratios
-            ]
-            for srt_pipe in srt_pipes:
-                if callable(srt_pipe):
+
+    rank_only = bool(getattr(args, "rank_only", False))
+    save_all = bool(getattr(args, "save_all", False))
+    auto_srtout = bool(getattr(args, "auto_srtout", False))
+    expanded_from_dir = bool(getattr(args, "_expanded_from_dir", False)) and not getattr(
+        args, "gui_mode", False
+    )
+    multi_mode = len(args.srtin) > 1 or expanded_from_dir or rank_only or in_memory_only
+
+    if not multi_mode:
+        srtin = args.srtin[0]
+        if candidate_progress_cb is not None:
+            try:
+                candidate_progress_cb(0, 1, srtin)
+            except Exception:
+                pass
+        cand = _sync_single_subtitle(
+            args,
+            srtin,
+            reference_pipe,
+            write_output=True,
+            keep_in_memory=False,
+        )
+        sync_was_successful = bool(cand["sync_was_successful"]) and not cand.get("error")
+        if not cand.get("error") and not cand.get("low_quality_reasons"):
+            result["offset_seconds"] = cand["offset_seconds"]
+            result["framerate_scale_factor"] = cand["framerate_scale_factor"]
+            result["split_segments"] = cand["split_segments"]
+            result["dropped_cues"] = cand["dropped_cues"]
+            result["clipped_cues"] = cand["clipped_cues"]
+            result["alignment_profile"] = cand["alignment_profile"]
+            result["profile_offset_seconds"] = cand["profile_offset_seconds"]
+            result["quality"] = cand["quality"]
+            result["overall_score"] = cand["overall_score"]
+        result["sync_was_successful"] = sync_was_successful
+        return sync_was_successful
+
+    # Multi-subtitle / ranking mode: analyze every candidate against the single
+    # extracted reference_pipe, rank them, and write only what the mode asks for.
+    raw_candidates: List[Dict[str, Any]] = []
+    total = len(args.srtin)
+    for idx, srtin in enumerate(args.srtin):
+        if candidate_progress_cb is not None:
+            try:
+                candidate_progress_cb(idx, total, srtin)
+            except Exception:
+                pass
+        cand = _sync_single_subtitle(
+            args,
+            srtin,
+            reference_pipe,
+            write_output=False,
+            keep_in_memory=True,
+        )
+        raw_candidates.append(cand)
+
+    ranked = rank_sync_candidates(raw_candidates)
+
+    if not rank_only and not in_memory_only:
+        used_paths: set = set()
+        if args.overwrite_input:
+            for cand in ranked:
+                out_subs = cand.get("output_subs")
+                in_path = cand.get("input_path")
+                if out_subs is None or in_path is None or cand.get("error"):
                     continue
+                cand["output_path"] = _write_candidate_output(
+                    args,
+                    out_subs,
+                    in_path,
+                    float(cand.get("offset_seconds") or 0.0),
+                    is_unmodified=bool(cand.get("_is_unmodified", False)),
+                )
+        elif save_all or auto_srtout:
+            out_dir = args.srtout if (save_all and args.srtout) else None
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            for cand in ranked:
+                out_subs = cand.get("output_subs")
+                in_path = cand.get("input_path")
+                if out_subs is None or in_path is None or cand.get("error"):
+                    continue
+                if auto_srtout and not save_all:
+                    dest = _resolve_srtout(args, in_path)
                 else:
-                    srt_pipe.fit(srtin)
-            if (
-                not skip_infer_framerate_ratio
-                and hasattr(reference_pipe[-1], "num_frames")
-                and reference_pipe[-1].num_frames is not None
-            ):
-                inferred_framerate_ratio_from_length = (
-                    float(reference_pipe[-1].num_frames)
-                    / cast(Pipeline, srt_pipes[0])[-1].num_frames
+                    dest = _default_synced_output_path(in_path, out_dir=out_dir)
+                assert dest is not None
+                dest = _unique_output_path(dest, used_paths)
+                cand["output_path"] = _write_candidate_output(
+                    args,
+                    out_subs,
+                    dest,
+                    float(cand.get("offset_seconds") or 0.0),
+                    is_unmodified=bool(cand.get("_is_unmodified", False)),
                 )
-                logger.info(
-                    "inferred frameratio ratio: %.3f"
-                    % inferred_framerate_ratio_from_length
-                )
-                srt_pipes.append(
-                    cast(
-                        Pipeline, srt_pipe_maker(inferred_framerate_ratio_from_length)
-                    ).fit(srtin)
-                )
-                logger.info("...done")
-            logger.info("computing alignments...")
-            reference_speech = None
-            split_penalty = getattr(args, "split_penalty", None)
-            use_split_early = split_penalty is not None and not skip_sync
-            use_auto_split_early = (
-                bool(getattr(args, "auto_split", False))
-                and not use_split_early
-                and not skip_sync
-            )
-            align_max_offset_seconds = (
-                max(
-                    float(args.max_offset_seconds),
-                    DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
-                )
-                if use_auto_split_early
-                else args.max_offset_seconds
-            )
-            aligner: Optional[MaxScoreAligner] = None
-            best_peak_snr: Optional[float] = None
-            best_peak_margin: Optional[float] = None
-            reference_kind: str = "audio"
-            if skip_sync:
-                best_score = 0.0
-                best_srt_pipe = cast(Pipeline, srt_pipes[0])
-                offset_samples = 0
-            else:
-                reference_speech = reference_pipe.transform(args.reference)
-                aligner = MaxScoreAligner(
-                    FFTAligner, srtin, SAMPLE_RATE, align_max_offset_seconds
-                )
-                (best_score, offset_samples), best_srt_pipe = aligner.fit_transform(
-                    reference_speech,
-                    srt_pipes,
-                )
-                best_peak_snr = getattr(aligner, "best_peak_snr_", None)
-                best_peak_margin = getattr(aligner, "best_peak_margin_", None)
-
-                ref_step = (
-                    reference_pipe[-1]
-                    if hasattr(reference_pipe, "__getitem__")
-                    else reference_pipe
-                )
-                if isinstance(
-                    ref_step, (SubtitleSpeechTransformer, PGSSpeechTransformer)
-                ) or bool(getattr(ref_step, "used_embedded_subs_", False)):
-                    reference_kind = "subtitles"
-                else:
-                    reference_kind = "audio"
-                alt_candidates = list(
-                    getattr(ref_step, "alt_video_speech_results_", None) or []
-                )
-                embedded_peak_weak = (
-                    best_peak_snr is not None
-                    and best_peak_snr < DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
-                )
-                poor_embedded_alignment = (
-                    (
-                        (best_score < 0 and (best_peak_snr is None or embedded_peak_weak))
-                        or embedded_peak_weak
-                    )
-                    and bool(getattr(ref_step, "can_fallback_to_audio", False))
-                )
-                if poor_embedded_alignment:
-                    logger.warning(
-                        "embedded subtitle alignment looked unreliable "
-                        "(score=%.1f, peak SNR=%s); falling back to audio VAD",
-                        best_score,
-                        "%.2f" % best_peak_snr if best_peak_snr is not None else "n/a",
-                    )
-                    try:
-                        audio_speech, audio_alts = ref_step.fallback_to_audio(
-                            args.reference
-                        )
-                        alt_candidates.append(("audio VAD fallback", audio_speech))
-                        alt_candidates.extend(audio_alts)
-                    except Exception as e:
-                        logger.warning(
-                            "audio VAD fallback failed (%s); keeping embedded alignment",
-                            e,
-                        )
-                for cand_label, cand_speech in alt_candidates:
-                    logger.info("comparing alignment with %s...", cand_label)
-                    cand_aligner = MaxScoreAligner(
-                        FFTAligner, srtin, SAMPLE_RATE, align_max_offset_seconds
-                    )
-                    (cand_score, cand_offset), cand_pipe = cand_aligner.fit_transform(
-                        cand_speech,
-                        srt_pipes,
-                    )
-                    cand_snr = getattr(cand_aligner, "best_peak_snr_", None)
-                    cand_is_valid = cand_score >= 0 or (
-                        cand_snr is not None
-                        and cand_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
-                    )
-                    best_is_valid = best_score >= 0 or (
-                        best_peak_snr is not None
-                        and best_peak_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
-                    )
-                    prefer_cand = (
-                        (cand_is_valid and not best_is_valid)
-                        or (
-                            cand_snr is not None
-                            and (best_peak_snr is None or cand_snr > best_peak_snr)
-                        )
-                        or (
-                            cand_snr is None
-                            and best_peak_snr is None
-                            and cand_score > best_score
-                        )
-                    )
-                    if prefer_cand:
-                        logger.info(
-                            "%s alignment scored higher peak SNR (%.2f vs %.2f; "
-                            "offset %.3fs vs %.3fs); using %s",
-                            cand_label,
-                            cand_snr or 0.0,
-                            best_peak_snr or 0.0,
-                            cand_offset / float(SAMPLE_RATE),
-                            offset_samples / float(SAMPLE_RATE),
-                            cand_label,
-                        )
-                        reference_speech = cand_speech
-                        aligner = cand_aligner
-                        best_score = cand_score
-                        offset_samples = cand_offset
-                        best_srt_pipe = cand_pipe
-                        best_peak_snr = cand_snr
-                        best_peak_margin = getattr(
-                            cand_aligner, "best_peak_margin_", None
-                        )
-                        if "audio" in cand_label.lower() or "center channel" in cand_label.lower():
-                            reference_kind = "audio"
-                    else:
-                        logger.info(
-                            "keeping primary alignment over %s (peak SNR %.2f vs %.2f)",
-                            cand_label,
-                            best_peak_snr or 0.0,
-                            cand_snr or 0.0,
-                        )
-            if best_score < 0:
-                if (
-                    best_peak_snr is not None
-                    and best_peak_snr >= DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD
-                ):
-                    logger.info(
-                        "raw score was negative (%.1f) due to speech-density mismatch, "
-                        "but peak SNR is strong (%.2f >= %.1f); accepting alignment",
-                        best_score,
-                        best_peak_snr,
-                        DEFAULT_PEAK_SNR_SUCCESS_THRESHOLD,
-                    )
-                else:
-                    sync_was_successful = False
-            logger.info("...done")
-            offset_seconds = (
-                offset_samples / float(SAMPLE_RATE) + args.apply_offset_seconds
-            )
-            scale_step = best_srt_pipe.named_steps["scale"]
-            if best_peak_snr is not None:
-                logger.info("score: %.3f (peak SNR: %.2f)", best_score, best_peak_snr)
-            else:
-                logger.info("score: %.3f", best_score)
-            logger.info("offset seconds: %.3f", offset_seconds)
-            logger.info("framerate scale factor: %.3f", scale_step.scale_factor)
-            low_quality_reasons: List[str] = []
-            if getattr(args, "skip_sync_on_low_quality", False):
-                low_quality_reasons = assess_alignment_quality(
-                    best_score,
-                    offset_seconds,
-                    scale_step.scale_factor,
-                    min_score=args.min_score,
-                    max_offset_seconds=args.quality_max_offset_seconds,
-                    max_framerate_deviation=args.max_framerate_deviation,
-                )
-            if low_quality_reasons:
-                logger.warning(
-                    "low-quality alignment (%s); leaving subtitles unmodified",
-                    "; ".join(low_quality_reasons),
-                )
-                sync_was_successful = False
-                # write the original (unscaled, unshifted) subtitles unchanged
-                original_subs = best_srt_pipe.named_steps["parse"].subs_
-                out_subs = original_subs.clone_props_for_subs(list(original_subs))
-                if args.output_encoding != "same":
-                    out_subs = out_subs.set_encoding(args.output_encoding)
-                logger.info(
-                    "writing original (unsynced) output to {}".format(srtout or "stdout")
-                )
-                out_subs.write_file(srtout)
-                continue
-            use_split = use_split_early and reference_speech is not None
-            use_auto_split = use_auto_split_early and reference_speech is not None
-            split_segments: Optional[List[Dict[str, Any]]] = None
-            dropped_cues = 0
-            alignment_profile = normalize_alignment_profile(
-                getattr(args, "alignment_profile", DEFAULT_ALIGNMENT_PROFILE)
-            )
-            profile_offset_seconds: float = 0.0
-            if use_split or use_auto_split:
-                length_penalty = getattr(
-                    args, "split_length_penalty", DEFAULT_SPLIT_LENGTH_PENALTY
-                )
-                subsample = max(1, int(getattr(args, "split_subsample", 1) or 1))
-                max_off = abs(int(args.max_offset_seconds * SAMPLE_RATE))
-                offsets_samples: List[Optional[float]]
-                if use_split:
-                    # Joint framerate + split search: score the piecewise alignment at
-                    # every candidate framerate scale (reusing the pipelines the global
-                    # search already fit) and keep the best-scoring one, rather than
-                    # committing to the scale the single-offset FFT search preferred.
-                    candidate_pipes = [p for p in srt_pipes if not callable(p)]
-                    if best_srt_pipe not in candidate_pipes:
-                        candidate_pipes.append(cast(Pipeline, best_srt_pipe))
-                    best_split: Optional[Tuple[float, List[float], Pipeline]] = None
-                    for cand_pipe in candidate_pipes:
-                        cand_offsets, cand_score = compute_split_offsets(
-                            reference_speech,
-                            list(cand_pipe.named_steps["scale"].subs_),
-                            sample_rate=SAMPLE_RATE,
-                            start_seconds=args.start_seconds,
-                            split_penalty=split_penalty * SAMPLE_RATE,
-                            length_penalty=length_penalty,
-                            offset_step_samples=1.0 / subsample,
-                            max_offset_samples=max_off,
-                            return_score=True,
-                            log_segments=False,
-                        )
-                        if best_split is None or cand_score > best_split[0]:
-                            best_split = (cand_score, cand_offsets, cand_pipe)
-                    assert best_split is not None
-                    _, split_offs, best_split_pipe = best_split
-                    offsets_samples = list(split_offs)
-                    if best_split_pipe is not best_srt_pipe:
-                        logger.info(
-                            "split search preferred framerate scale %.3f (single-offset "
-                            "search had chosen %.3f)",
-                            best_split_pipe.named_steps["scale"].scale_factor,
-                            scale_step.scale_factor,
-                        )
-                    scale_step = best_split_pipe.named_steps["scale"]
-                else:
-                    auto_max_search = max(
-                        float(args.max_offset_seconds),
-                        DEFAULT_AUTO_SPLIT_MAX_OFFSET_SECONDS,
-                    )
-                    auto_search_samples = int(round(auto_max_search * SAMPLE_RATE))
-                    precomputed_offsets: Dict[int, float] = {}
-                    if aligner is not None:
-                        for cand_score_tuple, cand_pipe in getattr(
-                            aligner, "_scores", []
-                        ):
-                            precomputed_offsets[id(cand_pipe)] = float(
-                                cand_score_tuple[1]
-                            )
-
-                    def _run_auto_for_pipe(
-                        cand_pipe: Pipeline, cand_global: float
-                    ) -> Tuple[float, List[Optional[float]], Pipeline]:
-                        cand_offsets, cand_score = compute_auto_split_offsets(
-                            reference_speech,
-                            list(cand_pipe.named_steps["scale"].subs_),
-                            global_offset_samples=cand_global,
-                            sample_rate=SAMPLE_RATE,
-                            start_seconds=args.start_seconds,
-                            split_penalty=DEFAULT_AUTO_SPLIT_PENALTY * SAMPLE_RATE,
-                            length_penalty=length_penalty,
-                            offset_step_samples=1.0 / subsample,
-                            max_search_samples=auto_search_samples,
-                            log_segments=False,
-                        )
-                        cand_scale = float(cand_pipe.named_steps["scale"].scale_factor)
-                        norm_score = cand_score * min(1.0 / cand_scale, 1.0)
-                        return norm_score, cand_offsets, cand_pipe
-
-                    best_auto = _run_auto_for_pipe(
-                        cast(Pipeline, best_srt_pipe), float(offset_samples)
-                    )
-                    first_segs = summarize_split_segments(best_auto[1], SAMPLE_RATE)
-                    first_dropped = count_dropped_cues(best_auto[1])
-                    needs_alt_scale_check = (
-                        len(first_segs) > 1
-                        or first_dropped > 0
-                        or best_score < 0
-                        or abs(scale_step.scale_factor - 1.0) > 1e-6
-                    )
-                    if needs_alt_scale_check:
-                        for cand_pipe in srt_pipes:
-                            if callable(cand_pipe) or cand_pipe is best_srt_pipe:
-                                continue
-                            cand_global = precomputed_offsets.get(id(cand_pipe))
-                            if cand_global is None:
-                                cand_global = float(
-                                    FFTAligner(
-                                        max_offset_samples=auto_search_samples
-                                    ).fit_transform(
-                                        reference_speech, cand_pipe.transform(None)
-                                    )
-                                )
-                            cand_res = _run_auto_for_pipe(cand_pipe, cand_global)
-                            if cand_res[0] > best_auto[0]:
-                                best_auto = cand_res
-                    _, offsets_samples, best_auto_pipe = best_auto
-                    if best_auto_pipe is not best_srt_pipe:
-                        logger.info(
-                            "auto-split preferred framerate scale %.3f (single-offset "
-                            "search had chosen %.3f)",
-                            best_auto_pipe.named_steps["scale"].scale_factor,
-                            scale_step.scale_factor,
-                        )
-                    scale_step = best_auto_pipe.named_steps["scale"]
-                log_split_segments(offsets_samples, SAMPLE_RATE)
-                dropped_cues = count_dropped_cues(offsets_samples)
-                if not sync_was_successful and alignment_has_positive_signal(
-                    reference_speech,
-                    list(scale_step.subs_),
-                    offsets_samples,
-                    sample_rate=SAMPLE_RATE,
-                    start_seconds=args.start_seconds,
-                    length_penalty=length_penalty,
-                ):
-                    sync_was_successful = True
-                if alignment_profile != DEFAULT_ALIGNMENT_PROFILE:
-                    profile_delta_samples = compute_profile_offset_adjustment(
-                        reference_speech,
-                        list(scale_step.subs_),
-                        offsets_samples,
-                        profile=alignment_profile,
-                        sample_rate=SAMPLE_RATE,
-                        start_seconds=args.start_seconds,
-                    )
-                    profile_offset_seconds = profile_delta_samples / float(SAMPLE_RATE)
-                    if abs(profile_delta_samples) > 1e-6:
-                        offsets_samples = [
-                            None if off is None else off + profile_delta_samples
-                            for off in offsets_samples
-                        ]
-                        logger.info(
-                            "alignment profile '%s': adjusted block offset by %+.3fs",
-                            alignment_profile,
-                            profile_offset_seconds,
-                        )
-                offsets_seconds: List[Optional[float]] = [
-                    None
-                    if off is None
-                    else off / float(SAMPLE_RATE) + args.apply_offset_seconds
-                    for off in offsets_samples
-                ]
-                valid_offsets = [off for off in offsets_seconds if off is not None]
-                split_segments = [
-                    {
-                        "count": count,
-                        "offset_seconds": off_s + args.apply_offset_seconds,
-                    }
-                    for count, off_s in summarize_split_segments(
-                        offsets_samples, SAMPLE_RATE
-                    )
-                ]
-                if len(split_segments) <= 1 and dropped_cues == 0 and valid_offsets:
-                    offset_seconds = valid_offsets[0]
-                    shift_step: TransformerMixin = SubtitleShifter(offset_seconds)
-                else:
-                    shift_step = VariableSubtitleShifter(offsets_seconds)
-                    if valid_offsets:
-                        offset_seconds = float(np.median(valid_offsets))
-            else:
-                if (
-                    not skip_sync
-                    and reference_speech is not None
-                    and alignment_profile != DEFAULT_ALIGNMENT_PROFILE
-                ):
-                    profile_delta_samples = compute_profile_offset_adjustment(
-                        reference_speech,
-                        list(scale_step.subs_),
-                        float(offset_samples),
-                        profile=alignment_profile,
-                        sample_rate=SAMPLE_RATE,
-                        start_seconds=args.start_seconds,
-                    )
-                    profile_offset_seconds = profile_delta_samples / float(SAMPLE_RATE)
-                    if abs(profile_delta_samples) > 1e-6:
-                        offset_seconds += profile_offset_seconds
-                        logger.info(
-                            "alignment profile '%s': adjusted block offset by %+.3fs "
-                            "(final offset: %.3fs)",
-                            alignment_profile,
-                            profile_offset_seconds,
-                            offset_seconds,
-                        )
-                shift_step = SubtitleShifter(offset_seconds)
-            output_steps: List[Tuple[str, TransformerMixin]] = [("shift", shift_step)]
-            if args.merge_with_reference:
-                output_steps.append(
-                    ("merge", SubtitleMerger(reference_pipe.named_steps["parse"].subs_))
-                )
-            output_pipe = Pipeline(output_steps)
-            out_subs = output_pipe.fit_transform(scale_step.subs_)
-            out_subs, clipped_cues = out_subs.sanitize_negative_timestamps()
-            if clipped_cues > 0:
-                logger.warning(
-                    "%d subtitle cue(s) shifted before 00:00:00 and were omitted",
-                    clipped_cues,
-                )
-            quality: Optional[Dict[str, Any]] = None
-            if not skip_sync:
-                try:
-                    quality = compute_quality_metrics(
-                        reference_speech,
-                        list(out_subs),
-                        sample_rate=SAMPLE_RATE,
-                        start_seconds=args.start_seconds,
-                        best_peak_snr=best_peak_snr,
-                        best_peak_margin=best_peak_margin,
-                        sync_was_successful=sync_was_successful,
-                        total_input_cues=len(scale_step.subs_),
-                        dropped_cues=dropped_cues,
-                        clipped_cues=clipped_cues,
-                        n_split_segments=len(split_segments) if split_segments else 1,
-                        sub_format=getattr(out_subs, "_sub_format", "srt"),
-                        reference_kind=reference_kind,
-                        profile_offset_seconds=profile_offset_seconds,
-                    )
-                    s_q = quality["sync"]
-                    sub_q = quality["subtitle"]
-                    logger.info(
-                        "sync confidence: %d/100 (consistency=%d, overlap=%d, peak=%d, integrity=%d)",
-                        s_q["score"],
-                        s_q["metrics"]["temporal_consistency"],
-                        s_q["metrics"]["overlap_lift"],
-                        s_q["metrics"]["peak_confidence"],
-                        s_q["metrics"]["sync_integrity"],
-                    )
-                    logger.info(
-                        "subtitle quality: %d/100 (coverage=%d, speed=%d, timing=%d, text=%d)",
-                        sub_q["score"],
-                        sub_q["metrics"]["timeline_coverage"],
-                        sub_q["metrics"]["reading_speed"],
-                        sub_q["metrics"]["timing_hygiene"],
-                        sub_q["metrics"]["text_integrity"],
-                    )
-                except Exception:
-                    logger.debug("failed to compute quality metrics", exc_info=True)
-            if args.output_encoding != "same":
-                out_subs = out_subs.set_encoding(args.output_encoding)
-            suppress_output_thresh = args.suppress_output_if_offset_less_than
-            if offset_seconds >= (suppress_output_thresh or float("-inf")):
-                logger.info("writing output to {}".format(srtout or "stdout"))
-                out_subs.write_file(srtout)
-            else:
-                logger.warning(
-                    "suppressing output because offset %s was less than suppression threshold %s",
-                    offset_seconds,
-                    args.suppress_output_if_offset_less_than,
-                )
-        except Exception:
-            sync_was_successful = False
-            logger.exception("failed to sync %s", srtin)
         else:
-            result["offset_seconds"] = offset_seconds
-            result["framerate_scale_factor"] = scale_step.scale_factor
-            result["split_segments"] = split_segments
-            result["dropped_cues"] = dropped_cues
-            result["clipped_cues"] = clipped_cues
-            result["alignment_profile"] = alignment_profile
-            result["profile_offset_seconds"] = profile_offset_seconds
-            result["quality"] = quality
+            # Default multi-subtitle CLI behavior: write only the #1 ranked winner.
+            winner = ranked[0] if ranked else None
+            if (
+                winner is not None
+                and winner.get("output_subs") is not None
+                and not winner.get("error")
+                and not winner.get("low_quality_reasons")
+            ):
+                if args.srtout is not None:
+                    dest = args.srtout
+                elif winner.get("input_path") is not None:
+                    dest = _default_synced_output_path(winner["input_path"])
+                else:
+                    dest = None
+                winner["output_path"] = _write_candidate_output(
+                    args,
+                    winner["output_subs"],
+                    dest,
+                    float(winner.get("offset_seconds") or 0.0),
+                )
+
+    table = format_ranking_table(ranked)
+    for line in table.splitlines():
+        logger.info("%s", line)
+    if rank_only and not in_memory_only:
+        print(table)
+
+    public_candidates: List[Dict[str, Any]] = []
+    for cand in ranked:
+        clean = dict(cand)
+        clean.pop("_is_unmodified", None)
+        if not in_memory_only:
+            clean.pop("output_subs", None)
+        public_candidates.append(clean)
+
+    best = public_candidates[0] if public_candidates else None
+    result["multi_mode"] = True
+    result["candidates"] = public_candidates
+    result["best_candidate"] = best
+    if best is not None and not best.get("error"):
+        result["offset_seconds"] = best.get("offset_seconds")
+        result["framerate_scale_factor"] = best.get("framerate_scale_factor")
+        result["split_segments"] = best.get("split_segments")
+        result["dropped_cues"] = best.get("dropped_cues", 0)
+        result["clipped_cues"] = best.get("clipped_cues", 0)
+        result["alignment_profile"] = best.get(
+            "alignment_profile", DEFAULT_ALIGNMENT_PROFILE
+        )
+        result["profile_offset_seconds"] = best.get("profile_offset_seconds", 0.0)
+        result["quality"] = best.get("quality")
+        result["overall_score"] = best.get("overall_score", 0)
+        result["output_path"] = best.get("output_path")
+
+    if args.overwrite_input or save_all or auto_srtout:
+        sync_was_successful = bool(ranked) and all(
+            bool(c.get("sync_was_successful")) and not c.get("error") for c in ranked
+        )
+    else:
+        sync_was_successful = (
+            best is not None
+            and bool(best.get("sync_was_successful"))
+            and not best.get("error")
+        )
     result["sync_was_successful"] = sync_was_successful
     return sync_was_successful
 
@@ -1029,14 +1441,15 @@ def validate_args(args: argparse.Namespace) -> None:
                 "at least one of `srtin` or `reference` must be specified to apply offset seconds"
             )
     if args.srtin:
-        if len(args.srtin) > 1 and not args.overwrite_input:
-            raise ValueError(
-                "cannot specify multiple input srt files without overwriting"
-            )
+        expanded_srtin, had_dir = discover_subtitle_files(
+            args.srtin,
+            recursive=bool(getattr(args, "recursive", False)),
+            exclude_path=args.reference,
+        )
+        args.srtin = expanded_srtin
+        args._expanded_from_dir = had_dir
         if len(args.srtin) > 1 and args.make_test_case:
             raise ValueError("cannot specify multiple input srt files for test cases")
-        if len(args.srtin) > 1 and args.gui_mode:
-            raise ValueError("cannot specify multiple input srt files in GUI mode")
     elif (
         args.reference is not None
         and not is_remote_url(args.reference)  # can't list a remote dir for sibling srts
@@ -1074,6 +1487,14 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 "need to specify input and output srt files for test cases"
             )
+    rank_only = bool(getattr(args, "rank_only", False))
+    save_all = bool(getattr(args, "save_all", False))
+    if rank_only and args.overwrite_input:
+        raise ValueError("cannot combine --rank-only with --overwrite-input")
+    if rank_only and save_all:
+        raise ValueError("cannot combine --rank-only with --save-all")
+    if save_all and args.overwrite_input:
+        raise ValueError("cannot combine --save-all with --overwrite-input")
     if args.overwrite_input:
         if args.extract_subs_from_stream is not None:
             raise ValueError(
@@ -1112,14 +1533,23 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--sub-fps must be positive (got %r)" % (sub_fps,))
     if args.extract_subs_from_stream is None:
         if args.srtout is not None:
-            out_ext = os.path.splitext(args.srtout)[-1][1:].lower()
-            if out_ext not in SUPPORTED_OUTPUT_FORMATS:
-                raise ValueError(
-                    "unsupported output subtitle format: {!r} (supported: {})".format(
-                        out_ext or args.srtout,
-                        ", ".join(sorted(SUPPORTED_OUTPUT_FORMATS)),
+            if save_all and args.srtin and len(args.srtin) > 1:
+                out_ext = os.path.splitext(args.srtout)[-1][1:].lower()
+                if out_ext in SUPPORTED_OUTPUT_FORMATS and not os.path.isdir(args.srtout):
+                    raise ValueError(
+                        "--save-all with -o expects an output directory, not a single subtitle file: {!r}".format(
+                            args.srtout
+                        )
                     )
-                )
+            else:
+                out_ext = os.path.splitext(args.srtout)[-1][1:].lower()
+                if out_ext not in SUPPORTED_OUTPUT_FORMATS:
+                    raise ValueError(
+                        "unsupported output subtitle format: {!r} (supported: {})".format(
+                            out_ext or args.srtout,
+                            ", ".join(sorted(SUPPORTED_OUTPUT_FORMATS)),
+                        )
+                    )
         elif args.overwrite_input and args.srtin:
             for srtin_path in args.srtin:
                 if srtin_path is not None:
@@ -1196,6 +1626,11 @@ def _run_impl(
     args: argparse.Namespace,
     result: Dict[str, Any],
     progress_handler: Optional[Callable[[ProgressInfo], None]] = None,
+    *,
+    reference_pipe: Optional[Pipeline] = None,
+    candidate_progress_cb: Optional[Callable[[int, int, Optional[str]], None]] = None,
+    return_reference_pipe: bool = False,
+    in_memory_only: bool = False,
 ) -> bool:
     if args.extract_subs_from_stream is not None:
         result["retval"] = extract_subtitles_from_reference(args)
@@ -1204,11 +1639,22 @@ def _run_impl(
         args.reference is None
         or (len(args.srtin) == 1 and args.srtin[0] == args.reference)
     ):
-        return try_sync(args, None, result)
-    reference_pipe = make_reference_pipe(args, progress_handler=progress_handler)
-    logger.info("extracting speech segments from reference '%s'...", args.reference)
-    reference_pipe.fit(args.reference)
-    logger.info("...done")
+        return try_sync(
+            args,
+            None,
+            result,
+            candidate_progress_cb=candidate_progress_cb,
+            in_memory_only=in_memory_only,
+        )
+    if reference_pipe is None:
+        reference_pipe = make_reference_pipe(args, progress_handler=progress_handler)
+        logger.info("extracting speech segments from reference '%s'...", args.reference)
+        reference_pipe.fit(args.reference)
+        logger.info("...done")
+    else:
+        logger.info("reusing cached reference speech for '%s'", args.reference)
+    if return_reference_pipe:
+        result["reference_pipe"] = reference_pipe
     if args.make_test_case or args.serialize_speech:
         logger.info("serializing speech...")
         np.savez_compressed(
@@ -1220,7 +1666,13 @@ def _run_impl(
                 "unsynchronized subtitle file not specified; skipping synchronization"
             )
             return False
-    return try_sync(args, reference_pipe, result)
+    return try_sync(
+        args,
+        reference_pipe,
+        result,
+        candidate_progress_cb=candidate_progress_cb,
+        in_memory_only=in_memory_only,
+    )
 
 
 def validate_and_transform_args(
@@ -1239,7 +1691,13 @@ def validate_and_transform_args(
         if parser is not None:
             parser.print_usage()
         return None
-    if args.gui_mode and args.srtout is None:
+    if (
+        args.gui_mode
+        and args.srtout is None
+        and args.srtin
+        and len(args.srtin) == 1
+        and args.srtin[0] is not None
+    ):
         args.srtout = "{}.synced.srt".format(os.path.splitext(args.srtin[0])[0])
     try:
         validate_file_permissions(args)
@@ -1259,6 +1717,11 @@ def validate_and_transform_args(
 def run(
     parser_or_args: Union[argparse.ArgumentParser, argparse.Namespace],
     progress_handler: Optional[Callable[[ProgressInfo], None]] = None,
+    *,
+    reference_pipe: Optional[Pipeline] = None,
+    candidate_progress_cb: Optional[Callable[[int, int, Optional[str]], None]] = None,
+    return_reference_pipe: bool = False,
+    in_memory_only: bool = False,
 ) -> Dict[str, Any]:
     """Synchronize subtitles.
 
@@ -1287,7 +1750,13 @@ def run(
     log_path, log_handler = _setup_logging(args)
     try:
         sync_was_successful = _run_impl(
-            args, result, progress_handler=progress_handler
+            args,
+            result,
+            progress_handler=progress_handler,
+            reference_pipe=reference_pipe,
+            candidate_progress_cb=candidate_progress_cb,
+            return_reference_pipe=return_reference_pipe,
+            in_memory_only=in_memory_only,
         )
         result["sync_was_successful"] = sync_was_successful
         return result
@@ -1317,11 +1786,12 @@ def add_main_args_for_cli(parser: argparse.ArgumentParser) -> None:
         "--srtin",
         nargs="*",
         help=(
-            "Input subtitles file (default=stdin). If omitted (and nothing is "
-            "piped in), subtitles sharing the reference's name in its directory "
-            "are auto-detected (e.g. `movie.srt`, `movie.en.srt` for `movie.mkv`) "
-            "and each is synced to a `<name>.synced.srt` next to it; pass "
-            "--overwrite-input to overwrite the detected file(s) in place."
+            "Input subtitle file(s) or folder(s) (default=stdin). When multiple "
+            "files or a folder are given, all candidates are analyzed once against "
+            "the same reference, ranked by match quality, and the #1 winner is saved "
+            "(unless --save-all, --rank-only, or --overwrite-input is set). If "
+            "omitted (and nothing is piped in), subtitles sharing the reference's "
+            "name in its directory are auto-detected."
         ),
     )
     parser.add_argument(
@@ -1388,6 +1858,31 @@ def add_cli_only_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "If specified, will overwrite the input srt "
             "instead of writing the output to a new file."
+        ),
+    )
+    parser.add_argument(
+        "--save-all",
+        action="store_true",
+        help=(
+            "In multi-subtitle mode, write synced outputs for all candidates "
+            "(as <name>.synced.<ext>, or into -o if a directory is provided) "
+            "instead of saving only the #1 ranked subtitle."
+        ),
+    )
+    parser.add_argument(
+        "--rank-only",
+        action="store_true",
+        help=(
+            "Analyze and print the ranking of input subtitles without writing "
+            "any output subtitle files."
+        ),
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help=(
+            "When a folder is passed to -i/--srtin, scan subdirectories "
+            "recursively for subtitle files."
         ),
     )
     parser.add_argument(

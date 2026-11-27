@@ -57,10 +57,22 @@ const els = {
   refFile: document.getElementById("ref-file"),
   inPath: document.getElementById("in-path"),
   inputFile: document.getElementById("input-file"),
+  inputFolder: document.getElementById("input-folder"),
   outField: document.getElementById("out-field"),
   outPath: document.getElementById("out-path"),
   browseRef: document.getElementById("browse-ref"),
+  browseInSplit: document.getElementById("browse-in-split"),
   browseIn: document.getElementById("browse-in"),
+  browseInMenuBtn: document.getElementById("browse-in-menu-btn"),
+  browseInMenu: document.getElementById("browse-in-menu"),
+  browseInOptAdd: document.getElementById("browse-in-opt-add"),
+  browseInOptFiles: document.getElementById("browse-in-opt-files"),
+  browseInOptFilesLabel: document.getElementById("browse-in-opt-files-label"),
+  browseInOptFolder: document.getElementById("browse-in-opt-folder"),
+  multiInPanel: document.getElementById("multi-in-panel"),
+  multiInCount: document.getElementById("multi-in-count"),
+  multiInList: document.getElementById("multi-in-list"),
+  clearInBtn: document.getElementById("clear-in-btn"),
   browseOut: document.getElementById("browse-out"),
   streamWrap: document.getElementById("stream-wrap"),
   refStream: document.getElementById("ref-stream"),
@@ -74,6 +86,11 @@ const els = {
   syncFill: document.getElementById("sync-fill"),
   syncPct: document.getElementById("sync-pct"),
   result: document.getElementById("result"),
+  resultSingle: document.getElementById("result-single"),
+  resultRanking: document.getElementById("result-ranking"),
+  rankingTitle: document.getElementById("ranking-title"),
+  rankingMeta: document.getElementById("ranking-meta"),
+  rankingList: document.getElementById("ranking-list"),
   offset: document.getElementById("offset"),
   resultMeta: document.getElementById("result-meta"),
   resultQuality: document.getElementById("result-quality"),
@@ -112,7 +129,8 @@ let adapter = null;
 let runtimeReady = false;
 let busy = false;
 let selectedRef = null; // string path (desktop) or File (web)
-let selectedIn = null; // string path (desktop) or File (web)
+let selectedIns = []; // array of { value: string|File, display: string, name: string, key: string }
+let appendNextWebPick = false;
 let lastResult = null;
 let lastStreamProbe = null;
 let lastFfmpegInfo = null;
@@ -121,7 +139,135 @@ let streamProbeSeq = 0;
 let themeTransitionTimer = null;
 let settingsOpen = false;
 let openQualityPanel = null; // null | "sync" | "subtitle"
+let expandedRankingId = null;
+let rankingQualityTabs = new Map(); // candidateId -> "sync" | "subtitle" | null
+let savedCandidatePaths = new Map(); // candidateId -> saved path (desktop)
 let alignmentProfile = readSavedAlignmentProfile();
+
+const SUPPORTED_SUB_EXTS = new Set(["srt", "ass", "ssa", "sub", "vtt"]);
+
+function basenameOf(str) {
+  const s = String(str || "");
+  const sep = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
+  return sep >= 0 ? s.slice(sep + 1) : s;
+}
+
+function isSupportedSubtitleName(name) {
+  const base = basenameOf(name);
+  const dot = base.lastIndexOf(".");
+  if (dot < 0) return false;
+  return SUPPORTED_SUB_EXTS.has(base.slice(dot + 1).toLowerCase());
+}
+
+function isSyncedFilename(name) {
+  const base = basenameOf(name);
+  const dot = base.lastIndexOf(".");
+  const stem = dot >= 0 ? base.slice(0, dot) : base;
+  return stem.toLowerCase().endsWith(".synced");
+}
+
+function normalizeSubtitleEntry(entry) {
+  if (!entry || !entry.value) return null;
+  const val = entry.value;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    return {
+      value: trimmed,
+      display: entry.display || trimmed,
+      name: basenameOf(trimmed),
+      key: trimmed.toLowerCase(),
+    };
+  }
+  const name = val.name || entry.display || "subtitle.srt";
+  const display =
+    entry.display || (adapter && adapter.formatFileDisplay ? adapter.formatFileDisplay(val) : name);
+  return {
+    value: val,
+    display,
+    name,
+    key: `${name.toLowerCase()}|${val.size || 0}|${val.lastModified || 0}`,
+  };
+}
+
+function filterWebFolderFiles(fileList, refValue) {
+  const refName = refValue && typeof refValue === "object" ? String(refValue.name || "").toLowerCase() : "";
+  const refSize = refValue && typeof refValue === "object" ? Number(refValue.size || -1) : -1;
+  const out = [];
+  for (const file of Array.from(fileList || [])) {
+    if (!file) continue;
+    // Top-level only: webkitRelativePath for top-level files in a picked folder is "folder/file.srt" (2 parts).
+    const rel = String(file.webkitRelativePath || "");
+    if (rel) {
+      const parts = rel.split("/").filter(Boolean);
+      if (parts.length > 2) continue;
+    }
+    if (!isSupportedSubtitleName(file.name)) continue;
+    if (isSyncedFilename(file.name)) continue;
+    if (refName && file.name.toLowerCase() === refName && Number(file.size) === refSize) {
+      continue;
+    }
+    out.push(file);
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+async function readDirectoryTopLevelFiles(dirEntry) {
+  const reader = dirEntry.createReader();
+  const entries = [];
+  while (true) {
+    const batch = await new Promise((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (!batch || !batch.length) break;
+    entries.push(...batch);
+  }
+  const files = [];
+  for (const ent of entries) {
+    if (ent && ent.isFile) {
+      try {
+        const f = await new Promise((resolve, reject) => ent.file(resolve, reject));
+        if (f) files.push(f);
+      } catch (_) {}
+    }
+  }
+  return files;
+}
+
+async function extractWebDroppedSubtitles(dataTransfer, refValue) {
+  if (!dataTransfer) return { files: [], hadDir: false };
+  const items = Array.from(dataTransfer.items || []);
+  const entries = items
+    .map((it) => (typeof it.webkitGetAsEntry === "function" ? it.webkitGetAsEntry() : null))
+    .filter(Boolean);
+
+  let hadDir = false;
+  if (entries.some((e) => e.isDirectory)) {
+    hadDir = true;
+    const collected = [];
+    for (const ent of entries) {
+      if (ent.isDirectory) {
+        const dirFiles = await readDirectoryTopLevelFiles(ent);
+        collected.push(...filterWebFolderFiles(dirFiles, refValue));
+      } else if (ent.isFile) {
+        try {
+          const f = await new Promise((resolve, reject) => ent.file(resolve, reject));
+          if (f && isSupportedSubtitleName(f.name)) collected.push(f);
+        } catch (_) {}
+      }
+    }
+    collected.sort((a, b) => a.name.localeCompare(b.name));
+    return { files: collected, hadDir };
+  }
+
+  const dropped = Array.from(dataTransfer.files || []);
+  if (dropped.length > 1) {
+    const filtered = dropped.filter((f) => isSupportedSubtitleName(f.name));
+    return { files: filtered.length ? filtered : dropped, hadDir: false };
+  }
+  return { files: dropped, hadDir: false };
+}
 
 function renderAlignmentProfileSetting() {
   if (els.settingsAlignmentProfile) {
@@ -239,7 +385,7 @@ function hasSelection(val) {
 
 function refreshSyncBtn() {
   els.syncBtn.disabled =
-    busy || !runtimeReady || !hasSelection(selectedRef) || !hasSelection(selectedIn);
+    busy || !runtimeReady || !hasSelection(selectedRef) || selectedIns.length === 0;
   if (!busy) {
     els.syncBtn.textContent = i18n.t("form.syncBtn");
   } else if (lastSyncProgress && lastSyncProgress.messageKey) {
@@ -873,19 +1019,161 @@ function setReference(entry) {
   refreshSyncBtn();
 }
 
-function setInputSubtitle(entry, { forceAutoOut = false } = {}) {
-  if (!entry) return;
-  selectedIn = entry.value;
-  els.inPath.value = entry.display;
-  if (
-    adapter.capabilities.outputPath &&
-    adapter.suggestOutputPath &&
-    (forceAutoOut || !els.outPath.value.trim() || els.outPath.dataset.auto === "1")
-  ) {
-    els.outPath.value = adapter.suggestOutputPath(entry.value);
-    els.outPath.dataset.auto = "1";
+function createRemoveIconSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2.2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const p1 = document.createElementNS(ns, "path");
+  p1.setAttribute("d", "M18 6 6 18");
+  const p2 = document.createElementNS(ns, "path");
+  p2.setAttribute("d", "m6 6 12 12");
+  svg.appendChild(p1);
+  svg.appendChild(p2);
+  return svg;
+}
+
+function setBrowseSplitMenuOpen(open) {
+  if (!els.browseInSplit || !els.browseInMenu || !els.browseInMenuBtn) return;
+  const isOpen = Boolean(open);
+  if (isOpen) {
+    closeAllCustomSelects();
+  }
+  els.browseInSplit.classList.toggle("is-open", isOpen);
+  els.browseInMenu.hidden = !isOpen;
+  els.browseInMenuBtn.setAttribute("aria-expanded", String(isOpen));
+}
+
+function updateBrowseInSplitUi() {
+  const hasFiles = selectedIns.length > 0;
+  if (els.browseIn) {
+    els.browseIn.textContent = hasFiles ? i18n.t("form.addMore") : i18n.t("form.browse");
+  }
+  if (els.browseInOptAdd) {
+    els.browseInOptAdd.hidden = !hasFiles;
+    els.browseInOptAdd.classList.toggle("is-default", hasFiles);
+  }
+  if (els.browseInOptFiles) {
+    els.browseInOptFiles.classList.toggle("is-default", !hasFiles);
+  }
+  if (els.browseInOptFilesLabel) {
+    els.browseInOptFilesLabel.textContent = hasFiles
+      ? i18n.t("form.menuReplaceFiles")
+      : i18n.t("form.menuSelectFiles");
+  }
+}
+
+function renderInputSubtitlesUI({ forceAutoOut = false } = {}) {
+  const count = selectedIns.length;
+  const editable = Boolean(adapter && adapter.capabilities && adapter.capabilities.editablePaths);
+  const supportsOut = Boolean(adapter && adapter.capabilities && adapter.capabilities.outputPath);
+
+  updateBrowseInSplitUi();
+
+  if (count === 0) {
+    els.inPath.value = "";
+    els.inPath.readOnly = !editable;
+    if (els.multiInPanel) els.multiInPanel.hidden = true;
+    if (els.outField) els.outField.hidden = !supportsOut;
+  } else if (count === 1) {
+    const single = selectedIns[0];
+    els.inPath.value = single.display;
+    els.inPath.readOnly = !editable;
+    if (els.multiInPanel) els.multiInPanel.hidden = true;
+    if (els.outField) els.outField.hidden = !supportsOut;
+    if (
+      supportsOut &&
+      adapter.suggestOutputPath &&
+      typeof single.value === "string" &&
+      (forceAutoOut || !els.outPath.value.trim() || els.outPath.dataset.auto === "1")
+    ) {
+      els.outPath.value = adapter.suggestOutputPath(single.value);
+      els.outPath.dataset.auto = "1";
+    }
+  } else {
+    els.inPath.value = i18n.t("form.multiSelectedSummary", { count });
+    els.inPath.readOnly = true;
+    if (els.outField) els.outField.hidden = true;
+    if (els.multiInPanel) els.multiInPanel.hidden = false;
+    if (els.multiInCount) {
+      els.multiInCount.textContent = i18n.t("form.multiQueueCount", { count });
+    }
+    if (els.multiInList) {
+      els.multiInList.innerHTML = "";
+      selectedIns.forEach((item, idx) => {
+        const li = document.createElement("li");
+        li.className = "multi-in-item";
+
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "multi-in-name";
+        nameSpan.textContent = item.name;
+        nameSpan.title = typeof item.value === "string" ? item.value : item.display;
+
+        const rmBtn = document.createElement("button");
+        rmBtn.type = "button";
+        rmBtn.className = "multi-in-remove";
+        const rmLabel = i18n.t("form.removeItem", { name: item.name });
+        rmBtn.title = rmLabel;
+        rmBtn.setAttribute("aria-label", rmLabel);
+        rmBtn.appendChild(createRemoveIconSvg());
+        rmBtn.addEventListener("click", () => {
+          selectedIns.splice(idx, 1);
+          renderInputSubtitlesUI({ forceAutoOut: selectedIns.length === 1 });
+        });
+
+        li.appendChild(nameSpan);
+        li.appendChild(rmBtn);
+        els.multiInList.appendChild(li);
+      });
+    }
   }
   refreshSyncBtn();
+}
+
+function setInputSubtitles(entries, { append = false, forceAutoOut = false } = {}) {
+  const list = Array.isArray(entries) ? entries : (entries ? [entries] : []);
+  const normalized = list.map(normalizeSubtitleEntry).filter(Boolean);
+  if (!normalized.length) {
+    if (!append) {
+      selectedIns = [];
+      renderInputSubtitlesUI({ forceAutoOut });
+    }
+    return;
+  }
+  if (append && selectedIns.length > 0) {
+    const seen = new Set(selectedIns.map((x) => x.key));
+    for (const item of normalized) {
+      if (!seen.has(item.key)) {
+        seen.add(item.key);
+        selectedIns.push(item);
+      }
+    }
+  } else {
+    const seen = new Set();
+    selectedIns = [];
+    for (const item of normalized) {
+      if (!seen.has(item.key)) {
+        seen.add(item.key);
+        selectedIns.push(item);
+      }
+    }
+  }
+  renderInputSubtitlesUI({ forceAutoOut });
+}
+
+function setInputSubtitle(entry, { forceAutoOut = false, append = false } = {}) {
+  if (!entry) return;
+  setInputSubtitles(Array.isArray(entry) ? entry : [entry], { append, forceAutoOut });
+}
+
+function showInputError(message) {
+  if (!message) return;
+  renderResult({ ok: false, error: message }, { scroll: false });
 }
 
 function renderFfmpegDir(info) {
@@ -1085,12 +1373,12 @@ function hasQualityWarning(quality) {
   return false;
 }
 
-function renderQualityBadges(quality, { resetOpen = false } = {}) {
-  const container = els.resultQuality;
+function renderQualityBadgesInto(
+  container,
+  quality,
+  { getOpenPanel, setOpenPanel, idPrefix = "quality-panel" } = {},
+) {
   if (!container) return;
-  if (resetOpen) {
-    openQualityPanel = null;
-  }
   if (!quality || typeof quality !== "object" || (!quality.sync && !quality.subtitle)) {
     container.innerHTML = "";
     container.hidden = true;
@@ -1106,9 +1394,10 @@ function renderQualityBadges(quality, { resetOpen = false } = {}) {
   const items = [];
 
   function syncAccordionState() {
+    const currentOpen = getOpenPanel ? getOpenPanel() : null;
     let anyOpen = false;
     for (const item of items) {
-      const active = openQualityPanel === item.key;
+      const active = currentOpen === item.key;
       item.btn.setAttribute("aria-expanded", String(active));
       item.panel.hidden = !active;
       if (active) anyOpen = true;
@@ -1116,6 +1405,7 @@ function renderQualityBadges(quality, { resetOpen = false } = {}) {
     panelsWrap.hidden = !anyOpen;
   }
 
+  const currentOpen = getOpenPanel ? getOpenPanel() : null;
   for (const spec of QUALITY_BADGE_SPECS) {
     const group = quality[spec.key];
     if (!group || typeof group !== "object" || !Number.isFinite(Number(group.score))) {
@@ -1124,10 +1414,9 @@ function renderQualityBadges(quality, { resetOpen = false } = {}) {
     const score = clampScore(group.score);
     const hasLowMetric = groupHasLowMetric(spec, group);
     const tier = hasLowMetric && score >= 75 ? "tier-warn" : scoreTierClass(score);
-    const isOpen = openQualityPanel === spec.key;
-    const panelId = `quality-panel-${spec.key}`;
+    const isOpen = currentOpen === spec.key;
+    const panelId = `${idPrefix}-${spec.key}`;
 
-    // Badge toggle button
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = `quality-badge-btn ${tier}`;
@@ -1150,7 +1439,6 @@ function renderQualityBadges(quality, { resetOpen = false } = {}) {
     btn.appendChild(scoreEl);
     btn.appendChild(createChevronSvg());
 
-    // Collapsible horizontal-axis breakdown panel
     const panel = document.createElement("div");
     panel.id = panelId;
     panel.className = "quality-panel";
@@ -1248,8 +1536,10 @@ function renderQualityBadges(quality, { resetOpen = false } = {}) {
 
     panel.appendChild(list);
 
-    btn.addEventListener("click", () => {
-      openQualityPanel = openQualityPanel === spec.key ? null : spec.key;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const next = (getOpenPanel ? getOpenPanel() : null) === spec.key ? null : spec.key;
+      if (setOpenPanel) setOpenPanel(next);
       syncAccordionState();
     });
 
@@ -1269,9 +1559,311 @@ function renderQualityBadges(quality, { resetOpen = false } = {}) {
   container.hidden = false;
 }
 
+function renderQualityBadges(quality, { resetOpen = false } = {}) {
+  if (resetOpen) {
+    openQualityPanel = null;
+  }
+  renderQualityBadgesInto(els.resultQuality, quality, {
+    getOpenPanel: () => openQualityPanel,
+    setOpenPanel: (next) => {
+      openQualityPanel = next;
+    },
+    idPrefix: "quality-panel",
+  });
+}
+
+function createDownloadIconSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const p = document.createElementNS(ns, "path");
+  p.setAttribute("d", "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4");
+  const poly = document.createElementNS(ns, "polyline");
+  poly.setAttribute("points", "7 10 12 15 17 10");
+  const line = document.createElementNS(ns, "line");
+  line.setAttribute("x1", "12");
+  line.setAttribute("x2", "12");
+  line.setAttribute("y1", "15");
+  line.setAttribute("y2", "3");
+  svg.appendChild(p);
+  svg.appendChild(poly);
+  svg.appendChild(line);
+  return svg;
+}
+
+function createFolderIconSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  const p = document.createElementNS(ns, "path");
+  p.setAttribute(
+    "d",
+    "m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2",
+  );
+  svg.appendChild(p);
+  return svg;
+}
+
+function renderRankingResult(res, { isNewResult = false, scroll = true } = {}) {
+  if (isNewResult) {
+    expandedRankingId = null;
+    rankingQualityTabs.clear();
+    savedCandidatePaths.clear();
+  }
+  if (els.resultSingle) els.resultSingle.hidden = true;
+  if (els.resultRanking) els.resultRanking.hidden = false;
+
+  const cands = Array.isArray(res.candidates) ? res.candidates : [];
+  const winner = cands[0] || null;
+  const anySavedCapable = cands.some((c) => c.can_save);
+  const topWarn =
+    winner &&
+    (!winner.ok || hasQualityWarning(winner.quality) || clampScore(winner.overall_score) < 75);
+
+  els.result.classList.toggle("error", !anySavedCapable);
+  els.result.classList.toggle("warning", Boolean(anySavedCapable && topWarn));
+
+  if (els.rankingTitle) {
+    els.rankingTitle.textContent = i18n.t("result.rankingTitle", { count: cands.length });
+  }
+  if (els.rankingMeta) {
+    const elapsed =
+      typeof res.elapsed_seconds === "number" && Number.isFinite(res.elapsed_seconds)
+        ? i18n.t("result.completedIn", { seconds: res.elapsed_seconds.toFixed(2) })
+        : i18n.t("result.completed");
+    els.rankingMeta.textContent = res.ref_cached
+      ? `${elapsed} · ${i18n.t("result.reusedAudio")}`
+      : elapsed;
+  }
+
+  const listEl = els.rankingList;
+  if (!listEl) return;
+  listEl.innerHTML = "";
+
+  const isDesktopSave = Boolean(adapter && typeof adapter.saveCandidate === "function");
+
+  for (const cand of cands) {
+    const candId = String(cand.id || cand.rank);
+    const hasErr = Boolean(cand.error);
+    const isWinner = cand.rank === 1 && !hasErr && cand.can_save;
+    const overall = clampScore(cand.overall_score);
+    const overallTier = hasErr ? "tier-err" : scoreTierClass(overall);
+    const isWinnerWarn = isWinner && (!cand.ok || overall < 75 || hasQualityWarning(cand.quality));
+    const isExpanded = !hasErr && expandedRankingId === candId;
+
+    const itemEl = document.createElement("div");
+    itemEl.className = "ranking-item";
+    if (isWinner) itemEl.classList.add("is-winner");
+    if (isWinnerWarn) itemEl.classList.add("is-warn");
+    if (hasErr) itemEl.classList.add("is-failed");
+    if (isExpanded) itemEl.classList.add("is-expanded");
+
+    const rowEl = document.createElement("div");
+    rowEl.className = "ranking-row";
+    if (!hasErr && cand.quality) {
+      rowEl.setAttribute("role", "button");
+      rowEl.tabIndex = 0;
+      rowEl.setAttribute("aria-expanded", String(isExpanded));
+      rowEl.title = i18n.t("result.expandDetails");
+    }
+
+    const rankEl = document.createElement("span");
+    rankEl.className = "ranking-rank";
+    rankEl.textContent = `#${cand.rank}`;
+
+    const infoEl = document.createElement("div");
+    infoEl.className = "ranking-info";
+
+    const nameRow = document.createElement("div");
+    nameRow.className = "ranking-name-row";
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "ranking-name";
+    nameEl.textContent = cand.input_name || basenameOf(cand.input_path) || "subtitle";
+    nameEl.title = cand.input_path || cand.input_name || "";
+    nameRow.appendChild(nameEl);
+
+    if (isWinner && !isWinnerWarn) {
+      const tag = document.createElement("span");
+      tag.className = "ranking-tag";
+      tag.textContent = i18n.t("result.bestMatch");
+      nameRow.appendChild(tag);
+    } else if (!hasErr && !cand.ok) {
+      const tag = document.createElement("span");
+      tag.className = "ranking-tag warn";
+      tag.textContent = i18n.t("result.lowConfidence");
+      nameRow.appendChild(tag);
+    }
+
+    const subMetaEl = document.createElement("div");
+    subMetaEl.className = "ranking-submeta";
+    if (hasErr) {
+      subMetaEl.textContent = cand.error;
+    } else if (cand.offset_seconds !== null && cand.offset_seconds !== undefined) {
+      subMetaEl.textContent = formatResultSummary(cand);
+    }
+
+    infoEl.appendChild(nameRow);
+    infoEl.appendChild(subMetaEl);
+
+    const scoresEl = document.createElement("div");
+    scoresEl.className = "ranking-scores";
+
+    if (!hasErr && cand.quality) {
+      const overallPill = document.createElement("span");
+      overallPill.className = `score-pill ${overallTier}`;
+      overallPill.textContent = `${overall}/100`;
+      overallPill.title = i18n.t("result.overallLabel");
+      scoresEl.appendChild(overallPill);
+    }
+
+    const actionsEl = document.createElement("div");
+    actionsEl.className = "ranking-actions";
+
+    if (cand.can_save) {
+      if (isDesktopSave) {
+        const savedPath = savedCandidatePaths.get(candId) || null;
+        const saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.className = `${isWinner ? "primary" : "secondary"} ranking-save-btn`;
+        saveBtn.appendChild(createDownloadIconSvg());
+        const saveLabel = document.createElement("span");
+        saveLabel.textContent = savedPath ? i18n.t("result.saved") : i18n.t("result.save");
+        saveBtn.appendChild(saveLabel);
+
+        const openBtn = document.createElement("button");
+        openBtn.type = "button";
+        openBtn.className = "secondary ranking-open-btn";
+        openBtn.title = i18n.t("result.openFolder");
+        openBtn.setAttribute("aria-label", i18n.t("result.openFolder"));
+        openBtn.appendChild(createFolderIconSvg());
+        openBtn.hidden = !savedPath;
+        openBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const p = savedCandidatePaths.get(candId);
+          if (p && adapter.openOutput) adapter.openOutput({ output_path: p });
+        });
+
+        saveBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          saveBtn.disabled = true;
+          try {
+            const saveRes = await adapter.saveCandidate(cand);
+            if (saveRes && saveRes.saved && saveRes.path) {
+              savedCandidatePaths.set(candId, saveRes.path);
+              saveLabel.textContent = i18n.t("result.saved");
+              openBtn.hidden = false;
+            } else if (saveRes && saveRes.error) {
+              alert(i18n.t("errors.saveFailed", { error: saveRes.error }));
+            }
+          } finally {
+            saveBtn.disabled = false;
+          }
+        });
+
+        actionsEl.appendChild(saveBtn);
+        actionsEl.appendChild(openBtn);
+      } else if (cand.download_url) {
+        const dl = document.createElement("a");
+        dl.className = `btn ${isWinner ? "primary" : "secondary"} ranking-save-btn`;
+        dl.href = cand.download_url;
+        dl.download = cand.download_name || cand.output_name || "synced.srt";
+        dl.appendChild(createDownloadIconSvg());
+        const dlLabel = document.createElement("span");
+        dlLabel.textContent = i18n.t("result.download");
+        dl.appendChild(dlLabel);
+        dl.addEventListener("click", (e) => e.stopPropagation());
+        actionsEl.appendChild(dl);
+      }
+    }
+
+    rowEl.appendChild(rankEl);
+    rowEl.appendChild(infoEl);
+    rowEl.appendChild(scoresEl);
+    rowEl.appendChild(actionsEl);
+    if (!hasErr && cand.quality) {
+      const chev = createChevronSvg();
+      chev.setAttribute("class", "ranking-chevron");
+      rowEl.appendChild(chev);
+    } else {
+      const spacer = document.createElement("span");
+      spacer.className = "ranking-chevron-spacer";
+      spacer.setAttribute("aria-hidden", "true");
+      rowEl.appendChild(spacer);
+    }
+    itemEl.appendChild(rowEl);
+
+    if (!hasErr && cand.quality) {
+      const detailsEl = document.createElement("div");
+      detailsEl.className = "ranking-details";
+      detailsEl.hidden = !isExpanded;
+
+      const qualityBox = document.createElement("div");
+      qualityBox.className = "quality-section";
+      detailsEl.appendChild(qualityBox);
+      itemEl.appendChild(detailsEl);
+
+      const renderDetails = () => {
+        if (!rankingQualityTabs.has(candId)) {
+          rankingQualityTabs.set(candId, "sync");
+        }
+        renderQualityBadgesInto(qualityBox, cand.quality, {
+          getOpenPanel: () => rankingQualityTabs.get(candId) ?? null,
+          setOpenPanel: (next) => rankingQualityTabs.set(candId, next),
+          idPrefix: `ranking-q-${candId}`,
+        });
+      };
+
+      if (isExpanded) {
+        renderDetails();
+      }
+
+      const toggleExpand = () => {
+        const willOpen = expandedRankingId !== candId;
+        expandedRankingId = willOpen ? candId : null;
+        if (willOpen && !rankingQualityTabs.has(candId)) {
+          rankingQualityTabs.set(candId, "sync");
+        }
+        renderRankingResult(res, { isNewResult: false, scroll: false });
+      };
+
+      rowEl.addEventListener("click", toggleExpand);
+      rowEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggleExpand();
+        }
+      });
+    }
+
+    listEl.appendChild(itemEl);
+  }
+
+  els.result.hidden = false;
+  if (scroll) scrollToResultTop();
+}
+
 function renderResult(res, { scroll = true } = {}) {
   const isNewResult = res !== lastResult;
   lastResult = res;
+  if (res && res.multi_mode && Array.isArray(res.candidates) && res.candidates.length > 0) {
+    renderRankingResult(res, { isNewResult, scroll });
+    return;
+  }
+  if (els.resultSingle) els.resultSingle.hidden = false;
+  if (els.resultRanking) els.resultRanking.hidden = true;
   if (!res || !res.ok) {
     els.result.classList.add("error");
     els.result.classList.remove("warning");
@@ -1297,13 +1889,18 @@ function renderResult(res, { scroll = true } = {}) {
     typeof res.elapsed_seconds === "number" && Number.isFinite(res.elapsed_seconds)
       ? i18n.t("result.completedIn", { seconds: res.elapsed_seconds.toFixed(2) })
       : i18n.t("result.completed");
+  const elapsedLabel = res.ref_cached ? `${elapsed} · ${i18n.t("result.reusedAudio")}` : elapsed;
 
   if (adapter.capabilities.outputPath) {
-    els.resultMeta.textContent = res.output_label ? `${elapsed} → ${res.output_label}` : elapsed;
+    els.resultMeta.textContent = res.output_label
+      ? `${elapsedLabel} → ${res.output_label}`
+      : elapsedLabel;
     els.resultActionBtn.hidden = !res.output_path;
     els.downloadLink.hidden = true;
   } else {
-    els.resultMeta.textContent = res.output_label ? `${elapsed} · ${res.output_label}` : elapsed;
+    els.resultMeta.textContent = res.output_label
+      ? `${elapsedLabel} · ${res.output_label}`
+      : elapsedLabel;
     els.resultActionBtn.hidden = true;
     if (res.download_url) {
       els.downloadLink.href = res.download_url;
@@ -1320,7 +1917,7 @@ function renderResult(res, { scroll = true } = {}) {
 
 function resetFormState() {
   selectedRef = null;
-  selectedIn = null;
+  selectedIns = [];
   lastStreamProbe = null;
   els.refPath.value = "";
   els.inPath.value = "";
@@ -1328,12 +1925,14 @@ function resetFormState() {
   els.outPath.dataset.auto = "1";
   els.refFile.value = "";
   els.inputFile.value = "";
+  if (els.inputFolder) els.inputFolder.value = "";
   resetStreamSelectToAuto();
   els.streamWrap.hidden = true;
   if (els.vadMode.options.length > 0) els.vadMode.selectedIndex = 0;
   els.splitMode.value = "auto";
   els.noFixFramerate.checked = false;
   els.gss.checked = false;
+  renderInputSubtitlesUI();
   fitAllSelectOptions();
   refreshSyncBtn();
 }
@@ -1432,6 +2031,7 @@ function applyLanguageToUi() {
     resetStreamSelectToAuto();
   }
 
+  renderInputSubtitlesUI();
   refreshSyncBtn();
 
   if (lastResult && !els.result.hidden) {
@@ -1617,20 +2217,101 @@ function wireEvents(ad) {
         zone.classList.remove("drag-over");
       }
     });
-    zone.addEventListener("drop", (e) => {
+    zone.addEventListener("drop", async (e) => {
       zone.classList.remove("drag-over");
       if (!capabilities.editablePaths) {
         e.preventDefault();
-        const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-        if (!file) return;
-        const display = ad.formatFileDisplay ? ad.formatFileDisplay(file) : file.name;
         if (target === "ref") {
+          const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+          if (!file) return;
+          const display = ad.formatFileDisplay ? ad.formatFileDisplay(file) : file.name;
           setReference({ value: file, display });
         } else {
-          setInputSubtitle({ value: file, display });
+          const { files, hadDir } = await extractWebDroppedSubtitles(e.dataTransfer, selectedRef);
+          if (!files.length) {
+            if (hadDir) showInputError(i18n.t("errors.noSubsInFolder"));
+            return;
+          }
+          setInputSubtitles(
+            files.map((f) => ({
+              value: f,
+              display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
+            })),
+            { append: false },
+          );
         }
       }
     });
+  }
+
+  if (els.clearInBtn) {
+    els.clearInBtn.addEventListener("click", () => {
+      selectedIns = [];
+      els.inputFile.value = "";
+      if (els.inputFolder) els.inputFolder.value = "";
+      renderInputSubtitlesUI();
+    });
+  }
+
+  const pickSubtitleFiles = async ({ append = false } = {}) => {
+    setBrowseSplitMenuOpen(false);
+    if (!capabilities.editablePaths) {
+      appendNextWebPick = append;
+      els.inputFile.click();
+      return;
+    }
+    const entries = await ad.pickSubtitle();
+    if (entries) {
+      setInputSubtitles(entries, { append, forceAutoOut: !append });
+    }
+  };
+
+  const pickSubtitleFolderAction = async () => {
+    setBrowseSplitMenuOpen(false);
+    if (!capabilities.editablePaths) {
+      if (els.inputFolder) els.inputFolder.click();
+      return;
+    }
+    if (typeof ad.pickSubtitleFolder === "function") {
+      const res = await ad.pickSubtitleFolder(typeof selectedRef === "string" ? selectedRef : null);
+      if (!res) return;
+      if (res.error) {
+        showInputError(res.error);
+        return;
+      }
+      if (res.entries && res.entries.length) {
+        setInputSubtitles(res.entries, { append: false, forceAutoOut: true });
+      }
+    }
+  };
+
+  // Unified split button: defaults to "Browse…" (replace) when empty and "+ Add" (append) when files exist.
+  if (els.browseIn) {
+    els.browseIn.addEventListener("click", () => {
+      pickSubtitleFiles({ append: selectedIns.length > 0 });
+    });
+  }
+  if (els.browseInMenuBtn && els.browseInMenu) {
+    els.browseInMenuBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const willOpen = els.browseInMenu.hidden;
+      setBrowseSplitMenuOpen(willOpen);
+    });
+    document.addEventListener("mousedown", (e) => {
+      if (els.browseInSplit && !els.browseInSplit.contains(e.target)) {
+        setBrowseSplitMenuOpen(false);
+      }
+    });
+    window.addEventListener("blur", () => setBrowseSplitMenuOpen(false));
+  }
+  if (els.browseInOptAdd) {
+    els.browseInOptAdd.addEventListener("click", () => pickSubtitleFiles({ append: true }));
+  }
+  if (els.browseInOptFiles) {
+    els.browseInOptFiles.addEventListener("click", () => pickSubtitleFiles({ append: false }));
+  }
+  if (els.browseInOptFolder) {
+    els.browseInOptFolder.addEventListener("click", () => pickSubtitleFolderAction());
   }
 
   if (!capabilities.editablePaths) {
@@ -1642,17 +2323,41 @@ function wireEvents(ad) {
       setReference({ value: file, display });
     });
     els.inputFile.addEventListener("change", () => {
-      const file = els.inputFile.files && els.inputFile.files[0];
-      if (!file) return;
-      const display = ad.formatFileDisplay ? ad.formatFileDisplay(file) : file.name;
-      setInputSubtitle({ value: file, display });
+      const files = Array.from(els.inputFile.files || []);
+      const append = appendNextWebPick;
+      appendNextWebPick = false;
+      if (!files.length) return;
+      setInputSubtitles(
+        files.map((f) => ({
+          value: f,
+          display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
+        })),
+        { append },
+      );
+      els.inputFile.value = "";
     });
+    if (els.inputFolder) {
+      els.inputFolder.addEventListener("change", () => {
+        const files = filterWebFolderFiles(els.inputFolder.files, selectedRef);
+        els.inputFolder.value = "";
+        if (!files.length) {
+          showInputError(i18n.t("errors.noSubsInFolder"));
+          return;
+        }
+        setInputSubtitles(
+          files.map((f) => ({
+            value: f,
+            display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
+          })),
+          { append: false },
+        );
+      });
+    }
 
-    // Clicking readonly display fields or Browse buttons opens the browser file picker.
+    // Clicking readonly display fields or Browse button opens the browser file picker.
     els.refPath.addEventListener("click", () => els.refFile.click());
-    els.inPath.addEventListener("click", () => els.inputFile.click());
+    els.inPath.addEventListener("click", () => pickSubtitleFiles({ append: selectedIns.length > 0 }));
     els.browseRef.addEventListener("click", () => els.refFile.click());
-    els.browseIn.addEventListener("click", () => els.inputFile.click());
   } else {
     // Desktop editable path fields + native dialogs.
     els.refPath.addEventListener("input", () => {
@@ -1664,8 +2369,10 @@ function wireEvents(ad) {
     els.refPath.addEventListener("change", () => refreshStreams(els.refPath.value.trim()));
 
     els.inPath.addEventListener("input", () => {
+      if (selectedIns.length > 1) return;
       const val = els.inPath.value.trim();
-      selectedIn = val;
+      selectedIns = val ? [normalizeSubtitleEntry({ value: val, display: val })] : [];
+      updateBrowseInSplitUi();
       if (
         capabilities.outputPath &&
         ad.suggestOutputPath &&
@@ -1677,6 +2384,24 @@ function wireEvents(ad) {
       refreshSyncBtn();
     });
 
+    els.inPath.addEventListener("change", async () => {
+      if (selectedIns.length > 1) return;
+      const val = els.inPath.value.trim();
+      if (!val || typeof ad.resolveSubtitleInputs !== "function") return;
+      const res = await ad.resolveSubtitleInputs([val], typeof selectedRef === "string" ? selectedRef : null);
+      if (res && res.error) {
+        showInputError(res.error);
+        return;
+      }
+      if (
+        res &&
+        Array.isArray(res.entries) &&
+        (res.entries.length > 1 || (res.entries.length === 1 && res.entries[0].value !== val))
+      ) {
+        setInputSubtitles(res.entries, { append: false, forceAutoOut: true });
+      }
+    });
+
     els.outPath.addEventListener("input", () => {
       els.outPath.dataset.auto = "0";
     });
@@ -1686,15 +2411,11 @@ function wireEvents(ad) {
       if (entry) setReference(entry);
     });
 
-    els.browseIn.addEventListener("click", async () => {
-      const entry = await ad.pickSubtitle();
-      if (entry) setInputSubtitle(entry, { forceAutoOut: true });
-    });
-
     els.browseOut.addEventListener("click", async () => {
+      const singleIn = selectedIns.length === 1 ? selectedIns[0].value : null;
       const fallback =
-        ad.suggestOutputPath && typeof selectedIn === "string"
-          ? ad.suggestOutputPath(selectedIn)
+        ad.suggestOutputPath && typeof singleIn === "string"
+          ? ad.suggestOutputPath(singleIn)
           : "";
       const p = await ad.pickOutput(els.outPath.value.trim() || fallback);
       if (p) {
@@ -1717,6 +2438,11 @@ function wireEvents(ad) {
     }
     window.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
+        if (els.browseInMenu && !els.browseInMenu.hidden) {
+          setBrowseSplitMenuOpen(false);
+          if (els.browseInMenuBtn) els.browseInMenuBtn.focus();
+          return;
+        }
         if (_openCustomSelect) {
           closeCustomSelect(_openCustomSelect, { restoreFocus: true });
           return;
@@ -1774,7 +2500,7 @@ function wireEvents(ad) {
   }
 
   els.syncBtn.addEventListener("click", async () => {
-    if (busy || !runtimeReady || !hasSelection(selectedRef) || !hasSelection(selectedIn)) return;
+    if (busy || !runtimeReady || !hasSelection(selectedRef) || selectedIns.length === 0) return;
     busy = true;
     lastSyncProgress = { messageKey: "form.startingSync", messageParams: null };
     refreshSyncBtn();
@@ -1784,11 +2510,16 @@ function wireEvents(ad) {
     setProgressBar(els.syncProg, els.syncFill, els.syncPct, { active: true, fraction: null });
 
     const [vad, fr] = (els.vadMode.value || "webrtc:16000").split(":");
+    const isMulti = selectedIns.length > 1;
+    const inputs = selectedIns.map((item) =>
+      typeof item.value === "string" ? item.value.trim() : item.value,
+    );
     let outPath = "";
-    if (capabilities.outputPath) {
+    if (capabilities.outputPath && !isMulti) {
+      const singleIn = inputs[0];
       const suggested =
-        ad.suggestOutputPath && typeof selectedIn === "string"
-          ? ad.suggestOutputPath(selectedIn)
+        ad.suggestOutputPath && typeof singleIn === "string"
+          ? ad.suggestOutputPath(singleIn)
           : "";
       outPath = els.outPath.value.trim() || suggested;
       els.outPath.value = outPath;
@@ -1802,7 +2533,8 @@ function wireEvents(ad) {
       res = await ad.sync(
         {
           ref: typeof selectedRef === "string" ? selectedRef.trim() : selectedRef,
-          input: typeof selectedIn === "string" ? selectedIn.trim() : selectedIn,
+          input: inputs[0],
+          inputs,
           outPath,
           vad,
           frameRate: Number(fr),
@@ -1862,9 +2594,11 @@ async function boot() {
         if (target === "ref") {
           setReference(entry);
         } else if (target === "in") {
-          setInputSubtitle(entry);
+          setInputSubtitles(entry, { append: false, forceAutoOut: true });
         }
       },
+      onInputError: (msg) => showInputError(msg),
+      getCurrentReference: () => (typeof selectedRef === "string" ? selectedRef : null),
       onWindowMaximizedChange: syncMaximizedState,
       onAppVersion: applyAppVersion,
       onAlignmentProfileInit: (profile) =>

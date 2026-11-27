@@ -131,6 +131,14 @@ function mapWorkerMessage(raw) {
       message: capitalize(s),
     };
   }
+  const mSub = /^analyzing subtitle (\d+)\/(\d+) \((.+)\)/i.exec(s);
+  if (mSub) {
+    return {
+      messageKey: "progress.analyzingSubtitle",
+      messageParams: { cur: Number(mSub[1]), tot: Number(mSub[2]), name: mSub[3] },
+      message: capitalize(s),
+    };
+  }
   return { messageKey: null, messageParams: null, message: capitalize(s) };
 }
 
@@ -146,9 +154,39 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
   let configPromise = null;
   let ffmpegModPromise = null;
   let pendingSync = null;
+  let pendingPrepare = null;
   let lastBlobUrl = null;
+  let multiBlobUrls = [];
+  let cachedRefKey = null;
+  let cachedRefVideoFps = null;
   let lastRuntimeState = null;
   const probeCache = new WeakMap();
+
+  function revokeAllBlobUrls() {
+    if (lastBlobUrl) {
+      URL.revokeObjectURL(lastBlobUrl);
+      lastBlobUrl = null;
+    }
+    if (multiBlobUrls.length) {
+      for (const u of multiBlobUrls) {
+        URL.revokeObjectURL(u);
+      }
+      multiBlobUrls = [];
+    }
+  }
+
+  function buildRefCacheKey(refFile, request) {
+    if (!(refFile instanceof File)) return null;
+    return [
+      refFile.name,
+      refFile.size,
+      refFile.lastModified,
+      String(request.vad || ""),
+      String(request.frameRate || ""),
+      String(request.refStream || ""),
+      String(request.refStreamKind || ""),
+    ].join("|");
+  }
 
   function emitRuntimeState(stateObj) {
     lastRuntimeState = stateObj;
@@ -163,6 +201,12 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
   }
 
   function finishPending(result) {
+    if (pendingPrepare) {
+      const prep = pendingPrepare;
+      pendingPrepare = null;
+      prep.resolve(result);
+      return;
+    }
     if (!pendingSync) return;
     const current = pendingSync;
     pendingSync = null;
@@ -202,6 +246,14 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
     const [baseFrac, endFrac] = range;
     return new Promise((resolve) => {
       pendingSync = { resolve, onProgress, t0, baseFrac, endFrac };
+      worker.postMessage(message, transferables);
+    });
+  }
+
+  function postWorkerPrepare(message, transferables, onProgress, range = [0, 1]) {
+    const [baseFrac, endFrac] = range;
+    return new Promise((resolve) => {
+      pendingPrepare = { resolve, onProgress, baseFrac, endFrac };
       worker.postMessage(message, transferables);
     });
   }
@@ -287,20 +339,21 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       worker.onmessage = (event) => {
         const msg = event.data || {};
         if (msg.type === "progress") {
-          if (pendingSync && pendingSync.onProgress) {
+          const active = pendingPrepare || pendingSync;
+          if (active && active.onProgress) {
             const raw = Number(msg.fraction);
             const scaled = Number.isFinite(raw)
               ? Math.max(
                   0,
                   Math.min(
                     1,
-                    pendingSync.baseFrac +
-                      (pendingSync.endFrac - pendingSync.baseFrac) * Math.max(0, Math.min(1, raw)),
+                    active.baseFrac +
+                      (active.endFrac - active.baseFrac) * Math.max(0, Math.min(1, raw)),
                   ),
                 )
               : null;
             const mapped = mapWorkerMessage(msg.message);
-            pendingSync.onProgress({
+            active.onProgress({
               message: mapped.message,
               messageKey: mapped.messageKey,
               messageParams: mapped.messageParams,
@@ -309,8 +362,9 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           }
         } else if (msg.type === "status") {
           const mapped = mapWorkerMessage(msg.status);
-          if (pendingSync && pendingSync.onProgress) {
-            pendingSync.onProgress({
+          const active = pendingPrepare || pendingSync;
+          if (active && active.onProgress) {
+            active.onProgress({
               message: mapped.message,
               messageKey: mapped.messageKey,
               messageParams: mapped.messageParams,
@@ -326,6 +380,12 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
               ready: false,
             });
           }
+        } else if (msg.type === "prepared") {
+          if (pendingPrepare) {
+            const prep = pendingPrepare;
+            pendingPrepare = null;
+            prep.resolve(msg.result || { ok: false, error: "prepare failed" });
+          }
         } else if (msg.type === "ready") {
           engineReady = true;
           workerCaps = msg.capabilities || workerCaps;
@@ -339,6 +399,37 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         } else if (msg.type === "result") {
           const raw = msg.result || {};
           const elapsed = pendingSync ? (performance.now() - pendingSync.t0) / 1000 : 0;
+          if (raw.multi_mode) {
+            revokeAllBlobUrls();
+            const cands = Array.isArray(raw.candidates)
+              ? raw.candidates.map((c) => {
+                  let downloadUrl = null;
+                  const outName = c.output_name || "synced.srt";
+                  if (c.can_save && c.output_text) {
+                    const blob = new Blob([c.output_text], {
+                      type: subtitleMimeType(outName),
+                    });
+                    downloadUrl = URL.createObjectURL(blob);
+                    multiBlobUrls.push(downloadUrl);
+                  }
+                  return {
+                    ...c,
+                    output_text: undefined,
+                    download_url: downloadUrl,
+                    download_name: outName,
+                  };
+                })
+              : [];
+            finishPending({
+              ok: Boolean(raw.ok),
+              multi_mode: true,
+              candidates: cands,
+              elapsed_seconds: elapsed,
+              error: raw.error || (raw.ok ? null : t("errors.allCandidatesFailed")),
+              error_key: raw.ok ? null : "errors.allCandidatesFailed",
+            });
+            return;
+          }
           if (!raw.ok) {
             finishPending({
               ok: false,
@@ -348,10 +439,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             });
             return;
           }
-          if (lastBlobUrl) {
-            URL.revokeObjectURL(lastBlobUrl);
-            lastBlobUrl = null;
-          }
+          revokeAllBlobUrls();
           const outName = raw.output_name || "synced.srt";
           const blob = new Blob([raw.output_text || ""], {
             type: subtitleMimeType(outName),
@@ -359,6 +447,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           lastBlobUrl = URL.createObjectURL(blob);
           finishPending({
             ok: true,
+            multi_mode: false,
             offset_seconds: raw.offset_seconds,
             framerate_scale_factor: raw.framerate_scale_factor,
             split_segments: raw.split_segments,
@@ -372,8 +461,8 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             error: null,
           });
         } else if (msg.type === "error") {
-          if (pendingSync) {
-            const elapsed = (performance.now() - pendingSync.t0) / 1000;
+          if (pendingPrepare || pendingSync) {
+            const elapsed = pendingSync ? (performance.now() - pendingSync.t0) / 1000 : 0;
             finishPending({
               ok: false,
               elapsed_seconds: elapsed,
@@ -449,8 +538,10 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       }
 
       const refFile = request.ref;
-      const inFile = request.input;
-      if (!(refFile instanceof File) || !(inFile instanceof File)) {
+      const inFiles = Array.isArray(request.inputs) && request.inputs.length
+        ? request.inputs.filter((f) => f instanceof File)
+        : (request.input instanceof File ? [request.input] : []);
+      if (!(refFile instanceof File) || !inFiles.length) {
         return {
           ok: false,
           error: t("errors.selectBothFiles"),
@@ -469,28 +560,71 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       };
 
       onProgress({ messageKey: "progress.readingInputSubs", fraction: 0.02 });
-      const inBytesRaw = new Uint8Array(await inFile.arrayBuffer());
+      const rawInputEntries = [];
+      for (const f of inFiles) {
+        rawInputEntries.push({
+          name: f.name,
+          bytes: new Uint8Array(await f.arrayBuffer()),
+        });
+      }
+
+      const cloneInputs = () => {
+        const cloned = rawInputEntries.map((item) => ({
+          name: item.name,
+          bytes: item.bytes.slice(),
+        }));
+        const transferables = cloned.map((item) => item.bytes.buffer);
+        return { cloned, transferables };
+      };
+
+      const runSyncCached = (cacheKey, syncOpts, range) => {
+        const { cloned, transferables } = cloneInputs();
+        return postWorkerSync(
+          {
+            type: "syncCached",
+            payload: { cacheKey, inputs: cloned, options: syncOpts },
+          },
+          transferables,
+          onProgress,
+          t0,
+          range,
+        );
+      };
+
+      // 0. Fast path: reuse cached reference speech in worker when video + settings match.
+      const refCacheKey = buildRefCacheKey(refFile, request);
+      if (refCacheKey && cachedRefKey === refCacheKey) {
+        onProgress({ messageKey: "progress.reusingCachedRef", fraction: 0.05 });
+        const cachedOpts = cachedRefVideoFps
+          ? { ...options, inferred_sub_fps: cachedRefVideoFps }
+          : options;
+        const cachedRes = await runSyncCached(refCacheKey, cachedOpts, [0.05, 1.0]);
+        return { ...cachedRes, ref_cached: true };
+      }
 
       // 1. Direct subtitle reference file (.srt, .ass, .vtt, etc.)
       if (isSubtitleFile(refFile.name)) {
         onProgress({ messageKey: "progress.readingRef", fraction: 0.05 });
         const refBytes = new Uint8Array(await refFile.arrayBuffer());
-        return postWorkerSync(
+        const prep = await postWorkerPrepare(
           {
-            type: "sync",
-            payload: {
-              refName: refFile.name,
-              inName: inFile.name,
-              refBytes,
-              inBytes: inBytesRaw,
-              options,
-            },
+            type: "prepareRefSubs",
+            payload: { cacheKey: refCacheKey, refName: refFile.name, refBytes, options: {} },
           },
-          [refBytes.buffer, inBytesRaw.buffer],
+          [refBytes.buffer],
           onProgress,
-          t0,
-          [0.05, 1.0],
+          [0.05, 0.10],
         );
+        if (!prep || !prep.ok) {
+          return {
+            ok: false,
+            elapsed_seconds: (performance.now() - t0) / 1000,
+            error: (prep && prep.error) || t("result.syncFailed"),
+          };
+        }
+        cachedRefKey = refCacheKey;
+        cachedRefVideoFps = null;
+        return runSyncCached(refCacheKey, options, [0.10, 1.0]);
       }
 
       // 2. Video / audio reference file via ffmpeg.wasm
@@ -547,20 +681,25 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           };
         }
         onProgress({ messageKey: "progress.aligningPgs", fraction: 0.35 });
-        const pgsOptions =
-          probed && probed.video_fps
-            ? { ...options, inferred_sub_fps: probed.video_fps }
-            : options;
-        return postWorkerSync(
-          {
-            type: "syncTimings",
-            payload: { timings, inName: inFile.name, inBytes: inBytesRaw, options: pgsOptions },
-          },
-          [inBytesRaw.buffer],
+        const prep = await postWorkerPrepare(
+          { type: "prepareRefTimings", payload: { cacheKey: refCacheKey, timings } },
+          [],
           onProgress,
-          t0,
-          [0.35, 1.0],
+          [0.32, 0.38],
         );
+        if (!prep || !prep.ok) {
+          return {
+            ok: false,
+            elapsed_seconds: (performance.now() - t0) / 1000,
+            error: (prep && prep.error) || t("result.syncFailed"),
+          };
+        }
+        cachedRefKey = refCacheKey;
+        cachedRefVideoFps = (probed && probed.video_fps) || null;
+        const pgsOptions = cachedRefVideoFps
+          ? { ...options, inferred_sub_fps: cachedRefVideoFps }
+          : options;
+        return runSyncCached(refCacheKey, pgsOptions, [0.38, 1.0]);
       }
 
       // 2b. Explicit embedded text subtitle stream selected
@@ -593,31 +732,33 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           };
         }
         onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
-        let subOptions = options;
+        let videoFps = null;
         try {
           const probed = await probeStreamsCached(refFile, reportStatus);
-          if (probed && probed.video_fps) {
-            subOptions = { ...options, inferred_sub_fps: probed.video_fps };
-          }
+          if (probed && probed.video_fps) videoFps = probed.video_fps;
         } catch {
           /* ignore */
         }
-        return postWorkerSync(
+        const prep = await postWorkerPrepare(
           {
-            type: "sync",
-            payload: {
-              refName: "embedded.srt",
-              inName: inFile.name,
-              refBytes: subBytes,
-              inBytes: inBytesRaw,
-              options: subOptions,
-            },
+            type: "prepareRefSubs",
+            payload: { cacheKey: refCacheKey, refName: "embedded.srt", refBytes: subBytes, options: {} },
           },
-          [subBytes.buffer, inBytesRaw.buffer],
+          [subBytes.buffer],
           onProgress,
-          t0,
-          [0.35, 1.0],
+          [0.35, 0.38],
         );
+        if (!prep || !prep.ok) {
+          return {
+            ok: false,
+            elapsed_seconds: (performance.now() - t0) / 1000,
+            error: (prep && prep.error) || t("result.syncFailed"),
+          };
+        }
+        cachedRefKey = refCacheKey;
+        cachedRefVideoFps = videoFps;
+        const subOptions = videoFps ? { ...options, inferred_sub_fps: videoFps } : options;
+        return runSyncCached(refCacheKey, subOptions, [0.38, 1.0]);
       }
 
       // 2c. Auto embedded subtitles -> PGS/VobSub/DVB timings fallback (subs_then_webrtc)
@@ -626,10 +767,10 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         onProgress({ messageKey: "progress.checkingVideoSubs", fraction: 0.04 });
         const probed = await probeStreamsCached(refFile, reportStatus);
         const streams = (probed && probed.streams) || [];
-        const probedOptions =
-          probed && probed.video_fps
-            ? { ...options, inferred_sub_fps: probed.video_fps }
-            : options;
+        const videoFps = (probed && probed.video_fps) || null;
+        const probedOptions = videoFps
+          ? { ...options, inferred_sub_fps: videoFps }
+          : options;
 
         // Try full embedded text subtitle tracks (skip forced/commentary/signs/songs
         // and sparse stubs with <50 cues so they fall through to bitmap/audio VAD).
@@ -652,24 +793,34 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           });
           if (subBytes && subBytes.byteLength > 0) {
             onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
-            const inCopy = inBytesRaw.slice();
-            const res = await postWorkerSync(
+            const prep = await postWorkerPrepare(
               {
-                type: "sync",
+                type: "prepareRefSubs",
                 payload: {
+                  cacheKey: refCacheKey,
                   refName: "embedded.srt",
-                  inName: inFile.name,
                   refBytes: subBytes,
-                  inBytes: inCopy,
-                  options: { ...probedOptions, min_ref_cues: 50 },
+                  options: { min_ref_cues: 50 },
                 },
               },
-              [subBytes.buffer, inCopy.buffer],
+              [subBytes.buffer],
               onProgress,
-              t0,
-              [0.35, 1.0],
+              [0.35, 0.38],
             );
-            if (res && res.ok) return res;
+            if (prep && prep.ok) {
+              const res = await runSyncCached(refCacheKey, probedOptions, [0.38, 1.0]);
+              const anySynced = Boolean(
+                res &&
+                  (res.multi_mode
+                    ? Array.isArray(res.candidates) && res.candidates.some((c) => c.ok)
+                    : res.ok),
+              );
+              if (anySynced) {
+                cachedRefKey = refCacheKey;
+                cachedRefVideoFps = videoFps;
+                return res;
+              }
+            }
           }
         }
 
@@ -699,18 +850,26 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
               messageParams: { kind: kindLabel, stream: track.value },
               fraction: 0.35,
             });
-            const inCopy = inBytesRaw.slice();
-            const res = await postWorkerSync(
-              {
-                type: "syncTimings",
-                payload: { timings, inName: inFile.name, inBytes: inCopy, options: probedOptions },
-              },
-              [inCopy.buffer],
+            const prep = await postWorkerPrepare(
+              { type: "prepareRefTimings", payload: { cacheKey: refCacheKey, timings } },
+              [],
               onProgress,
-              t0,
-              [0.35, 1.0],
+              [0.35, 0.38],
             );
-            if (res && res.ok) return res;
+            if (prep && prep.ok) {
+              const res = await runSyncCached(refCacheKey, probedOptions, [0.38, 1.0]);
+              const anySynced = Boolean(
+                res &&
+                  (res.multi_mode
+                    ? Array.isArray(res.candidates) && res.candidates.some((c) => c.ok)
+                    : res.ok),
+              );
+              if (anySynced) {
+                cachedRefKey = refCacheKey;
+                cachedRefVideoFps = videoFps;
+                return res;
+              }
+            }
           }
         }
       }
@@ -744,10 +903,10 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         targetAudio = audioStreams.find((s) => s.is_default) || audioStreams[0];
       }
       const dualCenter = Boolean(targetAudio && targetAudio.has_center_channel);
-      const audioOptions =
-        probedForAudio && probedForAudio.video_fps
-          ? { ...options, inferred_sub_fps: probedForAudio.video_fps }
-          : options;
+      const audioVideoFps = (probedForAudio && probedForAudio.video_fps) || null;
+      const audioOptions = audioVideoFps
+        ? { ...options, inferred_sub_fps: audioVideoFps }
+        : options;
 
       let pcm;
       let channels = 1;
@@ -763,7 +922,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
               onProgress({
                 messageKey: "progress.decodingAudioPct",
                 messageParams: { pct },
-                fraction: 0.05 + p * 0.45,
+                fraction: 0.05 + p * 0.40,
               });
             }
           },
@@ -787,25 +946,33 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         };
       }
 
-      onProgress({ messageKey: "progress.detectingSpeechAligning", fraction: 0.50 });
-      return postWorkerSync(
+      onProgress({ messageKey: "progress.detectingSpeechAligning", fraction: 0.45 });
+      const prepAudio = await postWorkerPrepare(
         {
-          type: "syncAudioPcm",
+          type: "prepareRefAudio",
           payload: {
+            cacheKey: refCacheKey,
             pcm,
             channels,
             frameRate: ff.frameRate,
-            inName: inFile.name,
-            inBytes: inBytesRaw,
             vad: "webrtc",
-            options: audioOptions,
+            nonSpeechLabel: 0.0,
           },
         },
-        [pcm.buffer, inBytesRaw.buffer],
+        [pcm.buffer],
         onProgress,
-        t0,
-        [0.50, 1.0],
+        [0.45, 0.72],
       );
+      if (!prepAudio || !prepAudio.ok) {
+        return {
+          ok: false,
+          elapsed_seconds: (performance.now() - t0) / 1000,
+          error: (prepAudio && prepAudio.error) || t("result.syncFailed"),
+        };
+      }
+      cachedRefKey = refCacheKey;
+      cachedRefVideoFps = audioVideoFps;
+      return runSyncCached(refCacheKey, audioOptions, [0.72, 1.0]);
     },
   };
 }

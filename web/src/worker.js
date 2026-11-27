@@ -57,6 +57,29 @@ self.onmessage = async (event) => {
         onProgress,
       });
       post({ type: "result", result });
+    } else if (msg.type === "prepareRefSubs") {
+      if (!engine) throw new Error("engine not initialized");
+      const result = eng.prepareRefSubsWithEngine(engine, msg.payload);
+      post({ type: "prepared", result });
+    } else if (msg.type === "prepareRefAudio") {
+      if (!engine) throw new Error("engine not initialized");
+      post({ type: "progress", fraction: 0.0, message: "Detecting speech (0%)…" });
+      const result = eng.prepareRefAudioWithEngine(engine, {
+        ...msg.payload,
+        onProgress,
+      });
+      post({ type: "prepared", result });
+    } else if (msg.type === "prepareRefTimings") {
+      if (!engine) throw new Error("engine not initialized");
+      const result = eng.prepareRefTimingsWithEngine(engine, msg.payload);
+      post({ type: "prepared", result });
+    } else if (msg.type === "syncCached") {
+      if (!engine) throw new Error("engine not initialized");
+      const result = eng.syncCachedWithEngine(engine, {
+        ...msg.payload,
+        onProgress,
+      });
+      post({ type: "result", result });
     } else {
       throw new Error("unknown worker message type: " + msg.type);
     }

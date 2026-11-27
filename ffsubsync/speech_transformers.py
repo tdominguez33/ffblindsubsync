@@ -638,6 +638,9 @@ class VideoSpeechTransformer(TransformerMixin):
         self.used_embedded_subs_: bool = False
         self.reference_source_: Optional[str] = None
         self._last_ffmpeg_stderr_: str = ""
+        self._audio_fallback_cache_: Optional[
+            Tuple[str, np.ndarray, List[Tuple[str, np.ndarray]]]
+        ] = None
 
     @property
     def can_fallback_to_audio(self) -> bool:
@@ -965,14 +968,36 @@ class VideoSpeechTransformer(TransformerMixin):
     def fallback_to_audio(
         self, fname: str
     ) -> Tuple[np.ndarray, List[Tuple[str, np.ndarray]]]:
-        """Re-extract reference speech from audio VAD after poor embedded-sub alignment."""
-        self._run_audio_pipeline(fname)
-        assert self.video_speech_results_ is not None
-        return self.video_speech_results_, list(self.alt_video_speech_results_)
+        """Re-extract reference speech from audio VAD after poor embedded-sub alignment.
+
+        Results are cached per ``fname`` and the primary embedded-subtitle speech
+        signal is preserved so multi-subtitle batches neither re-decode audio nor
+        lose embedded subtitles for subsequent candidates.
+        """
+        if self._audio_fallback_cache_ is not None and self._audio_fallback_cache_[0] == fname:
+            return self._audio_fallback_cache_[1], list(self._audio_fallback_cache_[2])
+        prev_results = self.video_speech_results_
+        prev_alts = list(self.alt_video_speech_results_)
+        prev_used_embedded = self.used_embedded_subs_
+        prev_source = self.reference_source_
+        try:
+            self._run_audio_pipeline(fname)
+            assert self.video_speech_results_ is not None
+            audio_speech = self.video_speech_results_
+            audio_alts = list(self.alt_video_speech_results_)
+            self._audio_fallback_cache_ = (fname, audio_speech, audio_alts)
+            return audio_speech, list(audio_alts)
+        finally:
+            if prev_used_embedded and prev_results is not None:
+                self.video_speech_results_ = prev_results
+                self.alt_video_speech_results_ = prev_alts
+                self.used_embedded_subs_ = prev_used_embedded
+                self.reference_source_ = prev_source
 
     def fit(self, fname: str, *_) -> "VideoSpeechTransformer":
         self.used_embedded_subs_ = False
         self.reference_source_ = None
+        self._audio_fallback_cache_ = None
         if "subs" in self.vad and (
             self.ref_stream is None or self.ref_stream.startswith("0:s:")
         ):

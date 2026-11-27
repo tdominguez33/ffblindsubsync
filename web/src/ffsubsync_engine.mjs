@@ -202,3 +202,112 @@ ffsubsync_bridge.sync_with_timings(
     if (opts && opts.destroy) opts.destroy();
   }
 }
+
+export function prepareRefSubsWithEngine(
+  engine,
+  { cacheKey, refName, refBytes, options = {} },
+) {
+  const { pyodide } = engine;
+  const opts = pyodide.toPy(options);
+  pyodide.globals.set("_cache_key", cacheKey);
+  pyodide.globals.set("_ref_name", refName);
+  pyodide.globals.set("_ref_bytes", refBytes);
+  pyodide.globals.set("_opts", opts);
+  let proxy;
+  try {
+    proxy = pyodide.runPython(`
+import ffsubsync_bridge
+ffsubsync_bridge.prepare_reference_subtitles(
+    _cache_key, _ref_name, _ref_bytes, **dict(_opts)
+)
+`);
+    return proxy.toJs({ dict_converter: Object.fromEntries });
+  } finally {
+    pyodide.globals.set("_ref_bytes", null);
+    pyodide.globals.set("_opts", null);
+    if (proxy) proxy.destroy();
+    if (opts && opts.destroy) opts.destroy();
+  }
+}
+
+export function prepareRefAudioWithEngine(
+  engine,
+  { cacheKey, pcm, channels = 1, frameRate, vad = "webrtc", nonSpeechLabel = 0.0, onProgress = null },
+) {
+  const { pyodide } = engine;
+  pyodide.globals.set("_cache_key", cacheKey);
+  pyodide.globals.set("_pcm", pcm);
+  pyodide.globals.set("_channels", Number(channels) || 1);
+  pyodide.globals.set("_frame_rate", frameRate);
+  pyodide.globals.set("_vad", vad);
+  pyodide.globals.set("_non_speech_label", nonSpeechLabel);
+  pyodide.globals.set("_on_progress", onProgress);
+  let proxy;
+  try {
+    proxy = pyodide.runPython(`
+import ffsubsync_bridge
+ffsubsync_bridge.prepare_reference_audio(
+    _cache_key, _pcm, _frame_rate,
+    vad=_vad, channels=_channels,
+    non_speech_label=_non_speech_label,
+    progress_cb=_on_progress,
+)
+`);
+    return proxy.toJs({ dict_converter: Object.fromEntries });
+  } finally {
+    pyodide.globals.set("_on_progress", null);
+    pyodide.globals.set("_pcm", null);
+    if (proxy) proxy.destroy();
+  }
+}
+
+export function prepareRefTimingsWithEngine(engine, { cacheKey, timings }) {
+  const { pyodide } = engine;
+  const pyTimings = pyodide.toPy(timings);
+  pyodide.globals.set("_cache_key", cacheKey);
+  pyodide.globals.set("_timings", pyTimings);
+  let proxy;
+  try {
+    proxy = pyodide.runPython(`
+import ffsubsync_bridge
+ffsubsync_bridge.prepare_reference_timings(_cache_key, _timings)
+`);
+    return proxy.toJs({ dict_converter: Object.fromEntries });
+  } finally {
+    pyodide.globals.set("_timings", null);
+    if (proxy) proxy.destroy();
+    if (pyTimings && pyTimings.destroy) pyTimings.destroy();
+  }
+}
+
+export function syncCachedWithEngine(
+  engine,
+  { cacheKey, inputs, options = {}, onProgress = null },
+) {
+  const { pyodide } = engine;
+  const opts = pyodide.toPy(options);
+  const pyInputs = pyodide.toPy(inputs);
+  pyodide.globals.set("_cache_key", cacheKey);
+  pyodide.globals.set("_inputs", pyInputs);
+  pyodide.globals.set("_opts", opts);
+  pyodide.globals.set("_on_progress", onProgress);
+  let proxy;
+  try {
+    proxy = pyodide.runPython(`
+import ffsubsync_bridge
+ffsubsync_bridge.sync_with_cached_reference(
+    _cache_key, _inputs,
+    progress_cb=_on_progress,
+    **dict(_opts),
+)
+`);
+    return proxy.toJs({ dict_converter: Object.fromEntries });
+  } finally {
+    pyodide.globals.set("_on_progress", null);
+    pyodide.globals.set("_inputs", null);
+    pyodide.globals.set("_opts", null);
+    if (proxy) proxy.destroy();
+    if (pyInputs && pyInputs.destroy) pyInputs.destroy();
+    if (opts && opts.destroy) opts.destroy();
+  }
+}
