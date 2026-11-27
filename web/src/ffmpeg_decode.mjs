@@ -178,7 +178,13 @@ async function safeDelete(ffmpeg, filePath) {
 }
 
 export async function probeStreams(cfg, file, { status } = {}) {
-  const empty = { streams: [], has_text_subs: false, has_pgs_subs: false, video_fps: null };
+  const empty = {
+    streams: [],
+    has_text_subs: false,
+    has_pgs_subs: false,
+    video_fps: null,
+    duration: null,
+  };
   if (!cfg || !file) return empty;
   return withMountedFile(cfg, file, status, async (ffmpeg, mounted) => {
     const outPath = "/probe_streams.json";
@@ -189,7 +195,7 @@ export async function probeStreams(cfg, file, { status } = {}) {
       await ffmpeg.ffprobe([
         "-v", "error",
         "-show_entries",
-        "stream=index,codec_type,codec_name,channels,channel_layout,r_frame_rate,avg_frame_rate:stream_disposition=default,forced,comment,hearing_impaired,attached_pic:stream_tags",
+        "format=duration:stream=index,codec_type,codec_name,channels,channel_layout,r_frame_rate,avg_frame_rate:stream_disposition=default,forced,comment,hearing_impaired,attached_pic:stream_tags",
         "-of", "json",
         mounted,
         "-o", outPath,
@@ -198,6 +204,8 @@ export async function probeStreams(cfg, file, { status } = {}) {
       if (!raw || !raw.byteLength) return empty;
       const data = JSON.parse(textDecoder.decode(raw));
       const rawStreams = Array.isArray(data && data.streams) ? data.streams : [];
+      const rawDuration = Number(data && data.format && data.format.duration);
+      const duration = Number.isFinite(rawDuration) && rawDuration > 0 ? rawDuration : null;
       const audioLang = primaryAudioLanguage(rawStreams);
 
       let audioIdx = 0;
@@ -310,6 +318,7 @@ export async function probeStreams(cfg, file, { status } = {}) {
         has_text_subs: hasTextSubs,
         has_pgs_subs: hasPgsSubs,
         video_fps: videoFps,
+        duration,
       };
     } catch {
       return empty;
@@ -353,7 +362,164 @@ export async function extractSubtitleStream(
   });
 }
 
-async function probeDvdFramesInSession(ffmpeg, mounted, probeStream) {
+function parseCompactLine(line) {
+  const row = {};
+  let hasField = false;
+  for (const part of String(line || "").split("|")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    row[part.slice(0, eq).trim()] = part.slice(eq + 1).trim();
+    hasField = true;
+  }
+  return hasField ? row : null;
+}
+
+async function streamFfprobeCompact(ffmpeg, args, { duration = null, onProgress = null } = {}) {
+  const rows = [];
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+  let lastPts = 0;
+  let lastEmitMs = 0;
+
+  const onLog = ({ type, message }) => {
+    if (type && type !== "stdout") return;
+    if (!message || !message.includes("=")) return;
+    for (const rawLine of String(message).split(/\r?\n/)) {
+      const trimmed = rawLine.trim();
+      if (!trimmed || !trimmed.includes("=")) continue;
+      const row = parseCompactLine(trimmed);
+      if (!row) continue;
+      rows.push(row);
+      if (onProgress && row.pts_time && row.pts_time !== "N/A") {
+        const pts = Number(row.pts_time);
+        if (Number.isFinite(pts) && pts > lastPts) {
+          lastPts = pts;
+          const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+          if (now - lastEmitMs >= 120) {
+            lastEmitMs = now;
+            const frac = hasDuration ? Math.max(0, Math.min(1, lastPts / duration)) : null;
+            onProgress(frac, { ptsSeconds: lastPts, count: rows.length });
+          }
+        }
+      }
+    }
+  };
+
+  ffmpeg.on("log", onLog);
+  try {
+    if (onProgress && hasDuration) {
+      onProgress(0, { ptsSeconds: 0, count: 0 });
+    }
+    await ffmpeg.ffprobe(args);
+    if (onProgress && rows.length > 0) {
+      onProgress(hasDuration ? 1 : null, {
+        ptsSeconds: hasDuration ? duration : lastPts,
+        count: rows.length,
+      });
+    }
+    return rows;
+  } finally {
+    ffmpeg.off("log", onLog);
+  }
+}
+
+function parseDvdFramesToTimings(frames) {
+  const captions = [];
+  for (const frame of frames || []) {
+    const pts = Number(frame.pts_time);
+    let startMs = frame.start_display_time != null ? Number(frame.start_display_time) : 0;
+    let endMs = Number(frame.end_display_time);
+    const numRects = frame.num_rects != null ? Number(frame.num_rects) : 1;
+    if (!Number.isFinite(pts) || !Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      continue;
+    }
+    if (numRects === 0) {
+      startMs = 0;
+      endMs = 0;
+    }
+    captions.push([pts, startMs / 1000.0, endMs / 1000.0]);
+  }
+  captions.sort((a, b) => a[0] - b[0]);
+  const results = [];
+  for (let i = 0; i < captions.length; i += 1) {
+    const [pts, startOff, endOff] = captions[i];
+    const start = pts + startOff;
+    let end = pts + endOff;
+    if (i + 1 < captions.length) {
+      end = Math.min(end, captions[i + 1][0]);
+    }
+    if (end > start) results.push([start, end]);
+  }
+  return results.length ? results : null;
+}
+
+function parsePgsPacketsToTimings(packets) {
+  const parsed = [];
+  for (const pkt of packets || []) {
+    if (pkt.pts_time == null || pkt.size == null) continue;
+    const pts = Number(pkt.pts_time);
+    const size = Number(pkt.size);
+    if (!Number.isFinite(pts) || !Number.isFinite(size)) continue;
+    let dur = null;
+    if (pkt.duration_time != null && pkt.duration_time !== "N/A") {
+      const parsedDur = Number(pkt.duration_time);
+      if (!Number.isFinite(parsedDur)) continue;
+      dur = parsedDur;
+    }
+    parsed.push({ pts, size, dur });
+  }
+  parsed.sort((a, b) => a.pts - b.pts);
+
+  // Single-pass extraction supporting numeric durations, durationless
+  // show/clear pairs, and streams mixing both.
+  const MAX_CUE_S = 15.0;
+  const results = [];
+  let pendingShowPts = null;
+  for (const { pts, size, dur } of parsed) {
+    if (size <= 50) {
+      if (pendingShowPts !== null && dur === null && pts > pendingShowPts) {
+        results.push([pendingShowPts, Math.min(pts, pendingShowPts + MAX_CUE_S)]);
+        pendingShowPts = null;
+      }
+      continue;
+    }
+    if (dur === null) {
+      if (pendingShowPts !== null && pts > pendingShowPts) {
+        results.push([pendingShowPts, Math.min(pts, pendingShowPts + MAX_CUE_S)]);
+      }
+      pendingShowPts = pts;
+      continue;
+    }
+    pendingShowPts = null;
+    if (dur > 0) {
+      results.push([pts, pts + dur]);
+    }
+  }
+  return results.length ? results : null;
+}
+
+async function probeDvdFramesInSession(
+  ffmpeg,
+  mounted,
+  probeStream,
+  { duration = null, onProgress = null } = {},
+) {
+  try {
+    const streamed = await streamFfprobeCompact(
+      ffmpeg,
+      [
+        "-v", "error",
+        "-show_frames",
+        "-select_streams", probeStream,
+        "-show_entries", "subtitle=pts_time,start_display_time,end_display_time,num_rects",
+        "-of", "compact=p=0:nk=0",
+        mounted,
+      ],
+      { duration, onProgress },
+    );
+    return parseDvdFramesToTimings(streamed);
+  } catch {
+    /* fall through to JSON file output */
+  }
   const outPath = "/dvd_frames.json";
   await safeDelete(ffmpeg, outPath);
   try {
@@ -370,33 +536,7 @@ async function probeDvdFramesInSession(ffmpeg, mounted, probeStream) {
     if (!raw || !raw.byteLength) return null;
     const data = JSON.parse(textDecoder.decode(raw));
     const frames = Array.isArray(data && data.frames) ? data.frames : [];
-    const captions = [];
-    for (const frame of frames) {
-      const pts = Number(frame.pts_time);
-      let startMs = frame.start_display_time != null ? Number(frame.start_display_time) : 0;
-      let endMs = Number(frame.end_display_time);
-      const numRects = frame.num_rects != null ? Number(frame.num_rects) : 1;
-      if (!Number.isFinite(pts) || !Number.isFinite(startMs) || !Number.isFinite(endMs)) {
-        continue;
-      }
-      if (numRects === 0) {
-        startMs = 0;
-        endMs = 0;
-      }
-      captions.push([pts, startMs / 1000.0, endMs / 1000.0]);
-    }
-    captions.sort((a, b) => a[0] - b[0]);
-    const results = [];
-    for (let i = 0; i < captions.length; i += 1) {
-      const [pts, startOff, endOff] = captions[i];
-      const start = pts + startOff;
-      let end = pts + endOff;
-      if (i + 1 < captions.length) {
-        end = Math.min(end, captions[i + 1][0]);
-      }
-      if (end > start) results.push([start, end]);
-    }
-    return results.length ? results : null;
+    return parseDvdFramesToTimings(frames);
   } catch {
     return null;
   } finally {
@@ -404,14 +544,39 @@ async function probeDvdFramesInSession(ffmpeg, mounted, probeStream) {
   }
 }
 
-export async function probePgsTimings(cfg, file, streamSpec, { status, codec } = {}) {
+export async function probePgsTimings(
+  cfg,
+  file,
+  streamSpec,
+  { status, codec, duration = null, onProgress = null } = {},
+) {
   const probeStream = normalizeProbeStream(streamSpec);
   if (!probeStream) return null;
   return withMountedFile(cfg, file, status, async (ffmpeg, mounted) => {
     status && status(`reading PGS/VobSub/DVB timings (${streamSpec})…`);
     if (codec === "dvd_subtitle") {
-      const dvdTimings = await probeDvdFramesInSession(ffmpeg, mounted, probeStream);
+      const dvdTimings = await probeDvdFramesInSession(ffmpeg, mounted, probeStream, {
+        duration,
+        onProgress,
+      });
       if (dvdTimings && dvdTimings.length) return dvdTimings;
+    }
+    try {
+      const streamed = await streamFfprobeCompact(
+        ffmpeg,
+        [
+          "-v", "error",
+          "-show_packets",
+          "-select_streams", probeStream,
+          "-show_entries", "packet=pts_time,duration_time,size",
+          "-of", "compact=p=0:nk=0",
+          mounted,
+        ],
+        { duration, onProgress },
+      );
+      return parsePgsPacketsToTimings(streamed);
+    } catch {
+      /* fall through to JSON file output */
     }
     const outPath = "/pgs_packets.json";
     await safeDelete(ffmpeg, outPath);
@@ -430,48 +595,7 @@ export async function probePgsTimings(cfg, file, streamSpec, { status, codec } =
       if (!raw || !raw.byteLength) return null;
       const data = JSON.parse(textDecoder.decode(raw));
       const packets = Array.isArray(data && data.packets) ? data.packets : [];
-      const parsed = [];
-      for (const pkt of packets) {
-        if (pkt.pts_time == null || pkt.size == null) continue;
-        const pts = Number(pkt.pts_time);
-        const size = Number(pkt.size);
-        if (!Number.isFinite(pts) || !Number.isFinite(size)) continue;
-        let dur = null;
-        if (pkt.duration_time != null && pkt.duration_time !== "N/A") {
-          const parsedDur = Number(pkt.duration_time);
-          if (!Number.isFinite(parsedDur)) continue;
-          dur = parsedDur;
-        }
-        parsed.push({ pts, size, dur });
-      }
-      parsed.sort((a, b) => a.pts - b.pts);
-
-      // Single-pass extraction supporting numeric durations, durationless
-      // show/clear pairs, and streams mixing both.
-      const MAX_CUE_S = 15.0;
-      const results = [];
-      let pendingShowPts = null;
-      for (const { pts, size, dur } of parsed) {
-        if (size <= 50) {
-          if (pendingShowPts !== null && dur === null && pts > pendingShowPts) {
-            results.push([pendingShowPts, Math.min(pts, pendingShowPts + MAX_CUE_S)]);
-            pendingShowPts = null;
-          }
-          continue;
-        }
-        if (dur === null) {
-          if (pendingShowPts !== null && pts > pendingShowPts) {
-            results.push([pendingShowPts, Math.min(pts, pendingShowPts + MAX_CUE_S)]);
-          }
-          pendingShowPts = pts;
-          continue;
-        }
-        pendingShowPts = null;
-        if (dur > 0) {
-          results.push([pts, pts + dur]);
-        }
-      }
-      return results.length ? results : null;
+      return parsePgsPacketsToTimings(packets);
     } catch {
       return null;
     } finally {

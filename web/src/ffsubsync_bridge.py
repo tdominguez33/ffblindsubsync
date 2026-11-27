@@ -70,44 +70,73 @@ def _synced_name(in_name: str) -> str:
 
 
 class _ProgressLogHandler(logging.Handler):
-    """Translate ffsubsync INFO log milestones into normalized 0..1 progress."""
+    """Translate ffsubsync INFO log milestones into monotonic normalized 0..1 progress."""
 
-    def __init__(self, progress_cb, start_frac: float = 0.0, end_frac: float = 1.0):
+    def __init__(
+        self,
+        progress_cb,
+        start_frac: float = 0.0,
+        end_frac: float = 1.0,
+        message_override=None,
+    ):
         super().__init__(level=logging.INFO)
         self._cb = progress_cb
         self._start = float(start_frac)
         self._span = max(0.0, float(end_frac) - self._start)
+        self._message_override = message_override
         self._gss_steps = 0
+        self._alt_pass = False
+        self._max_global = self._start
+
+    def set_range(self, start_frac: float, end_frac: float, message_override=None) -> None:
+        self._start = float(start_frac)
+        self._span = max(0.0, float(end_frac) - self._start)
+        self._message_override = message_override
+        self._gss_steps = 0
+        self._alt_pass = False
+        if self._start > self._max_global:
+            self._max_global = self._start
 
     def _emit_scaled(self, local_frac: float, message: str) -> None:
         clamped = max(0.0, min(1.0, float(local_frac)))
+        target = self._start + self._span * clamped
+        if target < self._max_global:
+            target = self._max_global
+        else:
+            self._max_global = target
+        shown_msg = self._message_override if self._message_override is not None else message
         try:
-            self._cb(self._start + self._span * clamped, message)
+            self._cb(target, shown_msg)
         except Exception:
             pass
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
+        if "comparing alignment with" in msg:
+            self._alt_pass = True
+            self._emit_scaled(0.65, "Computing alignments…")
+            return
         if "extracting speech segments from subtitles" in msg:
-            self._emit_scaled(0.08, "Parsing subtitles…")
+            self._emit_scaled(0.06, "Parsing subtitles…")
             return
         m = _ALIGN_STEP_RE.search(msg)
         if m:
             cur, tot = int(m.group(1)), max(1, int(m.group(2)))
-            frac = 0.15 + 0.72 * ((cur - 1) / float(tot))
+            step_f = (cur - 0.5) / float(tot)
+            frac = 0.65 + 0.20 * step_f if self._alt_pass else 0.10 + 0.55 * step_f
             self._emit_scaled(frac, "Computing alignment (%d/%d)…" % (cur, tot))
             return
         gm = _GSS_STEP_RE.search(msg)
         if gm:
             self._gss_steps += 1
-            frac = min(0.87, 0.15 + 0.72 * (self._gss_steps / 14.0))
-            self._emit_scaled(frac, "Refining framerate ratio (%s)…" % gm.group(1))
+            frac = min(0.85, 0.15 + 0.70 * (self._gss_steps / 14.0))
+            self._emit_scaled(frac, "Refining framerate ratio…")
             return
         if "split alignment" in msg:
-            self._emit_scaled(0.92, "Checking mid-file breaks…")
+            self._emit_scaled(0.90, "Checking mid-file breaks…")
             return
         if "writing output" in msg:
-            self._emit_scaled(0.97, "Writing synced subtitles…")
+            self._emit_scaled(0.96, "Writing synced subtitles…")
             return
 
 
@@ -347,6 +376,7 @@ def _pcm_to_speech_signals(
     non_speech_label: float,
     channels: int = 1,
     progress_cb=None,
+    end_frac: float = 0.50,
 ):
     """Stream mono or interleaved 2-ch (mix + FC) s16le PCM through VAD.
 
@@ -383,7 +413,7 @@ def _pcm_to_speech_signals(
         if progress_cb is not None and total_bytes > 0:
             done_frac = min(1.0, bytes_done / float(total_bytes))
             pct = int(round(done_frac * 100))
-            progress_cb(done_frac * 0.50, "Detecting speech (%d%%)…" % pct)
+            progress_cb(done_frac * float(end_frac), "Detecting speech (%d%%)…" % pct)
 
     if not mix_parts:
         raise ValueError("no audio samples to analyze")
@@ -430,6 +460,7 @@ def sync_with_audio(
             non_speech_label,
             channels=int(channels or 1),
             progress_cb=progress_cb,
+            end_frac=0.50,
         )
     except Exception:
         return {
@@ -624,6 +655,7 @@ def prepare_reference_audio(
             non_speech_label,
             channels=int(channels or 1),
             progress_cb=progress_cb,
+            end_frac=1.0,
         )
     except Exception:
         return {"ok": False, "error": traceback.format_exc()}
@@ -639,6 +671,11 @@ def prepare_reference_audio(
         "audio",
         non_speech_label=non_speech_label,
     )
+    if progress_cb is not None:
+        try:
+            progress_cb(1.0, "Detecting speech (100%)…")
+        except Exception:
+            pass
     return {"ok": True, "error": None}
 
 
@@ -830,17 +867,34 @@ def sync_with_cached_reference(
     if ref_enc:
         argv += ["--reference-encoding", ref_enc]
 
+    ff_logger = logging.getLogger("ffsubsync")
+    multi_handler = (
+        _ProgressLogHandler(
+            progress_cb,
+            start_frac=0.0,
+            end_frac=1.0 / float(max(1, len(in_paths))),
+        )
+        if progress_cb is not None
+        else None
+    )
+
     def _on_cand(idx: int, total: int, srtin):
         if progress_cb is not None:
-            disp = display_by_path.get(
-                srtin, name_by_path.get(srtin, os.path.basename(srtin or ""))
-            )
-            frac = idx / float(max(1, total))
+            raw_name = name_by_path.get(srtin) or os.path.basename(srtin or "")
+            short_name = os.path.basename(str(raw_name).replace("\\", "/"))
+            tot = max(1, int(total))
+            start_f = idx / float(tot)
+            end_f = (idx + 1) / float(tot)
+            msg = "Analyzing subtitle %d/%d (%s)…" % (idx + 1, tot, short_name)
+            if multi_handler is not None:
+                multi_handler.set_range(start_f, end_f, message_override=msg)
             try:
-                progress_cb(frac, "Analyzing subtitle %d/%d (%s)…" % (idx + 1, total, disp))
+                progress_cb(start_f, msg)
             except Exception:
                 pass
 
+    if multi_handler is not None:
+        ff_logger.addHandler(multi_handler)
     try:
         args = make_parser().parse_args(argv)
         result = run(
@@ -859,6 +913,9 @@ def sync_with_cached_reference(
             "candidates": [],
             "error": traceback.format_exc(),
         }
+    finally:
+        if multi_handler is not None:
+            ff_logger.removeHandler(multi_handler)
 
     raw_cands = result.get("candidates") or []
     serialized = []

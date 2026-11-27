@@ -1309,6 +1309,7 @@ def make_reference_pipe(
                         ffmpeg_path=args.ffmpeg_path,
                         ref_stream=resolved_stream,
                         gui_mode=args.gui_mode,
+                        progress_handler=progress_handler,
                     ),
                 ),
             ]

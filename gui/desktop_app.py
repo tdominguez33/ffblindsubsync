@@ -243,6 +243,8 @@ def _get_system_languages() -> List[str]:
 
 
 _ALIGN_STEP_RE = re.compile(r"computing alignment (\d+)/(\d+)")
+_GSS_STEP_RE = re.compile(r"got score .* for ratio ([0-9.]+)")
+_PGS_READ_RE = re.compile(r"reading .+ timings for stream (\S+)")
 
 
 class _PhaseLogHandler(logging.Handler):
@@ -252,26 +254,56 @@ class _PhaseLogHandler(logging.Handler):
         super().__init__(level=logging.INFO)
         self._on_message = on_message
         self.error_lines = []
+        self._gss_steps = 0
+
+    def reset_candidate(self) -> None:
+        self._gss_steps = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
         if record.levelno >= logging.WARNING and msg:
             self.error_lines.append(msg)
+        pm = _PGS_READ_RE.search(msg)
+        if pm:
+            stream = pm.group(1)
+            self._on_message(
+                "Reading PGS/VobSub/DVB timings (%s)…" % stream,
+                None,
+                "progress.readingPgsStream",
+                {"stream": stream},
+            )
+            return
+        if "comparing alignment with" in msg:
+            self._on_message(
+                "Computing alignments…",
+                None,
+                "progress.comparingAlignment",
+            )
+            return
         m = _ALIGN_STEP_RE.search(msg)
         if m:
             cur, tot = int(m.group(1)), max(1, int(m.group(2)))
             self._on_message(
                 "Computing alignment (%d/%d)…" % (cur, tot),
-                (cur - 1) / float(tot),
+                (cur - 0.5) / float(tot),
                 "progress.computingAlignmentStep",
                 {"cur": cur, "tot": tot},
             )
             return
+        gm = _GSS_STEP_RE.search(msg)
+        if gm:
+            self._gss_steps += 1
+            self._on_message(
+                "Refining framerate ratio…",
+                min(1.0, self._gss_steps / 14.0),
+                "progress.refiningFramerate",
+            )
+            return
         if "split alignment" in msg:
-            self._on_message("Checking mid-file breaks…", 0.92, "progress.checkingBreaks")
+            self._on_message("Checking mid-file breaks…", 0.90, "progress.checkingBreaks")
             return
         if "writing output" in msg:
-            self._on_message("Writing output…", 0.98, "progress.writingOutput")
+            self._on_message("Writing output…", 0.96, "progress.writingOutput")
             return
         if "Checking video for subtitles" in msg:
             self._on_message("Checking video for subtitles…", None, "progress.checkingVideoSubs")
@@ -892,6 +924,7 @@ class DesktopApi:
                     )
 
                 ff_info = self._find_ffmpeg()
+                sync_start = 0.0
                 if not _is_subtitle_ref(ref_path) and not ff_info["available"]:
                     need_download = False
                     while True:
@@ -927,30 +960,44 @@ class DesktopApi:
                         self._dl_done_event.wait()
 
                     if need_download:
+                        sync_start = 0.25
                         try:
                             def _on_dl(ev: Dict[str, Any]) -> None:
-                                has_frac = ev.get("fraction") is not None
-                                pct_num = int(round(ev["fraction"] * 100)) if has_frac else None
-                                pct = " %d%%" % pct_num if pct_num is not None else ""
+                                dl_frac = ev.get("fraction")
+                                pct_num = (
+                                    int(round(max(0.0, min(1.0, float(dl_frac))) * 100))
+                                    if dl_frac is not None
+                                    else None
+                                )
+                                overall_dl = (
+                                    max(0.0, min(1.0, float(dl_frac))) * sync_start
+                                    if dl_frac is not None
+                                    else None
+                                )
                                 with self._lock:
                                     self._ffmpeg_dl.update(
                                         phase=ev.get("phase", "downloading"),
                                         downloaded=ev.get("downloaded", 0),
                                         total=ev.get("total", 0),
-                                        fraction=ev.get("fraction"),
+                                        fraction=dl_frac,
                                     )
-                                    self._sync_state.update(
-                                        message="Downloading FFmpeg%s…" % pct,
-                                        message_key=(
+                                    if pct_num is not None:
+                                        self._sync_state["message"] = (
+                                            "Downloading FFmpeg (%d%%)…" % pct_num
+                                        )
+                                        self._sync_state["message_key"] = (
                                             "progress.downloadingFfmpegPct"
-                                            if pct_num is not None
-                                            else "progress.downloadingFfmpeg"
-                                        ),
-                                        message_params=(
-                                            {"pct": pct_num} if pct_num is not None else None
-                                        ),
-                                        fraction=ev.get("fraction"),
-                                    )
+                                        )
+                                        self._sync_state["message_params"] = {"pct": pct_num}
+                                    else:
+                                        self._sync_state["message"] = "Downloading FFmpeg…"
+                                        self._sync_state["message_key"] = (
+                                            "progress.downloadingFfmpeg"
+                                        )
+                                        self._sync_state["message_params"] = None
+                                    if overall_dl is not None:
+                                        prev_f = self._sync_state.get("fraction") or 0.0
+                                        self._sync_state["fraction"] = max(prev_f, overall_dl)
 
                             target_dir = self._get_download_target_dir()
                             download_latest_ffmpeg(target_dir, progress_cb=_on_dl)
@@ -964,6 +1011,8 @@ class DesktopApi:
                                     info=ff_info,
                                     error=None,
                                 )
+                                prev_f = self._sync_state.get("fraction") or 0.0
+                                self._sync_state["fraction"] = max(prev_f, sync_start)
                         except Exception as exc:
                             with self._lock:
                                 self._ffmpeg_dl.update(
@@ -998,21 +1047,66 @@ class DesktopApi:
                         else None
                     )
 
-                with self._lock:
-                    if cached_pipe is not None:
-                        self._sync_state.update(
-                            message="Reusing analyzed video audio…",
-                            message_key="progress.reusingCachedRef",
-                            message_params=None,
-                            fraction=0.05 if multi_mode else None,
-                        )
-                    else:
-                        self._sync_state.update(
-                            message="Analyzing reference…",
-                            message_key="progress.analyzingRef",
-                            message_params=None,
-                            fraction=None,
-                        )
+                sync_span = 1.0 - sync_start
+                if cached_pipe is not None:
+                    ref_end_local = 0.05
+                elif _is_subtitle_ref(ref_path):
+                    ref_end_local = 0.10
+                elif multi_mode:
+                    ref_end_local = 0.55
+                else:
+                    ref_end_local = 0.72
+                align_base = sync_start + ref_end_local * sync_span
+
+                prog_state: Dict[str, Any] = {
+                    "max_frac": sync_start,
+                    "has_numeric": sync_start > 0.0,
+                    "in_candidates": False,
+                    "cand_base": align_base,
+                    "cand_idx": 0,
+                    "cand_total": max(1, len(in_paths)),
+                    "cand_name": "",
+                    "alt_pass": False,
+                    "fallback_audio": False,
+                    "fallback_base": None,
+                    "ref_mode": "audio",
+                    "ref_pass_base": sync_start + 0.02 * sync_span,
+                }
+
+                def _update_progress(
+                    msg: Optional[str] = None,
+                    raw_frac: Optional[float] = None,
+                    msg_key: Optional[str] = None,
+                    msg_params: Optional[Dict[str, Any]] = None,
+                    update_msg: bool = True,
+                ) -> None:
+                    with self._lock:
+                        if update_msg and (msg is not None or msg_key is not None):
+                            if msg is not None:
+                                self._sync_state["message"] = msg
+                            self._sync_state["message_key"] = msg_key
+                            self._sync_state["message_params"] = msg_params
+                        if raw_frac is not None:
+                            clamped = max(0.0, min(0.99, float(raw_frac)))
+                            if not prog_state["has_numeric"] or clamped > prog_state["max_frac"]:
+                                prog_state["max_frac"] = clamped
+                                prog_state["has_numeric"] = True
+                            self._sync_state["fraction"] = prog_state["max_frac"]
+                        elif prog_state["has_numeric"]:
+                            self._sync_state["fraction"] = prog_state["max_frac"]
+
+                if cached_pipe is not None:
+                    _update_progress(
+                        "Reusing analyzed video audio…",
+                        align_base,
+                        "progress.reusingCachedRef",
+                    )
+                else:
+                    _update_progress(
+                        "Analyzing reference…",
+                        sync_start + 0.02 * sync_span,
+                        "progress.analyzingRef",
+                    )
 
                 argv = [ref_path, "-i"] + in_paths
                 if not multi_mode:
@@ -1058,47 +1152,103 @@ class DesktopApi:
                 }
                 args._keep_archive_temp = True
 
-                ref_weight = 0.55 if (multi_mode and cached_pipe is None) else (0.0 if cached_pipe is not None else 1.0)
-                cand_state = {"idx": 0, "total": len(in_paths), "name": ""}
+                def _cand_slice() -> tuple:
+                    tot = max(1, int(prog_state["cand_total"]))
+                    idx = max(0, min(tot - 1, int(prog_state["cand_idx"])))
+                    c_base = float(prog_state["cand_base"])
+                    span = max(0.01, 0.99 - c_base) / float(tot)
+                    return c_base + idx * span, c_base + (idx + 1) * span
+
+                def _map_cand(local_0_to_1: float) -> float:
+                    c_start, c_end = _cand_slice()
+                    clamped = max(0.0, min(1.0, float(local_0_to_1)))
+                    return c_start + clamped * (c_end - c_start)
 
                 def _on_progress(info: ProgressInfo) -> None:
                     frac = info.fraction
-                    scaled_frac = (frac * ref_weight) if frac is not None else None
-                    with self._lock:
-                        if frac is not None:
-                            pct = int(round(frac * 100))
-                            self._sync_state.update(
-                                message="Decoding audio + VAD (%d%%)…" % pct,
-                                message_key="progress.decodingAudioVadPct",
-                                message_params={"pct": pct},
-                                fraction=scaled_frac,
+                    is_pgs = prog_state["ref_mode"] == "pgs"
+                    if frac is not None:
+                        f_clamped = max(0.0, min(1.0, float(frac)))
+                        pct = int(round(f_clamped * 100))
+                        if prog_state["fallback_audio"] or prog_state["in_candidates"]:
+                            if prog_state["fallback_base"] is None:
+                                prog_state["fallback_base"] = prog_state["max_frac"]
+                            fb_base = float(prog_state["fallback_base"])
+                            fb_end = min(0.92, fb_base + max(0.08, (0.92 - fb_base) * 0.65))
+                            overall = fb_base + f_clamped * max(0.0, fb_end - fb_base)
+                        else:
+                            ref_start = float(prog_state["ref_pass_base"])
+                            if ref_start >= align_base - 0.02:
+                                ref_end_dyn = min(0.88, ref_start + max(0.08, (0.88 - ref_start) * 0.6))
+                            else:
+                                ref_end_dyn = align_base
+                            overall = ref_start + f_clamped * max(0.0, ref_end_dyn - ref_start)
+                        if is_pgs:
+                            _update_progress(
+                                "Reading PGS/VobSub/DVB timings (%d%%)…" % pct,
+                                overall,
+                                "progress.readingPgsPct",
+                                {"pct": pct},
                             )
                         else:
-                            sec = "%.0f" % info.processed_seconds
-                            self._sync_state.update(
-                                message="Decoding audio + VAD (%ss)…" % sec,
-                                message_key="progress.decodingAudioVadSec",
-                                message_params={"sec": sec},
-                                fraction=None,
+                            _update_progress(
+                                "Decoding audio + VAD (%d%%)…" % pct,
+                                overall,
+                                "progress.decodingAudioVadPct",
+                                {"pct": pct},
+                            )
+                    else:
+                        sec = "%.0f" % info.processed_seconds
+                        if is_pgs:
+                            # Advance gently even if duration is unknown so bar shows life.
+                            ref_start = float(prog_state["ref_pass_base"])
+                            ref_end_dyn = max(ref_start + 0.05, align_base)
+                            asymp = 1.0 - (1.0 / (1.0 + max(0.0, float(info.processed_seconds)) / 1800.0))
+                            overall = ref_start + asymp * (ref_end_dyn - ref_start) * 0.9
+                            _update_progress(
+                                "Reading PGS/VobSub/DVB timings (%ss)…" % sec,
+                                overall,
+                                "progress.readingPgsSec",
+                                {"sec": sec},
+                            )
+                        else:
+                            _update_progress(
+                                "Decoding audio + VAD (%ss)…" % sec,
+                                None,
+                                "progress.decodingAudioVadSec",
+                                {"sec": sec},
                             )
 
                 def _on_candidate(idx: int, total: int, srtin: Optional[str]) -> None:
-                    name = os.path.basename(srtin) if srtin else ""
-                    cand_state["idx"] = idx
-                    cand_state["total"] = max(1, total)
-                    cand_state["name"] = name
-                    if not multi_mode:
-                        return
-                    base = ref_weight
-                    span = 1.0 - base
-                    frac = base + span * (idx / float(max(1, total)))
-                    with self._lock:
-                        self._sync_state.update(
-                            message="Analyzing subtitle %d/%d (%s)…" % (idx + 1, total, name),
-                            message_key="progress.analyzingSubtitle",
-                            message_params={"cur": idx + 1, "tot": total, "name": name},
-                            fraction=frac,
+                    meta = run_archive_meta.get(srtin) if srtin else None
+                    name = (
+                        meta["output_name"]
+                        if (meta and meta.get("output_name"))
+                        else (os.path.basename(srtin) if srtin else "")
+                    )
+                    if not prog_state["in_candidates"]:
+                        prog_state["cand_base"] = min(
+                            0.92, max(align_base, float(prog_state["max_frac"]))
                         )
+                    prog_state["in_candidates"] = True
+                    prog_state["cand_idx"] = idx
+                    prog_state["cand_total"] = max(1, total)
+                    prog_state["cand_name"] = name
+                    prog_state["alt_pass"] = False
+                    prog_state["fallback_audio"] = False
+                    prog_state["fallback_base"] = None
+                    if phase_handler is not None:
+                        phase_handler.reset_candidate()
+                    c_start, _ = _cand_slice()
+                    if multi_mode:
+                        _update_progress(
+                            "Analyzing subtitle %d/%d (%s)…" % (idx + 1, total, name),
+                            c_start,
+                            "progress.analyzingSubtitle",
+                            {"cur": idx + 1, "tot": total, "name": name},
+                        )
+                    else:
+                        _update_progress(raw_frac=c_start, update_msg=False)
 
                 def _on_log(
                     msg: str,
@@ -1106,30 +1256,103 @@ class DesktopApi:
                     msg_key: Optional[str] = None,
                     msg_params: Optional[Dict[str, Any]] = None,
                 ) -> None:
-                    if multi_mode and msg_key in (
-                        "progress.computingAlignmentStep",
-                        "progress.checkingBreaks",
+                    if msg_key == "progress.readingPgsStream":
+                        prog_state["ref_mode"] = "pgs"
+                        prog_state["ref_pass_base"] = max(
+                            sync_start + 0.02 * sync_span, prog_state["max_frac"]
+                        )
+                        _update_progress(msg, prog_state["ref_pass_base"], msg_key, msg_params)
+                        return
+                    if msg_key == "progress.comparingAlignment":
+                        prog_state["alt_pass"] = True
+                        _update_progress(
+                            "Computing alignments…",
+                            _map_cand(0.65),
+                            "progress.computingAlignments",
+                            update_msg=not multi_mode,
+                        )
+                        return
+                    if msg_key == "progress.fallingBackAudio":
+                        prog_state["ref_mode"] = "audio"
+                        if prog_state["in_candidates"]:
+                            prog_state["fallback_audio"] = True
+                            prog_state["fallback_base"] = prog_state["max_frac"]
+                        else:
+                            prog_state["ref_pass_base"] = max(
+                                sync_start + 0.02 * sync_span, prog_state["max_frac"]
+                            )
+                        _update_progress(msg, None, msg_key, msg_params)
+                        return
+                    if msg_key == "progress.extractingSpeech" and not prog_state["in_candidates"]:
+                        prog_state["ref_mode"] = "audio"
+                        prog_state["ref_pass_base"] = max(
+                            sync_start + 0.02 * sync_span, prog_state["max_frac"]
+                        )
+                    if msg_key == "progress.computingAlignmentStep":
+                        step_f = max(0.0, min(1.0, float(frac or 0.0)))
+                        local_c = (
+                            0.65 + 0.20 * step_f
+                            if prog_state["alt_pass"]
+                            else 0.08 + 0.57 * step_f
+                        )
+                        _update_progress(
+                            msg,
+                            _map_cand(local_c),
+                            msg_key,
+                            msg_params,
+                            update_msg=not multi_mode,
+                        )
+                        return
+                    if msg_key == "progress.refiningFramerate":
+                        step_f = max(0.0, min(1.0, float(frac or 0.0)))
+                        local_c = 0.15 + 0.70 * step_f
+                        _update_progress(
+                            msg,
+                            _map_cand(local_c),
+                            msg_key,
+                            msg_params,
+                            update_msg=not multi_mode,
+                        )
+                        return
+                    if msg_key in ("progress.checkingBreaks", "progress.writingOutput"):
+                        local_c = 0.90 if msg_key == "progress.checkingBreaks" else 0.96
+                        _update_progress(
+                            msg,
+                            _map_cand(local_c),
+                            msg_key,
+                            msg_params,
+                            update_msg=not multi_mode,
+                        )
+                        return
+                    if msg_key in (
                         "progress.extractingSubTimings",
                         "progress.computingAlignments",
                     ):
-                        # Keep the crisp per-subtitle progress message in multi mode,
-                        # advancing the progress bar smoothly inside the candidate's slice.
-                        tot = max(1, cand_state["total"])
-                        idx = cand_state["idx"]
-                        base = ref_weight
-                        span = (1.0 - base) / float(tot)
-                        local_f = frac if frac is not None else 0.1
-                        with self._lock:
-                            self._sync_state["fraction"] = min(0.99, base + (idx + local_f) * span)
+                        local_c = 0.03 if msg_key == "progress.extractingSubTimings" else 0.06
+                        target_f = _map_cand(local_c) if prog_state["in_candidates"] else None
+                        _update_progress(
+                            msg,
+                            target_f,
+                            msg_key,
+                            msg_params,
+                            update_msg=not multi_mode,
+                        )
                         return
-                    with self._lock:
-                        self._sync_state["message"] = msg
-                        self._sync_state["message_key"] = msg_key
-                        self._sync_state["message_params"] = msg_params
-                        if frac is not None:
-                            self._sync_state["fraction"] = (
-                                frac * ref_weight if multi_mode else frac
-                            )
+                    # Reference-stage status logs (checkingVideoSubs, usingPgsTimings, etc.)
+                    ref_milestones = {
+                        "progress.checkingVideoSubs": 0.04,
+                        "progress.usingPgsTimings": 0.10,
+                        "progress.usingVobSubTimings": 0.10,
+                        "progress.usingDvbTimings": 0.10,
+                        "progress.extractingSpeech": 0.06,
+                    }
+                    milestone = ref_milestones.get(msg_key or "")
+                    target_f = (
+                        sync_start + min(ref_end_local, milestone) * sync_span
+                        if (milestone is not None and not prog_state["in_candidates"])
+                        else None
+                    )
+                    _update_progress(msg, target_f, msg_key, msg_params)
 
                 phase_handler = _PhaseLogHandler(_on_log)
                 ff_logger.addHandler(phase_handler)

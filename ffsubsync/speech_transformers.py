@@ -1024,6 +1024,7 @@ class VideoSpeechTransformer(TransformerMixin):
                                 ffmpeg_path=self.ffmpeg_path,
                                 ref_stream=pgs_stream,
                                 gui_mode=self.gui_mode,
+                                progress_handler=self.progress_handler,
                             ).fit(fname)
                             pgs_res = pgs.transform(fname)
                             active_sec = float(np.sum(pgs_res > 0)) / float(
@@ -1856,11 +1857,168 @@ def _probe_stream_codec(
     return codec.lower() if isinstance(codec, str) else None
 
 
+def _probe_stream_codec_and_duration(
+    fname: str,
+    stream: str,
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Tuple[Optional[str], Optional[float]]:
+    """Read both stream codec and container duration in a single ffprobe call."""
+    probe_stream = stream[2:] if stream.startswith("0:") else stream
+    try:
+        probe = ffmpeg.probe(
+            fname,
+            cmd=ffmpeg_bin_path("ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path),
+            select_streams=probe_stream,
+            show_entries="format=duration:stream=codec_name",
+        )
+    except Exception:
+        return None, None
+    codec: Optional[str] = None
+    streams = probe.get("streams", [])
+    if streams:
+        raw_codec = streams[0].get("codec_name")
+        if isinstance(raw_codec, str):
+            codec = raw_codec.lower()
+    duration: Optional[float] = None
+    raw_dur = (probe.get("format") or {}).get("duration")
+    if raw_dur is not None:
+        try:
+            val = float(raw_dur)
+            if val > 0.0 and np.isfinite(val):
+                duration = val
+        except (TypeError, ValueError):
+            pass
+    return codec, duration
+
+
+def _probe_media_duration(
+    fname: str,
+    ffmpeg_path: Optional[str] = None,
+    gui_mode: bool = False,
+) -> Optional[float]:
+    """Quickly read container duration in seconds via ffprobe, or return ``None``."""
+    ffprobe_cmd = ffmpeg_bin_path(
+        "ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path
+    )
+    kw = subprocess_args(include_stdout=True)
+    kw["stdin"] = subprocess.DEVNULL
+    kw["stderr"] = subprocess.DEVNULL
+    try:
+        out = subprocess.check_output(
+            [
+                ffprobe_cmd,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                fname,
+            ],
+            timeout=10,
+            **{k: v for k, v in kw.items() if k != "stdout"},
+        )
+        val = float(out.decode("utf-8", errors="replace").strip().splitlines()[0])
+        return val if val > 0.0 and np.isfinite(val) else None
+    except Exception:
+        return None
+
+
+def _parse_compact_ffprobe_line(line: str) -> Dict[str, str]:
+    """Parse one line of ``ffprobe -of compact=p=0:nk=0`` output into a dict."""
+    row: Dict[str, str] = {}
+    for part in line.strip().split("|"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            row[k.strip()] = v.strip()
+    return row
+
+
+def _stream_ffprobe_compact(
+    ffprobe_cmd: str,
+    args: List[str],
+    total_seconds: Optional[float],
+    progress_handler: Callable[[ProgressInfo], None],
+) -> Optional[List[Dict[str, str]]]:
+    """Stream ``ffprobe -of compact=p=0:nk=0`` line-by-line, emitting live progress."""
+    import time
+
+    kw = subprocess_args(include_stdout=True)
+    kw["stdin"] = subprocess.DEVNULL
+    kw["stderr"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen([ffprobe_cmd] + args, **kw)
+    except Exception:
+        return None
+
+    rows: List[Dict[str, str]] = []
+    last_emit = 0.0
+    last_pts = 0.0
+    try:
+        try:
+            progress_handler(ProgressInfo(0.0, total_seconds))
+        except Exception:
+            pass
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            text = raw_line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            row = _parse_compact_ffprobe_line(text)
+            if not row:
+                continue
+            rows.append(row)
+            pts_raw = row.get("pts_time")
+            if pts_raw and pts_raw != "N/A":
+                try:
+                    pts = float(pts_raw)
+                except ValueError:
+                    continue
+                if pts > last_pts:
+                    last_pts = pts
+                now = time.monotonic()
+                if now - last_emit >= 0.12:
+                    last_emit = now
+                    try:
+                        progress_handler(ProgressInfo(last_pts, total_seconds))
+                    except Exception:
+                        pass
+        proc.wait()
+        if proc.returncode != 0 and not rows:
+            return None
+        if rows:
+            done_sec = (
+                total_seconds
+                if (total_seconds is not None and total_seconds > 0)
+                else last_pts
+            )
+            try:
+                progress_handler(ProgressInfo(done_sec, total_seconds))
+            except Exception:
+                pass
+        return rows
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+    finally:
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+
 def _get_dvd_timings_via_ffprobe(
     fname: str,
     stream: str,
     ffmpeg_path: Optional[str] = None,
     gui_mode: bool = False,
+    progress_handler: Optional[Callable[[ProgressInfo], None]] = None,
+    total_seconds: Optional[float] = None,
 ) -> Optional[List[Tuple[float, float]]]:
     """Read DVD (VobSub) subtitle timings by letting ffprobe decode the stream.
 
@@ -1873,21 +2031,49 @@ def _get_dvd_timings_via_ffprobe(
         "ffprobe", gui_mode, ffmpeg_resources_path=ffmpeg_path
     )
     probe_stream = stream[2:] if stream.startswith("0:") else stream
-    try:
-        probe_data = ffmpeg.probe(
-            fname,
-            cmd=ffprobe_cmd,
-            show_frames=None,
-            select_streams=probe_stream,
-            show_entries=(
-                "subtitle=pts_time,start_display_time,end_display_time,num_rects"
-            ),
+    frames: List[Dict[str, Any]]
+    if progress_handler is not None:
+        if total_seconds is None:
+            total_seconds = _probe_media_duration(
+                fname, ffmpeg_path=ffmpeg_path, gui_mode=gui_mode
+            )
+        streamed = _stream_ffprobe_compact(
+            ffprobe_cmd,
+            [
+                "-v",
+                "error",
+                "-show_frames",
+                "-select_streams",
+                probe_stream,
+                "-show_entries",
+                "subtitle=pts_time,start_display_time,end_display_time,num_rects",
+                "-of",
+                "compact=p=0:nk=0",
+                fname,
+            ],
+            total_seconds=total_seconds,
+            progress_handler=progress_handler,
         )
-    except Exception:
-        return None
+        if streamed is None:
+            return None
+        frames = streamed
+    else:
+        try:
+            probe_data = ffmpeg.probe(
+                fname,
+                cmd=ffprobe_cmd,
+                show_frames=None,
+                select_streams=probe_stream,
+                show_entries=(
+                    "subtitle=pts_time,start_display_time,end_display_time,num_rects"
+                ),
+            )
+        except Exception:
+            return None
+        frames = probe_data.get("frames", [])
 
     captions: List[Tuple[float, float, float]] = []
-    for frame in probe_data.get("frames", []):
+    for frame in frames:
         try:
             pts_time = float(frame["pts_time"])
             start_ms = int(frame.get("start_display_time", 0))
@@ -1993,6 +2179,8 @@ def _get_pgs_timings_via_ffprobe(
     stream: str,
     ffmpeg_path: Optional[str] = None,
     gui_mode: bool = False,
+    progress_handler: Optional[Callable[[ProgressInfo], None]] = None,
+    total_seconds: Optional[float] = None,
 ) -> Optional[List[Tuple[float, float]]]:
     """Read PGS timings from container metadata using ffprobe.
 
@@ -2010,6 +2198,32 @@ def _get_pgs_timings_via_ffprobe(
     # ffprobe -select_streams does not accept the "0:" input-index prefix;
     # strip it so "0:s:0" → "s:0" and "0:3" → "3".
     probe_stream = stream[2:] if stream.startswith("0:") else stream
+    if progress_handler is not None:
+        if total_seconds is None:
+            total_seconds = _probe_media_duration(
+                fname, ffmpeg_path=ffmpeg_path, gui_mode=gui_mode
+            )
+        streamed = _stream_ffprobe_compact(
+            ffprobe_cmd,
+            [
+                "-v",
+                "error",
+                "-show_packets",
+                "-select_streams",
+                probe_stream,
+                "-show_entries",
+                "packet=pts_time,duration_time,size",
+                "-of",
+                "compact=p=0:nk=0",
+                fname,
+            ],
+            total_seconds=total_seconds,
+            progress_handler=progress_handler,
+        )
+        if streamed is None:
+            return None
+        return _parse_pgs_timings_from_packets(streamed)
+
     try:
         probe_data = ffmpeg.probe(
             fname,
@@ -2060,6 +2274,7 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
         ffmpeg_path: Optional[str] = None,
         ref_stream: Optional[str] = None,
         gui_mode: bool = False,
+        progress_handler: Optional[Callable[[ProgressInfo], None]] = None,
     ) -> None:
         super(PGSSpeechTransformer, self).__init__()
         self.sample_rate: int = sample_rate
@@ -2067,6 +2282,7 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
         self.ffmpeg_path: Optional[str] = ffmpeg_path
         self.ref_stream: Optional[str] = ref_stream
         self.gui_mode: bool = gui_mode
+        self.progress_handler: Optional[Callable[[ProgressInfo], None]] = progress_handler
         self.pgs_speech_results_: Optional[np.ndarray] = None
         self.num_timings_: int = 0
 
@@ -2083,7 +2299,13 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
             if not stream.startswith("0:"):
                 stream = "0:" + stream
 
-        codec = _probe_stream_codec(fname, stream, self.ffmpeg_path, self.gui_mode)
+        total_seconds: Optional[float] = None
+        if self.progress_handler is not None:
+            codec, total_seconds = _probe_stream_codec_and_duration(
+                fname, stream, self.ffmpeg_path, self.gui_mode
+            )
+        else:
+            codec = _probe_stream_codec(fname, stream, self.ffmpeg_path, self.gui_mode)
         logger.info(
             "reading %s timings for stream %s from %s...",
             codec or "PGS/VobSub/DVB",
@@ -2092,15 +2314,30 @@ class PGSSpeechTransformer(TransformerMixin, ComputeSpeechFrameBoundariesMixin):
         )
         if codec == "dvd_subtitle":
             timings = _get_dvd_timings_via_ffprobe(
-                fname, stream, self.ffmpeg_path, self.gui_mode
+                fname,
+                stream,
+                self.ffmpeg_path,
+                self.gui_mode,
+                progress_handler=self.progress_handler,
+                total_seconds=total_seconds,
             )
             if timings is None:
                 timings = _get_pgs_timings_via_ffprobe(
-                    fname, stream, self.ffmpeg_path, self.gui_mode
+                    fname,
+                    stream,
+                    self.ffmpeg_path,
+                    self.gui_mode,
+                    progress_handler=self.progress_handler,
+                    total_seconds=total_seconds,
                 )
         else:
             timings = _get_pgs_timings_via_ffprobe(
-                fname, stream, self.ffmpeg_path, self.gui_mode
+                fname,
+                stream,
+                self.ffmpeg_path,
+                self.gui_mode,
+                progress_handler=self.progress_handler,
+                total_seconds=total_seconds,
             )
         if timings is None:
             raise ValueError(

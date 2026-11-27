@@ -135,6 +135,7 @@ let lastResult = null;
 let lastStreamProbe = null;
 let lastFfmpegInfo = null;
 let lastSyncProgress = null;
+let syncProgressMax = null;
 let streamProbeSeq = 0;
 let themeTransitionTimer = null;
 let settingsOpen = false;
@@ -2561,6 +2562,7 @@ function wireEvents(ad) {
     if (busy || !runtimeReady || !hasSelection(selectedRef) || selectedIns.length === 0) return;
     busy = true;
     lastSyncProgress = { messageKey: "form.startingSync", messageParams: null };
+    syncProgressMax = null;
     refreshSyncBtn();
     els.syncBtn.textContent = i18n.t("form.startingSync");
     els.result.hidden = true;
@@ -2612,9 +2614,16 @@ function wireEvents(ad) {
               lastSyncProgress = null;
               els.syncBtn.textContent = message;
             }
+            let effectiveFraction = syncProgressMax;
+            if (typeof fraction === "number" && Number.isFinite(fraction)) {
+              const clamped = Math.max(0, Math.min(1, fraction));
+              syncProgressMax =
+                syncProgressMax === null ? clamped : Math.max(syncProgressMax, clamped);
+              effectiveFraction = syncProgressMax;
+            }
             setProgressBar(els.syncProg, els.syncFill, els.syncPct, {
               active: true,
-              fraction,
+              fraction: effectiveFraction,
             });
           },
         },
@@ -2625,6 +2634,7 @@ function wireEvents(ad) {
 
     busy = false;
     lastSyncProgress = null;
+    syncProgressMax = null;
     setProgressBar(els.syncProg, els.syncFill, els.syncPct, { active: false, fraction: null });
     refreshSyncBtn();
     renderResult(res);

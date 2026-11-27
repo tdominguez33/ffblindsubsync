@@ -95,10 +95,19 @@ const WORKER_STATUS_KEY_MAP = new Map([
   ["loading ffblindsubsync…", "status.loadingApp"],
   ["ready", "status.ready"],
   ["syncing…", "progress.syncing"],
+  ["preparing subtitles…", "progress.preparing"],
+  ["parsing subtitles…", "progress.parsingSubtitles"],
+  ["computing alignments…", "progress.computingAlignments"],
+  ["refining framerate ratio…", "progress.refiningFramerate"],
+  ["checking mid-file breaks…", "progress.checkingBreaks"],
+  ["writing synced subtitles…", "progress.writingOutput"],
+  ["detecting speech…", "progress.detectingSpeech"],
   ["detecting speech + aligning…", "progress.detectingSpeechAligning"],
   ["aligning subtitle timings…", "progress.aligningSubTimings"],
+  ["building subtitle timeline…", "progress.aligningSubTimings"],
   ["loading ffmpeg.wasm…", "progress.loadingFfmpegWasm"],
   ["decoding audio (this can take a bit on long videos)…", "progress.decodingAudioLong"],
+  ["done.", "progress.syncing"],
 ]);
 
 function mapWorkerMessage(raw) {
@@ -107,6 +116,20 @@ function mapWorkerMessage(raw) {
   const low = s.toLowerCase();
   if (WORKER_STATUS_KEY_MAP.has(low)) {
     return { messageKey: WORKER_STATUS_KEY_MAP.get(low), messageParams: null, message: capitalize(s) };
+  }
+  const mSpeechPct = /^detecting speech \((\d+)%\)/i.exec(s);
+  if (mSpeechPct) {
+    return {
+      messageKey: "progress.detectingSpeechPct",
+      messageParams: { pct: Number(mSpeechPct[1]) },
+      message: capitalize(s),
+    };
+  }
+  if (/^detecting speech\b/i.test(s)) {
+    return { messageKey: "progress.detectingSpeech", messageParams: null, message: capitalize(s) };
+  }
+  if (/^refining framerate ratio\b/i.test(s)) {
+    return { messageKey: "progress.refiningFramerate", messageParams: null, message: capitalize(s) };
   }
   const mAlign = /^computing alignment \((\d+)\/(\d+)\)/i.exec(s);
   if (mAlign) {
@@ -634,6 +657,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       }
 
       const t0 = performance.now();
+      const isMulti = inFiles.length > 1;
       const options = {
         output_encoding: "utf-8",
         no_fix_framerate: Boolean(request.noFixFramerate),
@@ -643,7 +667,25 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         alignment_profile: request.alignmentProfile || "balanced",
       };
 
-      onProgress({ messageKey: "progress.readingInputSubs", fraction: 0.02 });
+      // Strictly monotonic overall progress reporter for this sync run.
+      let maxFrac = 0;
+      let hasNumeric = false;
+      const emitProgress = (ev) => {
+        if (!ev) return;
+        let nextFrac = hasNumeric ? maxFrac : null;
+        if (typeof ev.fraction === "number" && Number.isFinite(ev.fraction)) {
+          const clamped = Math.max(0, Math.min(1, ev.fraction));
+          maxFrac = hasNumeric ? Math.max(maxFrac, clamped) : clamped;
+          hasNumeric = true;
+          nextFrac = maxFrac;
+        }
+        onProgress({
+          ...ev,
+          fraction: nextFrac,
+        });
+      };
+
+      emitProgress({ messageKey: "progress.readingInputSubs", fraction: 0.02 });
       const rawInputEntries = [];
       for (const f of inFiles) {
         rawInputEntries.push({
@@ -671,7 +713,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             payload: { cacheKey, inputs: cloned, options: syncOpts },
           },
           transferables,
-          onProgress,
+          emitProgress,
           t0,
           range,
         );
@@ -680,7 +722,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       // 0. Fast path: reuse cached reference speech in worker when video + settings match.
       const refCacheKey = buildRefCacheKey(refFile, request);
       if (refCacheKey && cachedRefKey === refCacheKey) {
-        onProgress({ messageKey: "progress.reusingCachedRef", fraction: 0.05 });
+        emitProgress({ messageKey: "progress.reusingCachedRef", fraction: 0.05 });
         const cachedOpts = cachedRefVideoFps
           ? { ...options, inferred_sub_fps: cachedRefVideoFps }
           : options;
@@ -690,7 +732,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
 
       // 1. Direct subtitle reference file (.srt, .ass, .vtt, etc.)
       if (isSubtitleFile(refFile.name)) {
-        onProgress({ messageKey: "progress.readingRef", fraction: 0.05 });
+        emitProgress({ messageKey: "progress.readingRef", fraction: 0.05 });
         const refBytes = new Uint8Array(await refFile.arrayBuffer());
         const prep = await postWorkerPrepare(
           {
@@ -698,7 +740,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             payload: { cacheKey: refCacheKey, refName: refFile.name, refBytes, options: {} },
           },
           [refBytes.buffer],
-          onProgress,
+          emitProgress,
           [0.05, 0.10],
         );
         if (!prep || !prep.ok) {
@@ -720,7 +762,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       ]);
       const reportStatus = (s) => {
         const mapped = mapWorkerMessage(s);
-        onProgress({
+        emitProgress({
           message: mapped.message,
           messageKey: mapped.messageKey,
           messageParams: mapped.messageParams,
@@ -742,9 +784,28 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           String(refStream).startsWith("a:") ||
           String(refStream).startsWith("0:a:"));
 
+      const makePgsProgressCb = (rangeStart, rangeEnd) => (p, meta) => {
+        if (Number.isFinite(p) && p >= 0 && p <= 1) {
+          const pct = Math.round(p * 100);
+          emitProgress({
+            messageKey: "progress.readingPgsPct",
+            messageParams: { pct },
+            fraction: rangeStart + p * Math.max(0.02, rangeEnd - rangeStart),
+          });
+        } else if (meta && Number.isFinite(meta.ptsSeconds)) {
+          const sec = Math.max(0, Math.round(meta.ptsSeconds));
+          const asymp = 1 - 1 / (1 + sec / 1800);
+          emitProgress({
+            messageKey: "progress.readingPgsSec",
+            messageParams: { sec },
+            fraction: rangeStart + asymp * Math.max(0.02, rangeEnd - rangeStart) * 0.9,
+          });
+        }
+      };
+
       // 2a. Explicit PGS / VobSub / DVB timing stream selected
       if (isExplicitPgs) {
-        onProgress({
+        emitProgress({
           messageKey: "progress.readingPgsStream",
           messageParams: { stream: refStream },
           fraction: 0.05,
@@ -756,6 +817,8 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         const timings = await mod.probePgsTimings(ff, refFile, refStream, {
           status: reportStatus,
           codec: matchedStream && matchedStream.codec,
+          duration: probed && probed.duration,
+          onProgress: makePgsProgressCb(0.05, 0.34),
         });
         if (!timings || !timings.length) {
           return {
@@ -766,12 +829,12 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             error_params: { stream: refStream },
           };
         }
-        onProgress({ messageKey: "progress.aligningPgs", fraction: 0.35 });
+        emitProgress({ messageKey: "progress.aligningPgs", fraction: 0.34 });
         const prep = await postWorkerPrepare(
           { type: "prepareRefTimings", payload: { cacheKey: refCacheKey, timings } },
           [],
-          onProgress,
-          [0.32, 0.38],
+          emitProgress,
+          [0.34, 0.38],
         );
         if (!prep || !prep.ok) {
           return {
@@ -790,7 +853,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
 
       // 2b. Explicit embedded text subtitle stream selected
       if (isExplicitSub) {
-        onProgress({
+        emitProgress({
           messageKey: "progress.extractingEmbeddedStream",
           messageParams: { stream: refStream },
           fraction: 0.05,
@@ -800,7 +863,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           onProgress: (p) => {
             if (Number.isFinite(p) && p > 0 && p <= 1) {
               const pct = Math.round(p * 100);
-              onProgress({
+              emitProgress({
                 messageKey: "progress.extractingEmbeddedPct",
                 messageParams: { pct },
                 fraction: 0.05 + p * 0.30,
@@ -817,7 +880,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             error_params: { stream: refStream },
           };
         }
-        onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
+        emitProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
         let videoFps = null;
         try {
           const probed = await probeStreamsCached(refFile, reportStatus);
@@ -831,7 +894,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
             payload: { cacheKey: refCacheKey, refName: "embedded.srt", refBytes: subBytes, options: {} },
           },
           [subBytes.buffer],
-          onProgress,
+          emitProgress,
           [0.35, 0.38],
         );
         if (!prep || !prep.ok) {
@@ -850,7 +913,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       // 2c. Auto embedded subtitles -> PGS/VobSub/DVB timings fallback (subs_then_webrtc)
       const useEmbeddedFirst = !isExplicitAudio && String(request.vad || "").includes("subs");
       if (useEmbeddedFirst) {
-        onProgress({ messageKey: "progress.checkingVideoSubs", fraction: 0.04 });
+        emitProgress({ messageKey: "progress.checkingVideoSubs", fraction: 0.04 });
         const probed = await probeStreamsCached(refFile, reportStatus);
         const streams = (probed && probed.streams) || [];
         const videoFps = (probed && probed.video_fps) || null;
@@ -864,21 +927,25 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           streams.filter((s) => s.kind === "subtitle" && !s.is_bitmap),
         );
         for (const track of textTracks) {
+          const extStart = Math.max(0.05, maxFrac);
+          const extEnd = Math.min(0.60, extStart + Math.max(0.08, (0.60 - extStart) * 0.45));
           const subBytes = await mod.extractSubtitleStream(ff, refFile, track.value, {
             status: reportStatus,
             onProgress: (p) => {
               if (Number.isFinite(p) && p > 0 && p <= 1) {
                 const pct = Math.round(p * 100);
-                onProgress({
+                emitProgress({
                   messageKey: "progress.extractingEmbeddedPct",
                   messageParams: { pct },
-                  fraction: 0.05 + p * 0.30,
+                  fraction: extStart + p * Math.max(0.02, extEnd - extStart),
                 });
               }
             },
           });
           if (subBytes && subBytes.byteLength > 0) {
-            onProgress({ messageKey: "progress.aligningEmbedded", fraction: 0.35 });
+            const alignStart = Math.max(0.35, maxFrac);
+            const prepEnd = Math.min(0.85, alignStart + 0.03);
+            emitProgress({ messageKey: "progress.aligningEmbedded", fraction: alignStart });
             const prep = await postWorkerPrepare(
               {
                 type: "prepareRefSubs",
@@ -890,11 +957,11 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
                 },
               },
               [subBytes.buffer],
-              onProgress,
-              [0.35, 0.38],
+              emitProgress,
+              [alignStart, prepEnd],
             );
             if (prep && prep.ok) {
-              const res = await runSyncCached(refCacheKey, probedOptions, [0.38, 1.0]);
+              const res = await runSyncCached(refCacheKey, probedOptions, [prepEnd, 0.99]);
               const anySynced = Boolean(
                 res &&
                   (res.multi_mode
@@ -902,6 +969,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
                     : res.ok),
               );
               if (anySynced) {
+                emitProgress({ fraction: 1.0 });
                 cachedRefKey = refCacheKey;
                 cachedRefVideoFps = videoFps;
                 return res;
@@ -915,14 +983,18 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           streams.filter((s) => s.kind === "pgs"),
         ).slice(0, 3);
         for (const track of pgsTracks) {
-          onProgress({
+          const pgsStart = Math.max(0.06, maxFrac);
+          const pgsEnd = Math.min(0.70, pgsStart + Math.max(0.10, (0.70 - pgsStart) * 0.45));
+          emitProgress({
             messageKey: "progress.readingPgsStream",
             messageParams: { stream: track.value },
-            fraction: 0.08,
+            fraction: pgsStart,
           });
           const timings = await mod.probePgsTimings(ff, refFile, track.value, {
             status: reportStatus,
             codec: track.codec,
+            duration: probed && probed.duration,
+            onProgress: makePgsProgressCb(pgsStart, pgsEnd),
           });
           if (timings && timings.length >= 20 && activeSecondsForTimings(timings) >= 50.0) {
             const kindLabel =
@@ -931,19 +1003,21 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
                 : track.codec === "dvb_subtitle"
                   ? "DVB"
                   : "VobSub";
-            onProgress({
+            const useStart = Math.max(pgsEnd, maxFrac);
+            const prepEnd = Math.min(0.85, useStart + 0.04);
+            emitProgress({
               messageKey: "progress.usingStreamKind",
               messageParams: { kind: kindLabel, stream: track.value },
-              fraction: 0.35,
+              fraction: useStart,
             });
             const prep = await postWorkerPrepare(
               { type: "prepareRefTimings", payload: { cacheKey: refCacheKey, timings } },
               [],
-              onProgress,
-              [0.35, 0.38],
+              emitProgress,
+              [useStart, prepEnd],
             );
             if (prep && prep.ok) {
-              const res = await runSyncCached(refCacheKey, probedOptions, [0.38, 1.0]);
+              const res = await runSyncCached(refCacheKey, probedOptions, [prepEnd, 0.99]);
               const anySynced = Boolean(
                 res &&
                   (res.multi_mode
@@ -951,6 +1025,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
                     : res.ok),
               );
               if (anySynced) {
+                emitProgress({ fraction: 1.0 });
                 cachedRefKey = refCacheKey;
                 cachedRefVideoFps = videoFps;
                 return res;
@@ -994,10 +1069,19 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         ? { ...options, inferred_sub_fps: audioVideoFps }
         : options;
 
+      // Dynamically partition remaining progress [audioBase, 1.0] into decode -> VAD -> align
+      // so fallback from embedded subtitles still advances smoothly without jumping backward.
+      const audioBase = Math.min(0.85, Math.max(0.05, maxFrac));
+      const rem = Math.max(0.05, 1.0 - audioBase);
+      const decodeShare = isMulti ? 0.37 : 0.42;
+      const vadShare = isMulti ? 0.23 : 0.28;
+      const decodeEnd = audioBase + rem * decodeShare;
+      const vadEnd = decodeEnd + rem * vadShare;
+
       let pcm;
       let channels = 1;
       try {
-        onProgress({ messageKey: "progress.loadingFfmpegWasm", fraction: 0.05 });
+        emitProgress({ messageKey: "progress.loadingFfmpegWasm", fraction: audioBase });
         const decoded = await mod.decodeAudioToPcm(ff, refFile, {
           stream: isExplicitAudio ? refStream : undefined,
           dualCenter,
@@ -1005,10 +1089,10 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           onProgress: (p) => {
             if (Number.isFinite(p) && p > 0 && p <= 1) {
               const pct = Math.round(p * 100);
-              onProgress({
+              emitProgress({
                 messageKey: "progress.decodingAudioPct",
                 messageParams: { pct },
-                fraction: 0.05 + p * 0.40,
+                fraction: audioBase + p * (decodeEnd - audioBase),
               });
             }
           },
@@ -1032,7 +1116,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
         };
       }
 
-      onProgress({ messageKey: "progress.detectingSpeechAligning", fraction: 0.45 });
+      emitProgress({ messageKey: "progress.detectingSpeech", fraction: decodeEnd });
       const prepAudio = await postWorkerPrepare(
         {
           type: "prepareRefAudio",
@@ -1046,8 +1130,8 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
           },
         },
         [pcm.buffer],
-        onProgress,
-        [0.45, 0.72],
+        emitProgress,
+        [decodeEnd, vadEnd],
       );
       if (!prepAudio || !prepAudio.ok) {
         return {
@@ -1058,7 +1142,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       }
       cachedRefKey = refCacheKey;
       cachedRefVideoFps = audioVideoFps;
-      return runSyncCached(refCacheKey, audioOptions, [0.72, 1.0]);
+      return runSyncCached(refCacheKey, audioOptions, [vadEnd, 1.0]);
     },
   };
 }
