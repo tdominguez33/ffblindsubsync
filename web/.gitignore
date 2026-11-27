@@ -4,6 +4,7 @@ vendor/py_sources.json
 vendor/wheels/
 vendor/ffmpeg/
 vendor/util/
+vendor/libarchive/
 package-lock.json
 __pycache__/
 *.pyc

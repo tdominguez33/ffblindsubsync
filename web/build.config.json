@@ -17,6 +17,11 @@
     "util": "vendor/util/index.js",
     "frameRate": 16000
   },
+  "archive": {
+    "pkg": "libarchive.js@2.0.2",
+    "module": "vendor/libarchive/libarchive.js",
+    "worker": "vendor/libarchive/worker-bundle.js"
+  },
   "audioVad": {
     "default": "webrtc"
   }

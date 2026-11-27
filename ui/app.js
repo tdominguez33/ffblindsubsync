@@ -145,6 +145,18 @@ let savedCandidatePaths = new Map(); // candidateId -> saved path (desktop)
 let alignmentProfile = readSavedAlignmentProfile();
 
 const SUPPORTED_SUB_EXTS = new Set(["srt", "ass", "ssa", "sub", "vtt"]);
+const SUPPORTED_ARCHIVE_EXTS = new Set([
+  "zip",
+  "rar",
+  "7z",
+  "tar",
+  "gz",
+  "tgz",
+  "bz2",
+  "tbz2",
+  "xz",
+  "txz",
+]);
 
 function basenameOf(str) {
   const s = String(str || "");
@@ -157,6 +169,20 @@ function isSupportedSubtitleName(name) {
   const dot = base.lastIndexOf(".");
   if (dot < 0) return false;
   return SUPPORTED_SUB_EXTS.has(base.slice(dot + 1).toLowerCase());
+}
+
+function isSupportedArchiveName(name) {
+  const base = basenameOf(name).toLowerCase();
+  if (base.endsWith(".tar.gz") || base.endsWith(".tar.bz2") || base.endsWith(".tar.xz")) {
+    return true;
+  }
+  const dot = base.lastIndexOf(".");
+  if (dot < 0) return false;
+  return SUPPORTED_ARCHIVE_EXTS.has(base.slice(dot + 1));
+}
+
+function isSupportedInputOrArchiveName(name) {
+  return isSupportedSubtitleName(name) || isSupportedArchiveName(name);
 }
 
 function isSyncedFilename(name) {
@@ -175,18 +201,20 @@ function normalizeSubtitleEntry(entry) {
     return {
       value: trimmed,
       display: entry.display || trimmed,
-      name: basenameOf(trimmed),
+      name: entry.name || basenameOf(trimmed),
+      default_output_path: entry.default_output_path || null,
       key: trimmed.toLowerCase(),
     };
   }
-  const name = val.name || entry.display || "subtitle.srt";
+  const rawName = entry.name || val.name || entry.display || "subtitle.srt";
   const display =
-    entry.display || (adapter && adapter.formatFileDisplay ? adapter.formatFileDisplay(val) : name);
+    entry.display || (adapter && adapter.formatFileDisplay ? adapter.formatFileDisplay(val) : rawName);
   return {
     value: val,
     display,
-    name,
-    key: `${name.toLowerCase()}|${val.size || 0}|${val.lastModified || 0}`,
+    name: rawName,
+    default_output_path: null,
+    key: `${rawName.toLowerCase()}|${val.size || 0}|${val.lastModified || 0}`,
   };
 }
 
@@ -202,8 +230,8 @@ function filterWebFolderFiles(fileList, refValue) {
       const parts = rel.split("/").filter(Boolean);
       if (parts.length > 2) continue;
     }
-    if (!isSupportedSubtitleName(file.name)) continue;
-    if (isSyncedFilename(file.name)) continue;
+    if (!isSupportedInputOrArchiveName(file.name)) continue;
+    if (isSupportedSubtitleName(file.name) && isSyncedFilename(file.name)) continue;
     if (refName && file.name.toLowerCase() === refName && Number(file.size) === refSize) {
       continue;
     }
@@ -253,7 +281,7 @@ async function extractWebDroppedSubtitles(dataTransfer, refValue) {
       } else if (ent.isFile) {
         try {
           const f = await new Promise((resolve, reject) => ent.file(resolve, reject));
-          if (f && isSupportedSubtitleName(f.name)) collected.push(f);
+          if (f && isSupportedInputOrArchiveName(f.name)) collected.push(f);
         } catch (_) {}
       }
     }
@@ -263,7 +291,7 @@ async function extractWebDroppedSubtitles(dataTransfer, refValue) {
 
   const dropped = Array.from(dataTransfer.files || []);
   if (dropped.length > 1) {
-    const filtered = dropped.filter((f) => isSupportedSubtitleName(f.name));
+    const filtered = dropped.filter((f) => isSupportedInputOrArchiveName(f.name));
     return { files: filtered.length ? filtered : dropped, hadDir: false };
   }
   return { files: dropped, hadDir: false };
@@ -1083,16 +1111,18 @@ function renderInputSubtitlesUI({ forceAutoOut = false } = {}) {
   } else if (count === 1) {
     const single = selectedIns[0];
     els.inPath.value = single.display;
-    els.inPath.readOnly = !editable;
+    els.inPath.readOnly = !editable || Boolean(single.default_output_path);
     if (els.multiInPanel) els.multiInPanel.hidden = true;
     if (els.outField) els.outField.hidden = !supportsOut;
     if (
       supportsOut &&
-      adapter.suggestOutputPath &&
       typeof single.value === "string" &&
       (forceAutoOut || !els.outPath.value.trim() || els.outPath.dataset.auto === "1")
     ) {
-      els.outPath.value = adapter.suggestOutputPath(single.value);
+      const suggested =
+        single.default_output_path ||
+        (adapter.suggestOutputPath ? adapter.suggestOutputPath(single.value) : "");
+      els.outPath.value = suggested;
       els.outPath.dataset.auto = "1";
     }
   } else {
@@ -2198,6 +2228,41 @@ function wireEvents(ad) {
   window.addEventListener("dragover", (e) => e.preventDefault());
   window.addEventListener("drop", (e) => e.preventDefault());
 
+  const applyWebSubtitleFiles = async (
+    files,
+    { append = false, strictEmptyArchive = true, emptyFolderError = false } = {},
+  ) => {
+    if (!files || !files.length) {
+      if (emptyFolderError) showInputError(i18n.t("errors.noSubsInFolder"));
+      return;
+    }
+    if (typeof ad.expandSubtitleFiles === "function") {
+      try {
+        const expanded = await ad.expandSubtitleFiles(files, { strictEmptyArchive });
+        if (expanded && expanded.error) {
+          showInputError(expanded.error);
+          return;
+        }
+        const entries = (expanded && expanded.entries) || [];
+        if (!entries.length) {
+          if (emptyFolderError) showInputError(i18n.t("errors.noSubsInFolder"));
+          return;
+        }
+        setInputSubtitles(entries, { append });
+      } catch (err) {
+        showInputError(i18n.t("errors.archiveExtractFailed", { error: (err && err.message) || err }));
+      }
+      return;
+    }
+    setInputSubtitles(
+      files.map((f) => ({
+        value: f,
+        display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
+      })),
+      { append },
+    );
+  };
+
   // Instant drag-enter / drag-over visual highlight for both desktop and web.
   for (const [zone, target] of [
     [els.dropRef, "ref"],
@@ -2228,17 +2293,11 @@ function wireEvents(ad) {
           setReference({ value: file, display });
         } else {
           const { files, hadDir } = await extractWebDroppedSubtitles(e.dataTransfer, selectedRef);
-          if (!files.length) {
-            if (hadDir) showInputError(i18n.t("errors.noSubsInFolder"));
-            return;
-          }
-          setInputSubtitles(
-            files.map((f) => ({
-              value: f,
-              display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
-            })),
-            { append: false },
-          );
+          await applyWebSubtitleFiles(files, {
+            append: false,
+            strictEmptyArchive: !hadDir,
+            emptyFolderError: hadDir,
+          });
         }
       }
     });
@@ -2260,9 +2319,18 @@ function wireEvents(ad) {
       els.inputFile.click();
       return;
     }
-    const entries = await ad.pickSubtitle();
-    if (entries) {
-      setInputSubtitles(entries, { append, forceAutoOut: !append });
+    const res = await ad.pickSubtitle(typeof selectedRef === "string" ? selectedRef : null);
+    if (!res) return;
+    if (Array.isArray(res)) {
+      if (res.length) setInputSubtitles(res, { append, forceAutoOut: !append });
+      return;
+    }
+    if (res.error) {
+      showInputError(res.error);
+      return;
+    }
+    if (res.entries && res.entries.length) {
+      setInputSubtitles(res.entries, { append, forceAutoOut: !append });
     }
   };
 
@@ -2322,35 +2390,23 @@ function wireEvents(ad) {
       const display = ad.formatFileDisplay ? ad.formatFileDisplay(file) : file.name;
       setReference({ value: file, display });
     });
-    els.inputFile.addEventListener("change", () => {
+    els.inputFile.addEventListener("change", async () => {
       const files = Array.from(els.inputFile.files || []);
       const append = appendNextWebPick;
       appendNextWebPick = false;
-      if (!files.length) return;
-      setInputSubtitles(
-        files.map((f) => ({
-          value: f,
-          display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
-        })),
-        { append },
-      );
       els.inputFile.value = "";
+      if (!files.length) return;
+      await applyWebSubtitleFiles(files, { append, strictEmptyArchive: true });
     });
     if (els.inputFolder) {
-      els.inputFolder.addEventListener("change", () => {
+      els.inputFolder.addEventListener("change", async () => {
         const files = filterWebFolderFiles(els.inputFolder.files, selectedRef);
         els.inputFolder.value = "";
-        if (!files.length) {
-          showInputError(i18n.t("errors.noSubsInFolder"));
-          return;
-        }
-        setInputSubtitles(
-          files.map((f) => ({
-            value: f,
-            display: ad.formatFileDisplay ? ad.formatFileDisplay(f) : f.name,
-          })),
-          { append: false },
-        );
+        await applyWebSubtitleFiles(files, {
+          append: false,
+          strictEmptyArchive: false,
+          emptyFolderError: true,
+        });
       });
     }
 
@@ -2412,11 +2468,13 @@ function wireEvents(ad) {
     });
 
     els.browseOut.addEventListener("click", async () => {
-      const singleIn = selectedIns.length === 1 ? selectedIns[0].value : null;
+      const single = selectedIns.length === 1 ? selectedIns[0] : null;
+      const singleIn = single ? single.value : null;
       const fallback =
-        ad.suggestOutputPath && typeof singleIn === "string"
+        (single && single.default_output_path) ||
+        (ad.suggestOutputPath && typeof singleIn === "string"
           ? ad.suggestOutputPath(singleIn)
-          : "";
+          : "");
       const p = await ad.pickOutput(els.outPath.value.trim() || fallback);
       if (p) {
         els.outPath.value = p;

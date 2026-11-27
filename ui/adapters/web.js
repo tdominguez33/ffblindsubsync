@@ -6,7 +6,8 @@ const SUBTITLE_EXTS = new Set(["srt", "ass", "ssa", "ttml", "vtt", "sub", "npz",
 
 export const REF_ACCEPT =
   "video/*,audio/*,.mkv,.mp4,.avi,.mov,.webm,.m4v,.mka,.mp3,.aac,.flac,.wav,.ogg,.srt,.ass,.ssa,.ttml,.vtt,.sub";
-export const SUBTITLE_ACCEPT = ".srt,.ass,.ssa,.ttml,.vtt,.sub";
+export const SUBTITLE_ACCEPT =
+  ".srt,.ass,.ssa,.ttml,.vtt,.sub,.zip,.rar,.7z,.tar,.gz,.tgz,.bz2,.tbz2,.xz,.txz";
 
 function isSubtitleFile(filename) {
   if (!filename) return false;
@@ -151,8 +152,10 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
   let engineReady = false;
   let workerCaps = { webrtcvad: false };
   let ffmpegConfig = null;
+  let archiveConfig = null;
   let configPromise = null;
   let ffmpegModPromise = null;
+  let archiveModPromise = null;
   let pendingSync = null;
   let pendingPrepare = null;
   let lastBlobUrl = null;
@@ -221,16 +224,27 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
     return ffmpegModPromise;
   }
 
+  function getArchiveModule() {
+    if (!archiveModPromise) {
+      const url = withVersion(new URL("./src/archive_extract.mjs", document.baseURI).href);
+      archiveModPromise = import(url);
+    }
+    return archiveModPromise;
+  }
+
+  async function resolveBuildConfig() {
+    if (!configPromise) {
+      const configUrl = withVersion(new URL("./build.config.json", document.baseURI).href);
+      configPromise = fetch(configUrl).then((r) => r.json());
+    }
+    return configPromise;
+  }
+
   async function resolveFfmpegConfig(frameRateOverride) {
     let base = ffmpegConfig;
     if (!base) {
-      if (!configPromise) {
-        const configUrl = withVersion(new URL("./build.config.json", document.baseURI).href);
-        configPromise = fetch(configUrl)
-          .then((r) => r.json())
-          .then((cfg) => (cfg && cfg.ffmpeg) || null);
-      }
-      base = await configPromise;
+      const cfg = await resolveBuildConfig();
+      base = (cfg && cfg.ffmpeg) || null;
       if (base && !ffmpegConfig) ffmpegConfig = base;
     }
     if (!base) throw new Error("Missing ffmpeg configuration");
@@ -239,6 +253,21 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       frameRate: Number(frameRateOverride) || base.frameRate || 16000,
       module: withVersion(new URL(base.module, document.baseURI).href),
       util: withVersion(new URL(base.util, document.baseURI).href),
+    };
+  }
+
+  async function resolveArchiveConfig() {
+    let base = archiveConfig;
+    if (!base) {
+      const cfg = await resolveBuildConfig();
+      base = (cfg && cfg.archive) || null;
+      if (base && !archiveConfig) archiveConfig = base;
+    }
+    if (!base) throw new Error("Missing archive configuration");
+    return {
+      ...base,
+      module: withVersion(new URL(base.module, document.baseURI).href),
+      worker: withVersion(new URL(base.worker, document.baseURI).href),
     };
   }
 
@@ -316,6 +345,61 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
 
     formatFileDisplay(file) {
       return formatFileLabel(file);
+    },
+
+    async expandSubtitleFiles(files, { strictEmptyArchive = true } = {}) {
+      const list = Array.from(files || []).filter((f) => f instanceof File);
+      if (!list.length) return { entries: [], error: null };
+
+      const mod = await getArchiveModule();
+      const hasAnyArchive = list.some((f) => mod.isArchiveFilename(f.name));
+      if (!hasAnyArchive) {
+        return {
+          entries: list.map((f) => ({ value: f, display: formatFileLabel(f), name: f.name })),
+          error: null,
+        };
+      }
+
+      const archCfg = await resolveArchiveConfig();
+      const entries = [];
+      let hadArchive = false;
+      let lastArchiveErr = null;
+
+      for (const f of list) {
+        if (mod.isArchiveFilename(f.name)) {
+          hadArchive = true;
+          try {
+            const extracted = await mod.extractSubtitlesFromArchive(f, archCfg);
+            for (const item of extracted) {
+              if (item && item.file) {
+                try {
+                  item.file._archiveDisplayName = item.displayName;
+                } catch (_) {}
+                entries.push({
+                  value: item.file,
+                  display: item.displayName || formatFileLabel(item.file),
+                  name: item.displayName || item.file.name,
+                });
+              }
+            }
+          } catch (err) {
+            console.warn("Archive extraction failed:", f.name, err);
+            lastArchiveErr = (err && err.message) || String(err);
+          }
+        } else {
+          entries.push({ value: f, display: formatFileLabel(f), name: f.name });
+        }
+      }
+
+      if (!entries.length && hadArchive && strictEmptyArchive) {
+        return {
+          entries: [],
+          error: lastArchiveErr
+            ? t("errors.archiveExtractFailed", { error: lastArchiveErr })
+            : t("errors.noSubsInArchive"),
+        };
+      }
+      return { entries, error: null };
     },
 
     async probeStreams(file) {
@@ -564,6 +648,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       for (const f of inFiles) {
         rawInputEntries.push({
           name: f.name,
+          display_name: f._archiveDisplayName || f.name,
           bytes: new Uint8Array(await f.arrayBuffer()),
         });
       }
@@ -571,6 +656,7 @@ export function createAdapter({ version, withVersion, i18n, callbacks }) {
       const cloneInputs = () => {
         const cloned = rawInputEntries.map((item) => ({
           name: item.name,
+          display_name: item.display_name,
           bytes: item.bytes.slice(),
         }));
         const transferables = cloned.map((item) => item.bytes.buffer);

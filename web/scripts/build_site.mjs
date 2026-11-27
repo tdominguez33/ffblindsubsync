@@ -90,6 +90,7 @@ async function main() {
     path.join(webDir, "src", "worker.js"),
     path.join(webDir, "src", "ffsubsync_engine.mjs"),
     path.join(webDir, "src", "ffmpeg_decode.mjs"),
+    path.join(webDir, "src", "archive_extract.mjs"),
     path.join(webDir, "vendor", "py_sources.json"),
   ]);
   // Always include a content hash so local dirty rebuilds bust browser & Worker caches.
@@ -141,6 +142,12 @@ async function main() {
     excludeNames: new Set(["__pycache__", "ffsubsync_bridge.py"]),
   });
   await copyDir(path.join(webDir, "vendor"), path.join(distDir, "vendor"));
+  const licensesPath = path.join(repoRoot, "THIRD_PARTY_LICENSES.md");
+  try {
+    await fs.copyFile(licensesPath, path.join(distDir, "THIRD_PARTY_LICENSES.md"));
+  } catch {
+    /* optional */
+  }
 
   console.log(`assembled ${path.relative(repoRoot, distDir)} (v=${appVersion}, cache=${cacheVersion})`);
 }

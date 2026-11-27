@@ -124,6 +124,18 @@ DEFAULT_QUALITY_MAX_OFFSET_SECONDS: float = 30.0
 DEFAULT_MAX_FRAMERATE_DEVIATION: float = 0.1
 
 SUBTITLE_EXTENSIONS: Tuple[str, ...] = ("srt", "ass", "ssa", "sub", "vtt")
+ARCHIVE_EXTENSIONS: Tuple[str, ...] = (
+    "zip",
+    "rar",
+    "7z",
+    "tar",
+    "gz",
+    "tgz",
+    "bz2",
+    "tbz2",
+    "xz",
+    "txz",
+)
 
 # Remote URL protocols that ffmpeg can read directly as an input (`-i <url>`),
 # so a reference of this form needs no local download or read-permission check.

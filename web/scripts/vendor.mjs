@@ -108,6 +108,27 @@ async function main() {
     console.log(`vendored ${files.length} files from ${pkg} -> vendor/${dir}/`);
   }
 
+  // Vendor libarchive.js (MIT wrapper + 2-Clause BSD libarchive WASM) same-origin
+  // so .zip, .rar (RAR4/RAR5), .7z, and .tar.* extract client-side without CORS issues.
+  if (cfg.archive && cfg.archive.pkg) {
+    const archiveDir = path.join(outDir, "libarchive");
+    await fs.mkdir(archiveDir, { recursive: true });
+    const distFiles = ["libarchive.js", "worker-bundle.js", "libarchive.wasm"];
+    for (const name of distFiles) {
+      const url = `https://cdn.jsdelivr.net/npm/${cfg.archive.pkg}/dist/${name}`;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`fetch ${url} -> ${resp.status}`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      await fs.writeFile(path.join(archiveDir, name), buf);
+    }
+    const licUrl = `https://cdn.jsdelivr.net/npm/${cfg.archive.pkg}/LICENSE`;
+    const licResp = await fetch(licUrl);
+    if (licResp.ok) {
+      await fs.writeFile(path.join(archiveDir, "LICENSE"), await licResp.text());
+    }
+    console.log(`vendored ${distFiles.length} files from ${cfg.archive.pkg} -> vendor/libarchive/`);
+  }
+
   // Wheels manifest (webrtcvad wasm wheel, if built).
   const wheelDir = path.join(outDir, "wheels");
   await fs.mkdir(wheelDir, { recursive: true });

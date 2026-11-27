@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import collect_dynamic_libs, copy_metadata
 
 gui_dir = os.path.abspath(SPECPATH)
 repo_root = os.path.abspath(os.path.join(gui_dir, ".."))
@@ -15,6 +15,9 @@ datas = [
         os.path.join("ui", "adapters"),
     ),
 ]
+licenses_path = os.path.join(repo_root, "THIRD_PARTY_LICENSES.md")
+if os.path.exists(licenses_path):
+    datas.append((licenses_path, "."))
 i18n_root = os.path.join(repo_root, "ui", "i18n")
 if os.path.isdir(i18n_root):
     for root, _, files in os.walk(i18n_root):
@@ -27,10 +30,16 @@ if os.path.exists(icon_path):
     datas.append((icon_path, "."))
 datas += copy_metadata("webrtcvad-wheels")
 
+binaries = []
+try:
+    binaries += collect_dynamic_libs("unrar")
+except Exception:
+    pass
+
 a = Analysis(
     [os.path.join(gui_dir, "ffsubsync-gui.py")],
     pathex=[repo_root, gui_dir],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=[
         "ffsubsync._frozen_version",
@@ -44,6 +53,20 @@ a = Analysis(
         "ffmpeg",
         "clr_loader",
         "pythonnet",
+        "py7zr",
+        "pybcj",
+        "pyppmd",
+        "inflate64",
+        "brotli",
+        "backports.zstd",
+        "Cryptodome",
+        "multivolumefile",
+        "texttable",
+        "cffi",
+        "unrar",
+        "unrar.cffi",
+        "unrar.cffi.rarfile",
+        "unrar.cffi.unrarlib",
     ],
     hookspath=[os.path.join(gui_dir, "hooks")],
     hooksconfig={},

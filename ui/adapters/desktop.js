@@ -140,12 +140,12 @@ export function createAdapter({ i18n, callbacks }) {
         }
         return;
       }
-      const files = (resolved && resolved.files) || [];
-      if (files.length) {
-        callbacks.onExternalDrop(
-          target,
-          files.map((p) => ({ value: p, display: p })),
-        );
+      const entries =
+        Array.isArray(resolved && resolved.entries) && resolved.entries.length
+          ? resolved.entries
+          : ((resolved && resolved.files) || []).map((p) => ({ value: p, display: p }));
+      if (entries.length) {
+        callbacks.onExternalDrop(target, entries);
       }
       return;
     }
@@ -353,10 +353,12 @@ export function createAdapter({ i18n, callbacks }) {
       return p ? { value: p, display: p } : null;
     },
 
-    async pickSubtitle() {
+    async pickSubtitle(refPath) {
       if (!api) return null;
       const fileTypes = [
+        `${t("dialogs.subtitlesAndArchives")} (*.srt;*.ass;*.ssa;*.sub;*.vtt;*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz;*.bz2;*.xz)`,
         `${t("dialogs.subtitles")} (*.srt;*.ass;*.ssa;*.sub;*.vtt)`,
+        `${t("dialogs.archives")} (*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz;*.bz2;*.xz)`,
         `${t("dialogs.allFiles")} (*.*)`,
       ];
       const res = await api.pick_subtitle(fileTypes);
@@ -364,7 +366,21 @@ export function createAdapter({ i18n, callbacks }) {
       const list = Array.isArray(res) ? res : [res];
       const cleaned = list.filter(Boolean);
       if (!cleaned.length) return null;
-      return cleaned.map((p) => ({ value: p, display: p }));
+      if (typeof api.resolve_subtitle_inputs === "function") {
+        const resolved = await api.resolve_subtitle_inputs(cleaned, refPath || null);
+        if (resolved && resolved.error) {
+          return {
+            error: resolved.error_key ? t(resolved.error_key) : resolved.error,
+            entries: [],
+          };
+        }
+        const entries =
+          Array.isArray(resolved && resolved.entries) && resolved.entries.length
+            ? resolved.entries
+            : ((resolved && resolved.files) || []).map((p) => ({ value: p, display: p }));
+        return { error: null, entries };
+      }
+      return { error: null, entries: cleaned.map((p) => ({ value: p, display: p })) };
     },
 
     async pickSubtitleFolder(refPath) {
@@ -374,8 +390,11 @@ export function createAdapter({ i18n, callbacks }) {
       if (res.error) {
         return { error: res.error_key ? t(res.error_key) : res.error, entries: [] };
       }
-      const files = Array.isArray(res.files) ? res.files : [];
-      return { error: null, entries: files.map((p) => ({ value: p, display: p })) };
+      const entries =
+        Array.isArray(res.entries) && res.entries.length
+          ? res.entries
+          : (Array.isArray(res.files) ? res.files : []).map((p) => ({ value: p, display: p }));
+      return { error: null, entries };
     },
 
     async resolveSubtitleInputs(paths, refPath) {
@@ -386,8 +405,11 @@ export function createAdapter({ i18n, callbacks }) {
       if (res && res.error) {
         return { error: res.error_key ? t(res.error_key) : res.error, entries: [] };
       }
-      const files = (res && res.files) || [];
-      return { error: null, entries: files.map((p) => ({ value: p, display: p })) };
+      const entries =
+        Array.isArray(res && res.entries) && res.entries.length
+          ? res.entries
+          : ((res && res.files) || []).map((p) => ({ value: p, display: p }));
+      return { error: null, entries };
     },
 
     async saveCandidate(candidate) {

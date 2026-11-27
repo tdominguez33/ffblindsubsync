@@ -17,6 +17,10 @@ from ffsubsync.alignment_profile import (
     compute_profile_offset_adjustment,
     normalize_alignment_profile,
 )
+from ffsubsync.archive_utils import (
+    extract_subtitles_from_archive,
+    is_archive_filename,
+)
 from ffsubsync.constants import (
     ALIGNMENT_PROFILE_CHOICES,
     DEFAULT_ALIGNMENT_PROFILE,
@@ -170,12 +174,15 @@ def discover_subtitle_files(
     *,
     recursive: bool = False,
     exclude_path: Optional[str] = None,
+    archive_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Optional[str]], bool]:
-    """Expand files and directories in ``inputs`` into a deduplicated subtitle list.
+    """Expand files, directories, and compressed archives into a deduplicated subtitle list.
 
     Directories are scanned top-level only by default (or recursively when
     ``recursive=True``), keeping files with extensions in ``SUBTITLE_EXTENSIONS``
-    and skipping prior ``*.synced.*`` outputs as well as ``exclude_path``.
+    and extracting subtitles from supported compressed archives (``.zip``, ``.rar``,
+    ``.7z``, ``.tar.*``, ``.gz``, etc.), skipping prior ``*.synced.*`` outputs
+    as well as ``exclude_path``.
     """
     exclude_norm: Optional[str] = None
     if exclude_path and not is_remote_url(exclude_path):
@@ -183,8 +190,19 @@ def discover_subtitle_files(
 
     seen: set = set()
     discovered: List[Optional[str]] = []
-    had_dir = False
-    empty_dirs: List[str] = []
+    had_expanded = False
+    empty_sources: List[str] = []
+
+    temp_dirs: List[str] = (
+        archive_context.setdefault("temp_dirs", [])
+        if archive_context is not None
+        else []
+    )
+    meta_by_path: Dict[str, Dict[str, Any]] = (
+        archive_context.setdefault("meta_by_path", {})
+        if archive_context is not None
+        else {}
+    )
 
     def _add_path(p: str) -> None:
         key = os.path.normcase(os.path.abspath(p))
@@ -192,11 +210,34 @@ def discover_subtitle_files(
             seen.add(key)
             discovered.append(p)
 
-    def _is_dir_candidate(path: str, name: str) -> bool:
+    def _expand_archive(archive_path: str, *, strict_empty: bool) -> int:
+        nonlocal had_expanded
+        had_expanded = True
+        records, tmp_dir = extract_subtitles_from_archive(archive_path)
+        if records:
+            temp_dirs.append(tmp_dir)
+            for rec in records:
+                p = rec["path"]
+                meta_by_path[p] = rec
+                _add_path(p)
+            return len(records)
+        if strict_empty:
+            empty_sources.append(archive_path)
+        return 0
+
+    def _is_dir_subtitle(path: str, name: str) -> bool:
         ext = os.path.splitext(name)[1].lstrip(".").lower()
         if ext not in SUBTITLE_EXTENSIONS:
             return False
         if is_synced_output_filename(name):
+            return False
+        if exclude_norm is not None:
+            if os.path.normcase(os.path.abspath(path)) == exclude_norm:
+                return False
+        return os.path.isfile(path)
+
+    def _is_dir_archive(path: str, name: str) -> bool:
+        if not is_archive_filename(name):
             return False
         if exclude_norm is not None:
             if os.path.normcase(os.path.abspath(path)) == exclude_norm:
@@ -208,32 +249,46 @@ def discover_subtitle_files(
             discovered.append(None)
             continue
         if os.path.isdir(raw):
-            had_dir = True
+            had_expanded = True
             found_here = 0
             if recursive:
                 for root, dirnames, filenames in os.walk(raw):
                     dirnames.sort()
                     for name in sorted(filenames):
                         path = os.path.join(root, name)
-                        if _is_dir_candidate(path, name):
+                        if _is_dir_subtitle(path, name):
                             _add_path(path)
                             found_here += 1
+                        elif _is_dir_archive(path, name):
+                            try:
+                                found_here += _expand_archive(path, strict_empty=False)
+                            except Exception as exc:
+                                logger.warning(
+                                    "skipping archive %s: %s", path, exc
+                                )
             else:
                 for name in sorted(os.listdir(raw)):
                     path = os.path.join(raw, name)
-                    if _is_dir_candidate(path, name):
+                    if _is_dir_subtitle(path, name):
                         _add_path(path)
                         found_here += 1
+                    elif _is_dir_archive(path, name):
+                        try:
+                            found_here += _expand_archive(path, strict_empty=False)
+                        except Exception as exc:
+                            logger.warning("skipping archive %s: %s", path, exc)
             if found_here == 0:
-                empty_dirs.append(raw)
+                empty_sources.append(raw)
+        elif os.path.isfile(raw) and is_archive_filename(raw):
+            _expand_archive(raw, strict_empty=True)
         else:
             _add_path(raw)
 
-    if had_dir and not discovered:
+    if had_expanded and not discovered:
         raise ValueError(
-            "no subtitle files found in directory: {}".format(", ".join(empty_dirs))
+            "no subtitle files found in: {}".format(", ".join(empty_sources))
         )
-    return discovered, had_dir
+    return discovered, had_expanded
 
 
 def format_ranking_table(ranked: Sequence[Dict[str, Any]]) -> str:
@@ -248,9 +303,11 @@ def format_ranking_table(ranked: Sequence[Dict[str, Any]]) -> str:
     ]
     for item in ranked:
         rank = item.get("rank", "-")
-        name = os.path.basename(item.get("input_path") or "") or (
-            item.get("input_name") or "stdin"
-        )
+        raw_name = item.get("input_name") or ""
+        if " › " in raw_name:
+            name = raw_name
+        else:
+            name = os.path.basename(item.get("input_path") or "") or raw_name or "stdin"
         err = item.get("error")
         if err:
             lines.append(
@@ -466,9 +523,24 @@ def _sync_single_subtitle(
     srtout: Optional[str] = None,
     keep_in_memory: bool = False,
 ) -> Dict[str, Any]:
+    archive_meta = (
+        (getattr(args, "_archive_context", None) or {})
+        .get("meta_by_path", {})
+        .get(srtin)
+        if srtin is not None
+        else None
+    )
     candidate: Dict[str, Any] = {
         "input_path": srtin,
-        "input_name": os.path.basename(srtin) if srtin else "stdin",
+        "input_name": (
+            archive_meta["display_name"]
+            if archive_meta
+            else (os.path.basename(srtin) if srtin else "stdin")
+        ),
+        "archive_path": archive_meta["archive_path"] if archive_meta else None,
+        "default_output_path": (
+            archive_meta["default_output_path"] if archive_meta else None
+        ),
         "output_path": None,
         "sync_was_successful": False,
         "offset_seconds": None,
@@ -1129,6 +1201,13 @@ def try_sync(
                     continue
                 if auto_srtout and not save_all:
                     dest = _resolve_srtout(args, in_path)
+                elif cand.get("default_output_path"):
+                    if out_dir:
+                        dest = os.path.join(
+                            out_dir, os.path.basename(cand["default_output_path"])
+                        )
+                    else:
+                        dest = cand["default_output_path"]
                 else:
                     dest = _default_synced_output_path(in_path, out_dir=out_dir)
                 assert dest is not None
@@ -1151,6 +1230,8 @@ def try_sync(
             ):
                 if args.srtout is not None:
                     dest = args.srtout
+                elif winner.get("default_output_path"):
+                    dest = winner["default_output_path"]
                 elif winner.get("input_path") is not None:
                     dest = _default_synced_output_path(winner["input_path"])
                 else:
@@ -1441,13 +1522,23 @@ def validate_args(args: argparse.Namespace) -> None:
                 "at least one of `srtin` or `reference` must be specified to apply offset seconds"
             )
     if args.srtin:
+        archive_context: Dict[str, Any] = getattr(args, "_archive_context", None) or {
+            "temp_dirs": [],
+            "meta_by_path": {},
+        }
         expanded_srtin, had_dir = discover_subtitle_files(
             args.srtin,
             recursive=bool(getattr(args, "recursive", False)),
             exclude_path=args.reference,
+            archive_context=archive_context,
         )
         args.srtin = expanded_srtin
         args._expanded_from_dir = had_dir
+        args._archive_context = archive_context
+        if archive_context["meta_by_path"] and args.overwrite_input:
+            raise ValueError(
+                "cannot use --overwrite-input with compressed archive inputs"
+            )
         if len(args.srtin) > 1 and args.make_test_case:
             raise ValueError("cannot specify multiple input srt files for test cases")
     elif (
@@ -1770,6 +1861,11 @@ def run(
                 )
             if args.log_dir_path is None or not os.path.isdir(args.log_dir_path):
                 os.remove(log_path)
+        archive_ctx = getattr(args, "_archive_context", None)
+        if isinstance(archive_ctx, dict) and not getattr(args, "_keep_archive_temp", False):
+            for tmp_dir in archive_ctx.get("temp_dirs") or []:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            archive_ctx["temp_dirs"] = []
 
 
 def add_main_args_for_cli(parser: argparse.ArgumentParser) -> None:

@@ -719,9 +719,11 @@ def sync_with_cached_reference(
     # Write input files with unique prefixes so duplicate basenames don't collide.
     in_paths = []
     name_by_path = {}
+    display_by_path = {}
     fallback_fps = None
     for idx, entry in enumerate(items):
         in_name = str(entry["name"])
+        disp_name = str(entry.get("display_name") or in_name)
         raw_bytes = _as_bytes(entry["bytes"])
         ext = os.path.splitext(os.path.basename(in_name))[-1] or ".srt"
         safe_name = "multi_{}_{}".format(idx, os.path.basename(in_name))
@@ -730,6 +732,7 @@ def sync_with_cached_reference(
         in_p = _write(safe_name, raw_bytes)
         in_paths.append(in_p)
         name_by_path[in_p] = in_name
+        display_by_path[in_p] = disp_name
         if fallback_fps is None:
             fallback_fps = _resolve_fallback_sub_fps(in_name, raw_bytes, inferred_sub_fps)
 
@@ -829,7 +832,9 @@ def sync_with_cached_reference(
 
     def _on_cand(idx: int, total: int, srtin):
         if progress_cb is not None:
-            disp = name_by_path.get(srtin, os.path.basename(srtin or ""))
+            disp = display_by_path.get(
+                srtin, name_by_path.get(srtin, os.path.basename(srtin or ""))
+            )
             frac = idx / float(max(1, total))
             try:
                 progress_cb(frac, "Analyzing subtitle %d/%d (%s)…" % (idx + 1, total, disp))
@@ -861,6 +866,7 @@ def sync_with_cached_reference(
     for idx, cand in enumerate(raw_cands):
         in_p = cand.get("input_path") or ""
         orig_name = name_by_path.get(in_p, cand.get("input_name") or os.path.basename(in_p))
+        disp_name = display_by_path.get(in_p, orig_name)
         out_name = _synced_name(orig_name)
         out_ext = _output_ext(orig_name)
         out_subs = cand.get("output_subs")
@@ -882,7 +888,7 @@ def sync_with_cached_reference(
             {
                 "id": "web-cand-%d" % idx,
                 "rank": cand.get("rank", idx + 1),
-                "input_name": orig_name,
+                "input_name": disp_name,
                 "output_name": out_name,
                 "output_text": out_text,
                 "ok": bool(cand.get("sync_was_successful")) and has_output,

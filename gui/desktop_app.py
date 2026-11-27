@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Native Windows desktop GUI for ffsubsync (pywebview + native FFmpeg)."""
 
+import atexit
 import io
 import json
 import locale
@@ -9,6 +10,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -40,6 +42,7 @@ from ffsubsync.ffmpeg_downloader import (
     get_portable_dir,
 )
 from ffsubsync.ffmpeg_utils import subprocess_args
+from ffsubsync.archive_utils import is_archive_filename
 from ffsubsync.ffsubsync import (
     _default_synced_output_path,
     discover_subtitle_files,
@@ -311,6 +314,9 @@ class DesktopApi:
         self._ref_cache_key: Optional[tuple] = None
         self._ref_cache_pipe: Optional[Any] = None
         self._multi_outputs: Dict[str, Dict[str, Any]] = {}
+        self._archive_temp_dirs: List[str] = []
+        self._archive_meta: Dict[str, Dict[str, Any]] = {}
+        atexit.register(self._cleanup_archive_temps)
         self._config: Dict[str, Any] = _load_desktop_config()
         self._custom_ffmpeg_path: str = str(self._config.get("ffmpeg_path") or "").strip()
         self._language: str = str(self._config.get("language") or "system").strip() or "system"
@@ -548,10 +554,20 @@ class DesktopApi:
             "has_pgs_subs": has_pgs_subs,
         }
 
+    def _cleanup_archive_temps(self) -> None:
+        with self._lock:
+            dirs = list(self._archive_temp_dirs)
+            self._archive_temp_dirs.clear()
+            self._archive_meta.clear()
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
     def pick_subtitle(self, file_types: Optional[List[str]] = None) -> List[str]:
         assert self._window is not None
         default_types = (
+            "Subtitles & Archives (*.srt;*.ass;*.ssa;*.sub;*.vtt;*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz;*.bz2;*.xz)",
             "Subtitles (*.srt;*.ass;*.ssa;*.sub;*.vtt)",
+            "Archives (*.zip;*.rar;*.7z;*.tar;*.gz;*.tgz;*.bz2;*.xz)",
             "All files (*.*)",
         )
         filters = (
@@ -574,7 +590,7 @@ class DesktopApi:
         assert self._window is not None
         res = self._window.create_file_dialog(webview.FileDialog.FOLDER)
         if not res:
-            return {"cancelled": True, "folder": None, "files": [], "error": None}
+            return {"cancelled": True, "folder": None, "files": [], "entries": [], "error": None}
         folder = res[0] if isinstance(res, (list, tuple)) else str(res)
         return self.resolve_subtitle_inputs([folder], ref_path=ref_path)
 
@@ -583,25 +599,63 @@ class DesktopApi:
     ) -> Dict[str, Any]:
         cleaned = [str(p).strip() for p in (paths or []) if p and str(p).strip()]
         if not cleaned:
-            return {"cancelled": False, "files": [], "error": None}
+            return {"cancelled": False, "files": [], "entries": [], "error": None}
+        had_explicit_archive = any(
+            os.path.isfile(p) and is_archive_filename(p) for p in cleaned
+        )
+        archive_ctx: Dict[str, Any] = {"temp_dirs": [], "meta_by_path": {}}
         try:
-            discovered, had_dir = discover_subtitle_files(
-                cleaned, recursive=False, exclude_path=ref_path or None
+            discovered, had_expanded = discover_subtitle_files(
+                cleaned,
+                recursive=False,
+                exclude_path=ref_path or None,
+                archive_context=archive_ctx,
             )
             files = [p for p in discovered if p is not None]
+            with self._lock:
+                self._archive_temp_dirs.extend(archive_ctx["temp_dirs"])
+                self._archive_meta.update(archive_ctx["meta_by_path"])
+                meta_map = dict(self._archive_meta)
+            entries = []
+            for p in files:
+                meta = meta_map.get(p)
+                if meta:
+                    entries.append(
+                        {
+                            "value": p,
+                            "display": meta["display_name"],
+                            "name": meta["display_name"],
+                            "default_output_path": meta["default_output_path"],
+                        }
+                    )
+                else:
+                    entries.append({"value": p, "display": p})
             return {
                 "cancelled": False,
                 "files": files,
-                "had_dir": had_dir,
+                "entries": entries,
+                "had_dir": had_expanded,
                 "error": None,
             }
         except ValueError as exc:
+            for d in archive_ctx.get("temp_dirs") or []:
+                shutil.rmtree(d, ignore_errors=True)
+            msg = str(exc)
+            if "no subtitle files found" in msg.lower():
+                err_key = (
+                    "errors.noSubsInArchive"
+                    if had_explicit_archive
+                    else "errors.noSubsInFolder"
+                )
+            else:
+                err_key = None
             return {
                 "cancelled": False,
                 "files": [],
+                "entries": [],
                 "had_dir": True,
-                "error": str(exc),
-                "error_key": "errors.noSubsInFolder",
+                "error": msg,
+                "error_key": err_key,
             }
 
     def save_candidate(
@@ -772,12 +826,22 @@ class DesktopApi:
                             "elapsed_seconds": time.perf_counter() - t0,
                         }
                     return
+                archive_ctx: Dict[str, Any] = {"temp_dirs": [], "meta_by_path": {}}
                 try:
                     discovered, _had_dir = discover_subtitle_files(
-                        in_paths_raw, recursive=False, exclude_path=ref_path
+                        in_paths_raw,
+                        recursive=False,
+                        exclude_path=ref_path,
+                        archive_context=archive_ctx,
                     )
                     in_paths = [p for p in discovered if p is not None]
+                    with self._lock:
+                        self._archive_temp_dirs.extend(archive_ctx["temp_dirs"])
+                        self._archive_meta.update(archive_ctx["meta_by_path"])
+                        run_archive_meta = dict(self._archive_meta)
                 except ValueError as exc:
+                    for d in archive_ctx.get("temp_dirs") or []:
+                        shutil.rmtree(d, ignore_errors=True)
                     with self._lock:
                         self._sync_state = {
                             "active": False,
@@ -785,7 +849,9 @@ class DesktopApi:
                             "seq": sync_seq,
                             "ok": False,
                             "error": str(exc),
-                            "error_key": "errors.noSubsInFolder",
+                            "error_key": "errors.noSubsInFolder"
+                            if "no subtitle files found" in str(exc).lower()
+                            else None,
                             "elapsed_seconds": time.perf_counter() - t0,
                         }
                     return
@@ -818,7 +884,12 @@ class DesktopApi:
 
                 multi_mode = len(in_paths) > 1
                 if not multi_mode and not out_path:
-                    out_path = _default_synced_output_path(in_paths[0])
+                    meta0 = run_archive_meta.get(in_paths[0])
+                    out_path = (
+                        meta0["default_output_path"]
+                        if meta0 and meta0.get("default_output_path")
+                        else _default_synced_output_path(in_paths[0])
+                    )
 
                 ff_info = self._find_ffmpeg()
                 if not _is_subtitle_ref(ref_path) and not ff_info["available"]:
@@ -981,6 +1052,11 @@ class DesktopApi:
 
                 args = make_parser().parse_args(argv)
                 args.gui_mode = True
+                args._archive_context = {
+                    "temp_dirs": [],
+                    "meta_by_path": run_archive_meta,
+                }
+                args._keep_archive_temp = True
 
                 ref_weight = 0.55 if (multi_mode and cached_pipe is None) else (0.0 if cached_pipe is not None else 1.0)
                 cand_state = {"idx": 0, "total": len(in_paths), "name": ""}
@@ -1091,7 +1167,10 @@ class DesktopApi:
                     for i, cand in enumerate(raw_cands):
                         cid = "cand-%d-%d" % (sync_seq, i)
                         in_p = cand.get("input_path") or ""
-                        default_out = _default_synced_output_path(in_p) if in_p else "synced.srt"
+                        default_out = (
+                            cand.get("default_output_path")
+                            or (_default_synced_output_path(in_p) if in_p else "synced.srt")
+                        )
                         out_subs = cand.get("output_subs")
                         has_output = out_subs is not None and not cand.get("error")
                         if has_output:
@@ -1401,6 +1480,7 @@ class DesktopApi:
 
     def window_close(self) -> None:
         self.flush_window_state()
+        self._cleanup_archive_temps()
         if self._window is not None:
             self._window.destroy()
 
