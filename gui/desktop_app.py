@@ -364,6 +364,8 @@ class DesktopApi:
             "maximized": geom["maximized"],
         }
         self._win_save_timer: Optional[threading.Timer] = None
+        self._window_revealed: bool = False
+        self._reveal_timer: Optional[threading.Timer] = None
 
     def attach_window(self, window: webview.Window) -> None:
         self._window = window
@@ -387,6 +389,7 @@ class DesktopApi:
             "language": self._language,
             "alignment_profile": self._alignment_profile,
             "system_languages": _get_system_languages(),
+            "maximized": self.window_is_maximized(),
         }
 
     def set_language(self, language: str = "system") -> Dict[str, Any]:
@@ -1671,6 +1674,71 @@ class DesktopApi:
                 pass
         self._persist_window_state()
 
+    def prepare_before_show(self, start_maximized: bool = False) -> None:
+        """Apply icon, maximized bounds, and hide window until first UI paint.
+
+        Runs inside ``window.events.before_show`` on the WinForms STA thread:
+        setting ``Opacity = 0.0`` keeps the HWND visible to WebView2 so Chromium
+        commits its first painted frame invisibly (no blank black window flash),
+        then ``reveal_window()`` fades it in atomically once ``boot()`` renders.
+        """
+        self.apply_window_icon()
+        native, _ = self._get_native_winforms()
+        if native is None:
+            return
+        try:
+            from System.Drawing import Rectangle
+            import System.Windows.Forms as WinForms
+
+            if start_maximized:
+                screen = WinForms.Screen.FromControl(native)
+                wa = screen.WorkingArea
+                sb = screen.Bounds
+                native.MaximizedBounds = Rectangle(
+                    wa.X - sb.X, wa.Y - sb.Y, wa.Width, wa.Height
+                )
+                native.WindowState = WinForms.FormWindowState.Maximized
+                native.old_state = native.WindowState
+
+            native.Opacity = 0.0
+            with self._lock:
+                self._window_revealed = False
+                if self._reveal_timer is not None:
+                    self._reveal_timer.cancel()
+                # Safety fallback so the window always appears even if JS boot stalls.
+                timer = threading.Timer(2.5, self.reveal_window)
+                timer.daemon = True
+                self._reveal_timer = timer
+                timer.start()
+        except Exception:
+            pass
+
+    def reveal_window(self) -> None:
+        """Make the window visible once the frontend has rendered its first frame."""
+        with self._lock:
+            if self._window_revealed:
+                return
+            self._window_revealed = True
+            if self._reveal_timer is not None:
+                self._reveal_timer.cancel()
+                self._reveal_timer = None
+        native, _ = self._get_native_winforms()
+        if native is None:
+            return
+        try:
+            from System import Action
+
+            def _reveal():
+                native.Opacity = 1.0
+                native.Activate()
+
+            if native.InvokeRequired:
+                native.BeginInvoke(Action(_reveal))
+            else:
+                _reveal()
+        except Exception:
+            pass
+
     def window_toggle_maximize(self) -> bool:
         native, _ = self._get_native_winforms()
         if native is None:
@@ -1702,6 +1770,11 @@ class DesktopApi:
             return False
 
     def window_close(self) -> None:
+        with self._lock:
+            if self._reveal_timer is not None:
+                self._reveal_timer.cancel()
+                self._reveal_timer = None
+            self._window_revealed = True
         self.flush_window_state()
         self._cleanup_archive_temps()
         if self._window is not None:
@@ -1810,7 +1883,8 @@ def _wire_desktop_window(
     window.events.closing += lambda: api.flush_window_state()
 
     if start_maximized:
-        api.window_toggle_maximize()
+        if not api.window_is_maximized():
+            api.window_toggle_maximize()
         _notify_max(True)
 
 
@@ -1838,6 +1912,9 @@ def main() -> int:
         background_color="#09090b",
     )
     api.attach_window(window)
+    window.events.before_show += lambda: api.prepare_before_show(
+        start_maximized=bool(geom["maximized"])
+    )
     webview.start(_wire_desktop_window, (window, api, geom["maximized"]), http_server=True)
     return 0
 

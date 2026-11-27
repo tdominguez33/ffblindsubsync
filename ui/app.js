@@ -2680,10 +2680,21 @@ async function boot() {
   if (typeof adapter.onThemeChange === "function") {
     adapter.onThemeChange(isDarkTheme());
   }
+  if (typeof adapter.onUiReady === "function") {
+    // Wait two animation frames so WebView2 commits the first styled paint before reveal.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        adapter.onUiReady();
+      });
+    });
+  }
 }
 
 boot().catch((err) => {
   console.error(err);
+  if (adapter && typeof adapter.onUiReady === "function") {
+    adapter.onUiReady();
+  }
   const msg = i18n.t("status.errorPrefix", { error: (err && err.message) || err });
   if (els.statusRow && els.topbarStatusPill && els.topbarStatusPill.parentElement === els.statusRow) {
     els.statusRow.hidden = false;

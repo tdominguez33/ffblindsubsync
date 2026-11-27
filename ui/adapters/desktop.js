@@ -330,6 +330,9 @@ export function createAdapter({ i18n, callbacks }) {
       if (state && typeof state.alignment_profile === "string" && callbacks.onAlignmentProfileInit) {
         callbacks.onAlignmentProfileInit(state.alignment_profile);
       }
+      if (state && typeof state.maximized === "boolean" && callbacks.onWindowMaximizedChange) {
+        callbacks.onWindowMaximizedChange(state.maximized);
+      }
       const ff =
         state && state.ffmpeg
           ? {
@@ -513,6 +516,12 @@ export function createAdapter({ i18n, callbacks }) {
     onAlignmentProfileChange(profile) {
       if (api && typeof api.set_alignment_profile === "function") {
         api.set_alignment_profile(String(profile || "balanced")).catch(() => { });
+      }
+    },
+
+    onUiReady() {
+      if (api && typeof api.reveal_window === "function") {
+        api.reveal_window().catch(() => { });
       }
     },
   };
